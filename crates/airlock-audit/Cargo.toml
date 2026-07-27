@@ -1,0 +1,16 @@
+[package]
+name = "airlock-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+airlock-canonical.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

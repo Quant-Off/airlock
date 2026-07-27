@@ -1,0 +1,61 @@
+# 제로 트러스트 기본형입니다. 작업 공간 밖은 전부 막고 필요한 것만 통과시킵니다.
+# airlock policy check --policy examples/policy/strict.toml로 검증합니다.
+
+version = 1
+name = "strict"
+
+[defaults]
+file = "deny"
+exec = "ask"
+egress = "deny"
+
+# 작업 공간
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "~/work/**"
+action = "allow"
+
+# 툴체인 읽기: 실행에 필요
+[[rules]]
+id = "toolchain-read"
+kind = "file"
+path = ["/usr/**", "/bin/**", "/opt/homebrew/**", "/System/**", "/Library/**"]
+mode = ["read", "metadata", "exec"]
+action = "allow"
+
+# 빌드 캐시: 쓰기가 필요
+[[rules]]
+id = "build-cache"
+kind = "file"
+path = ["~/.cargo/registry/**", "~/.cargo/git/**", "~/.rustup/**", "~/.npm/_cacache/**"]
+action = "allow"
+
+# 개발 도구 실행은 묻지 않음
+[[rules]]
+id = "dev-tools"
+kind = "exec"
+program = "cargo"
+action = "allow"
+
+[[rules]]
+id = "git"
+kind = "exec"
+program = "git"
+action = "allow"
+
+# foo의 엔드포인트만 허용
+# egress 프록시 층이 붙어야 실제로 강제됨
+[[rules]]
+id = "llm-api"
+kind = "egress"
+host = "api.foollm.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "crates-io"
+kind = "egress"
+host = "*.crates.io"
+port = 443
+action = "allow"

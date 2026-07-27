@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Q. T. Felix <qtfelix@qu4nt.space>"]
+license = "AGPL-3.0-only"
+rust-version = "1.87"
+repository = "https://github.com/Quant-Off/airlock"
+
+[workspace.dependencies]
+airlock-audit = { path = "crates/airlock-audit" }
+airlock-broker = { path = "crates/airlock-broker" }
+airlock-canonical = { path = "crates/airlock-canonical" }
+airlock-policy = { path = "crates/airlock-policy" }
+
+sha2 = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
+unicode-normalization = "0.1"
+landlock = "0.4.6"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+# unwrap_used / expect_used는 라이브러리 코드에서 유용하지만 Rust는 워크스페이스 lint를
+# non-test 타겟으로만 한정할 수 없습니다. 테스트 경고에 실제 신호가 묻히기 때문에 끄고, 대신
+# 라이브러리 코드에 unwrap이 없음을 CI 에서 grep으로 확인합니다.
+[workspace.lints.clippy]
+todo = "warn"
+
+[profile.release]
+overflow-checks = true
+debug-assertions = false
+panic = "abort"
