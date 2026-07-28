@@ -368,28 +368,39 @@ impl<'a> Walker<'a> {
         // 달라지면 같은 정책이 머신마다 다른 강제 범위를 냅니다
         children.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut partial: Vec<PathBuf> = Vec::new();
+        // 아래에서 개별 규칙을 주면 안 되는 자식입니다. `Partial` 은 자기 규칙을 이미
+        // 쌓았고, `Denied` 는 아무것도 받으면 안 됩니다. 특히 나열할 수 없는 디렉토리는
+        // 매칭되는 규칙이 없어 `blocked` 가 false 라, 여기서 걸러 내지 않으면 하위를
+        // 검사하지도 못한 채 통째로 열립니다
+        let mut skip: Vec<PathBuf> = Vec::new();
         let mut any_denied = false;
+        let mut any_partial = false;
 
         for (path, is_dir) in &children {
             if *is_dir {
                 match self.walk(path, writable, plan) {
                     Grant::Whole => {}
-                    Grant::Partial => partial.push(path.clone()),
-                    Grant::Denied => any_denied = true,
+                    Grant::Partial => {
+                        any_partial = true;
+                        skip.push(path.clone());
+                    }
+                    Grant::Denied => {
+                        any_denied = true;
+                        skip.push(path.clone());
+                    }
                 }
             } else if self.blocked(path, writable) {
                 any_denied = true;
             }
         }
 
-        if !truncated && !any_denied && partial.is_empty() {
+        if !truncated && !any_denied && !any_partial {
             return Grant::Whole;
         }
 
         // 이 디렉토리는 통째로 줄 수 없습니다. 허용 가능한 자식만 개별로 줍니다
         for (path, is_dir) in &children {
-            if partial.iter().any(|p| p == path) {
+            if skip.iter().any(|p| p == path) {
                 continue;
             }
             if self.blocked(path, writable) {
@@ -919,6 +930,44 @@ mod tests {
             dir: true,
         };
         assert!(rule_access(&dir, read_access(ABI::V5), ABI::V5).contains(AccessFs::ReadDir));
+    }
+
+    /// 나열할 수 없는 디렉토리는 하위를 검사할 방법이 없으므로 규칙을 주면 안 됩니다.
+    ///
+    /// 매칭되는 규칙이 없어 `blocked` 가 false 라, 순회 결과를 따로 기억하지 않으면
+    /// 개별 허용 단계에서 도로 열립니다
+    #[test]
+    fn an_unlistable_directory_gets_no_rule() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("root 는 나열 권한 검사를 우회하므로 건너뜀");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = Scratch::new("unlistable");
+        let root = s.0.join("root");
+        let closed = root.join("closed");
+        fs::create_dir_all(&closed).unwrap();
+        fs::write(closed.join("inside"), b"x").unwrap();
+        fs::write(root.join("ok"), b"x").unwrap();
+        // 나열은 못 하지만 통과는 되는 디렉토리
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o311)).unwrap();
+
+        let policy = baseline(&s.0);
+        let mut walker = Walker::new(&policy);
+        let mut plan = Plan::default();
+        add_root(&mut walker, &root, true, &mut plan);
+
+        let _ = fs::set_permissions(&closed, fs::Permissions::from_mode(0o755));
+
+        assert!(
+            !plan.read_write.iter().any(|p| p.path == closed),
+            "나열할 수 없는 디렉토리에 규칙이 걸림"
+        );
+        assert!(
+            plan.read_write.iter().any(|p| p.path == root.join("ok")),
+            "형제 파일은 그대로 허용되어야 함"
+        );
     }
 
     #[test]

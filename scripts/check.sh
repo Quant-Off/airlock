@@ -10,7 +10,9 @@ echo "== clippy =="
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== test =="
-cargo test --workspace
+# --no-fail-fast 없이는 앞선 테스트 바이너리가 깨지는 순간 나머지가 실행되지 않습니다.
+# 강제 층 테스트가 CLI 테스트 뒤에 있어서, 실패 하나가 다른 실패를 통째로 가렸습니다
+cargo test --workspace --no-fail-fast
 
 echo "== 라이브러리 코드 unwrap/expect 금지 =="
 # 실패 경로를 삼키는 unwrap은 브로커가 TCB이므로 허용하지 않습니다.
