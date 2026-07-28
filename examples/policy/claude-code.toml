@@ -20,7 +20,7 @@ name = "claude-code"
 [defaults]
 file = "deny"
 exec = "allow"
-egress = "deny" # allow 는 문법 수준에서 금지됨
+egress = "deny" # allow는 문법 수준에서 금지됨
 
 # exec 기본값이 allow여도 베이스라인의 위험 exec ask는 그대로 살아 있습니다.
 # 사용자 규칙(2티어)이 아니라 [defaults](4티어)로 여는 것이라 sudo, rm -rf,
