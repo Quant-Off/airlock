@@ -1,0 +1,217 @@
+# Claude Code를 airlock 아래에서 돌리기 위한 정책입니다.
+#
+#   airlock run --policy examples/policy/claude-code.toml --workspace ~/work/myproj -- claude
+#
+# 내장 베이스라인에는 egress allow 규칙이 하나도 없습니다. 그래서 정책 파일 없이
+# airlock run -- claude를 돌리면 아웃바운드가 통째로 닫히고, Claude Code는
+# api.anthropic.com을 DNS로도 찾지 못해 ENOTFOUND로 죽습니다. 이 파일은 그때
+# 열어야 하는 최소 집합을 적어 둔 것입니다.
+#
+# 주의하세요! macOS Seatbelt는 호스트 단위 egress를 표현하지 못합니다. 아래 egress
+# allow가 하나라도 있으면 커널 프로파일은 아웃바운드를 통째로 엽니다. 곧 이
+# 호스트 목록은 정책 계층의 의도 선언이지 macOS의 강제 경계가 아닙니다. Linux
+# Landlock도 포트까지만 강제합니다. 실제 호스트 강제는 egress 프록시 층이
+# 들어와야 생깁니다 (docs/design.md 10.1). airlock은 이 사실을 배너의 한계
+# 목록으로 그대로 노출합니다.
+
+version = 1
+name = "claude-code"
+
+[defaults]
+file = "deny"
+exec = "allow"
+egress = "deny" # allow는 문법 수준에서 금지됨
+
+# exec 기본값이 allow여도 베이스라인의 위험 exec ask는 그대로 살아 있습니다.
+# 사용자 규칙(2티어)이 아니라 [defaults](4티어)로 여는 것이라 sudo, rm -rf,
+# curl 파이프 셸 같은 3티어 ask가 먼저 매칭됩니다.
+
+#
+# 작업 공간
+#
+# 이 경로를 실제 프로젝트로 바꾸고 --workspace에도 같은 경로를 입력하세요.
+# 커널 프로파일의 쓰기 창은 --workspace가 열고, 아래 규칙은 정책 계층의 판정입니다.
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "~/work/**"
+action = "allow"
+
+#
+# 툴체인 읽기
+#
+# 에이전트가 부르는 컴파일러와 CLI 가 여기 있습니다. 쓰기는 열지 않습니다.
+# /etc/**는 일부러 넣지 않았습니다. 베이스라인이 forbid로 잡는 /etc/shadow와
+# /etc/sudoers를 사용자 규칙이 건드리는 모양세가 되기 때문입니다.
+[[rules]]
+id = "toolchain-read"
+kind = "file"
+path = ["/usr/**", "/bin/**", "/sbin/**", "/opt/homebrew/**", "/System/**", "/Library/**"]
+mode = ["read", "metadata", "exec"]
+action = "allow"
+
+#
+# Claude Code 설치본
+#
+# native 설치 기준입니다. npm 전역 설치라면 그 경로를 입력하세요.
+[[rules]]
+id = "claude-install"
+kind = "file"
+path = ["~/.local/share/claude/**", "~/.local/bin/**"]
+mode = ["read", "metadata", "exec"]
+action = "allow"
+
+#
+# Claude Code 상태
+#
+# 세션, 히스토리, 설정, 셸 스냅샷이 전부 여기 있어 쓰기가 필요합니다.
+# ~/.claude.json은 MCP 서버 목록과 프로젝트 상태를 담습니다.
+[[rules]]
+id = "claude-state"
+kind = "file"
+path = ["~/.claude/**", "~/.claude.json*"]
+action = "allow"
+
+#
+# 빌드 캐시
+#
+# 이것이 없는 경우 cargo와 npm이 매번 실패합니다.
+[[rules]]
+id = "build-cache"
+kind = "file"
+path = ["~/.cargo/registry/**", "~/.cargo/git/**", "~/.rustup/**", "~/.npm/_cacache/**"]
+action = "allow"
+
+#
+# 임시 파일
+#
+# macOS의 경우 /tmp는 /private/tmp로 가는 심볼릭 링크입니다. 정책은 요청 경로와
+# 해소 경로 양쪽으로 평가하므로(docs/policy-dsl.md 4.1) 둘 다 적습니다.
+[[rules]]
+id = "temp-files"
+kind = "file"
+path = ["/tmp/**", "/private/tmp/**", "/private/var/folders/**"]
+action = "allow"
+
+#
+# 로그인 자격증명
+#
+# Claude Code는 OAuth 토큰을 macOS 키체인의 "Claude Code-credentials" 항목에
+# 넣습니다. 이 규칙이 없으면 프로세스는 뜨지만 'Not logged in'으로 멈춥니다.
+#
+# 경고! 경로 기반 정책으로는 "그 항목 하나만" 을 표현할 수 없습니다. 곧 이
+# 규칙은 로그인 키체인 전체를 에이전트에게 읽힙니다. 개별 항목의 실제 접근은
+# securityd의 ACL이 다시 판정하지만, airlock이 주는 경계는 파일 단위까지입니다.
+#
+# 데이터 보호 키체인(~/Library/Keychains/<UUID>/)은 일부러 뺐습니다. iCloud와
+# Safari 자격증명이 거기 있고 Claude Code는 그걸 사용하지 않습니다.
+#
+# ANTHROPIC_API_KEY를 환경 변수로 넘기면 키체인을 열 필요가 아예 없습니다.
+# 샌드박스 안에서 돌리는 에이전트에는 그쪽이 낫습니다.
+[[rules]]
+id = "keychain-login-ro"
+kind = "file"
+path = "~/Library/Keychains/login.keychain-db"
+mode = ["read", "metadata"]
+action = "allow"
+
+#
+# Anthropic 엔드포인트
+#
+# 여기까지가 Claude Code가 실행되어 로그인하고 대화하는 데 필요한 최소입니다.
+[[rules]]
+id = "anthropic-api"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "claude-code-service"
+kind = "egress"
+host = "code.claude.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "claude-platform"
+kind = "egress"
+host = "platform.claude.com"
+port = 443
+action = "allow"
+
+# OAuth 로그인 흐름
+[[rules]]
+id = "claude-login"
+kind = "egress"
+host = "claude.ai"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "anthropic-console-login"
+kind = "egress"
+host = "console.anthropic.com"
+port = 443
+action = "allow"
+
+# 자동 업데이트입니다.
+# autoUpdates를 꺼 두었다면 딱히 필요 없습니다.
+[[rules]]
+id = "claude-downloads"
+kind = "egress"
+host = "downloads.claude.ai"
+port = 443
+action = "allow"
+
+#
+# 개발 도구 엔드포인트
+#
+# 에이전트에게 git과 패키지 설치를 시킬 때만 필요합니다. 사용하지 않는 경우 지워도 됩니다.
+# *.githubusercontent.com은 하위 도메인에만 매칭하며 apex에는 매칭하지 않습니다
+# (docs/policy-dsl.md 8절). raw와 objects가 여기에 필터링됩니다.
+[[rules]]
+id = "github-web"
+kind = "egress"
+host = "github.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "github-api"
+kind = "egress"
+host = "api.github.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "github-content"
+kind = "egress"
+host = "*.githubusercontent.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "npm-registry"
+kind = "egress"
+host = "registry.npmjs.org"
+port = 443
+action = "allow"
+
+#
+# 비활성화처리된 것들
+#
+# ~/.config/gh/hosts.yml은 GitHub 토큰을 평문으로 담습니다. 읽기를 허용하면
+# gh CLI가 동작하지만 그 토큰은 곧바로 반출 가능한 자격증명이 됩니다. 필요하면
+# 아래를 사용하되, 그 의미를 정확히 이해한 뒤 활성화하시길 바랍니다.
+#
+# [[rules]]
+# id = "gh-token"
+# kind = "file"
+# path = "~/.config/gh/**"
+# mode = ["read", "metadata"]
+# action = "allow"
+#
+# ~/.ssh와 ~/.aws는 베이스라인 forbid 라 여기서 열 수 없습니다. 정말 필요하다면
+# overrides로 그 규칙 id를 지목하고 reason을 적어야 합니다
+# (docs/policy-dsl.md 3.2). git push는 SSH 대신 HTTPS를 쓰는 편이 낫습니다.
