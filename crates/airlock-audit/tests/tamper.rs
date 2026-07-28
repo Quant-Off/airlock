@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use airlock_audit::{
     AuditLog, CHAIN_FILE, Decision, Enforcement, Entry, Event, FileMode, GenesisInfo, Granted,
-    HEAD_FILE, Hash, Head, Record, SessionId, Warning, now_unix_nanos, verify_dir,
+    HEAD_FILE, Hash, Head, Mediation, Record, SessionId, Warning, now_unix_nanos, verify_dir,
 };
 
 struct Scratch(PathBuf);
@@ -37,6 +37,7 @@ fn genesis() -> GenesisInfo {
         cwd: "/Users/me/work".into(),
         policy_digest: Hash::from_bytes([0x42; 32]),
         policy_source: Some("airlock.toml".into()),
+        mediation: Mediation::ExecNet,
     }
 }
 
@@ -676,6 +677,54 @@ fn anchor_from_another_session_is_fatal() {
     let err = verify_dir(s.path()).unwrap_err();
     assert!(
         matches!(err, airlock_audit::Failure::HeadSessionMismatch { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn mediation_level_changes_the_genesis_hash() {
+    let a = Scratch::new("mediation-a");
+    let b = Scratch::new("mediation-b");
+
+    for (s, level) in [
+        (&a, airlock_audit::Mediation::Off),
+        (&b, airlock_audit::Mediation::Full),
+    ] {
+        let mut g = genesis();
+        g.mediation = level;
+        AuditLog::create(
+            s.path(),
+            SessionId::from_bytes([0xAB; 16]),
+            Enforcement::Landlock,
+            true,
+            g,
+        )
+        .unwrap();
+    }
+
+    let ga = read_entries(a.path());
+    let gb = read_entries(b.path());
+    assert_ne!(
+        ga.first().unwrap().hash,
+        gb.first().unwrap().hash,
+        "중계 수준이 다르면 제네시스 해시가 달라야 함"
+    );
+}
+
+#[test]
+fn whitespace_only_final_line_is_a_partial_write() {
+    let s = Scratch::new("trailing-space");
+    build_chain(s.path(), Enforcement::Landlock);
+
+    let path = s.path().join(CHAIN_FILE);
+    let mut body = fs::read_to_string(&path).unwrap();
+    // 개행 없이 공백만 남은 마지막 줄. 쓰기 도중 중단된 흔적이며 눈에 보이지 않는다
+    body.push_str("   ");
+    fs::write(&path, body).unwrap();
+
+    let err = verify_dir(s.path()).unwrap_err();
+    assert!(
+        matches!(err, airlock_audit::Failure::TruncatedFinalLine { .. }),
         "{err}"
     );
 }

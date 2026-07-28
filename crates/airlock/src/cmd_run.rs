@@ -108,6 +108,11 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
     }
 
     let workspace = args.workspace.clone().unwrap_or_else(|| cwd.clone());
+    if let Err(why) = check_workspace(&workspace, args.workspace.is_some()) {
+        eprintln!("airlock: {why}");
+        return 64;
+    }
+
     let mut enforcer: Box<dyn Enforcer> = if args.observe {
         Box::new(ObserveEnforcer)
     } else {
@@ -120,7 +125,7 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         );
         Box::new(ApproveAll)
     } else if TtyApprover::available() {
-        Box::new(TtyApprover)
+        Box::new(TtyApprover::new())
     } else {
         eprintln!("airlock: 경고 /dev/tty가 없어 모든 ask를 거부함");
         Box::new(RefuseAll {
@@ -131,18 +136,11 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
     let program = args.command.first().cloned().unwrap_or_default();
     let rest: Vec<String> = args.command.iter().skip(1).cloned().collect();
 
-    let mut argv = vec!["airlock".to_string(), "run".to_string()];
-    if args.observe {
-        argv.push("--observe".to_string());
-    }
-    argv.push("--".to_string());
-    argv.extend(args.command.iter().cloned());
-
     let config = SessionConfig {
         audit_dir: session_dir.clone(),
         actor: format!("pid:{} {program}", std::process::id()),
         cwd: cwd.clone(),
-        argv,
+        argv: genesis_argv(&args, &workspace),
         fsync_per_entry: !args.no_fsync,
         policy_source: policy_path
             .as_ref()
@@ -158,7 +156,14 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         return 70;
     }
 
-    print_banner(&policy, enforcer.as_ref(), approver.as_ref(), &session_dir);
+    print_banner(
+        &policy,
+        enforcer.as_ref(),
+        approver.as_ref(),
+        &session_dir,
+        &workspace,
+        mediation,
+    );
 
     let report = match airlock_broker::run(
         &program,
@@ -176,9 +181,84 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
     };
 
     print_summary(&report);
-    report
-        .exit_code
-        .unwrap_or(if report.denied > 0 { 77 } else { 0 })
+    report.exit_status()
+}
+
+/// 제네시스 엔트리에 남길 argv를 실제 호출대로 재구성합니다.
+///
+/// 결정의 의미를 바꾸는 플래그가 빠지면 사후 조사에서 그 세션이 무엇을 했는지 알 수
+/// 없습니다. 특히 `--yes`는 승인 통제를 포기하는 설정인데, ask가 한 번도 없었던 세션은
+/// approval 엔트리조차 없어 로그만으로 복원할 방법이 사라집니다
+fn genesis_argv(args: &RunArgs, workspace: &std::path::Path) -> Vec<String> {
+    let mut argv = vec!["airlock".to_string(), "run".to_string()];
+    if let Some(p) = &args.policy {
+        argv.push("--policy".to_string());
+        argv.push(p.display().to_string());
+    }
+    if args.observe {
+        argv.push("--observe".to_string());
+    }
+    if let Some(d) = &args.audit_dir {
+        argv.push("--audit-dir".to_string());
+        argv.push(d.display().to_string());
+    }
+    // 작업 공간은 기본값이 cwd 이므로 명시 여부와 무관하게 실제 값을 남깁니다.
+    // 무엇이 쓰기 가능했는지는 사후 조사의 핵심입니다
+    argv.push("--workspace".to_string());
+    argv.push(workspace.display().to_string());
+    if args.no_network {
+        argv.push("--no-network".to_string());
+    }
+    if args.yes {
+        argv.push("--yes".to_string());
+    }
+    if args.no_fsync {
+        argv.push("--no-fsync".to_string());
+    }
+    argv.push("--mediate".to_string());
+    argv.push(args.mediate.clone());
+    argv.push("--".to_string());
+    argv.extend(args.command.iter().cloned());
+    argv
+}
+
+/// 작업 공간이 쓰기 허용으로 열려도 되는 범위인지 봅니다.
+///
+/// 작업 공간은 통째로 읽기 쓰기가 열립니다. 기본값이 cwd 이므로 홈에서 그냥 실행하면
+/// 홈 전체가 쓰기 가능해지고, Linux 에서는 순회 예산까지 넘겨 조용히 gap 이 됩니다.
+/// 격리를 택한다는 전제가 무너지므로 그 경우는 명시를 요구합니다
+///
+/// # Errors
+/// 파일시스템 루트는 명시해도 거부합니다. 그 아래를 통째로 여는 것은 어떤 정책으로도
+/// 정당화되지 않습니다
+fn check_workspace(workspace: &std::path::Path, explicit: bool) -> Result<(), String> {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let ws = canon(workspace);
+
+    if ws.parent().is_none() {
+        return Err(format!(
+            "작업 공간이 파일시스템 루트({})임. 루트를 쓰기 허용으로 열지 않음. \
+             --workspace 로 실제 작업 디렉토리를 지정할 것",
+            ws.display()
+        ));
+    }
+
+    let home = canon(&airlock_policy::path::home_dir());
+    if ws == home {
+        if !explicit {
+            return Err(format!(
+                "작업 공간이 홈 전체({})가 됨. 작업 공간은 통째로 쓰기 허용이므로 \
+                 홈에서 그냥 실행하지 않음. 하위 디렉토리로 옮기거나 --workspace 로 \
+                 좁혀서 지정할 것",
+                ws.display()
+            ));
+        }
+        eprintln!(
+            "airlock: 경고 작업 공간이 홈 전체({})임. 홈 아래 모든 파일이 쓰기 허용됨",
+            ws.display()
+        );
+    }
+    Ok(())
 }
 
 fn build_enforcer(workspace: &std::path::Path, allow_network: bool) -> Box<dyn Enforcer> {
@@ -226,9 +306,12 @@ fn print_banner(
     enforcer: &dyn Enforcer,
     approver: &dyn Approver,
     session_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    mediation: airlock_broker::Mediation,
 ) {
     let digest = airlock_audit::Hash::from_bytes(policy.digest());
     let short: String = digest.to_hex().chars().take(12).collect();
+    let effective = airlock_broker::effective_mediation(mediation);
     eprintln!("\x1b[1;36mairlock\x1b[0m {}", env!("CARGO_PKG_VERSION"));
     eprintln!(
         "  정책     {} ({} 규칙, 다이제스트 {short})",
@@ -236,9 +319,25 @@ fn print_banner(
         policy.rule_count()
     );
     eprintln!("  강제     {}", enforcer.describe());
+    if effective == mediation {
+        eprintln!("  중계     {}", effective.as_str());
+    } else {
+        // 요청값과 적용값이 다르면 둘을 같이 보여 줍니다. 요청값만 보여 주면
+        // 배너가 실제보다 강한 보증을 하는 것이 됩니다
+        eprintln!(
+            "  중계     {} (요청 {})",
+            effective.as_str(),
+            mediation.as_str()
+        );
+    }
+    eprintln!("  작업공간 {}", workspace.display());
     eprintln!("  승인     {}", approver.describe());
     eprintln!("  감사     {}", session_dir.display());
-    for gap in enforcer.gaps() {
+    for gap in enforcer
+        .gaps()
+        .into_iter()
+        .chain(airlock_broker::mediation_gaps(mediation))
+    {
         eprintln!("  \x1b[33m한계\x1b[0m     {gap}");
     }
     eprintln!();
@@ -249,6 +348,10 @@ fn print_summary(report: &airlock_broker::RunReport) {
     eprintln!();
     eprintln!("\x1b[1;36mairlock\x1b[0m 세션 종료");
     eprintln!("  강제     {}", report.enforcement);
+    eprintln!("  중계     {}", report.mediation.as_str());
+    if let Some(signal) = report.signal {
+        eprintln!("  종료     시그널 {signal}");
+    }
     eprintln!("  승인요청 {}", report.asked);
     eprintln!("  차단     {}", report.denied);
     eprintln!("  체인헤드 {short}");

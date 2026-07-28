@@ -1,4 +1,13 @@
-use airlock_policy::rule::Matcher;
+//! 이 모듈은 정책을 macOS Seatbelt 프로파일(SBPL)로 번역합니다.
+//!
+//! # Features
+//! 프로파일은 deny-default이며 SBPL은 마지막 규칙이 이기므로, 시스템 기본 허용을 먼저
+//! 깔고 정책의 차단 규칙을 맨 뒤에 둡니다. 파일 규칙과 exec 경로 규칙, 아웃바운드
+//! 전체 차단까지는 커널에서 강제되지만 호스트·포트 단위 egress와 argv 조건은 SBPL로
+//! 표현할 수 없습니다. 옮기지 못한 규칙은 조용히 버리지 않고 `untranslatable`로
+//! 돌려주어 배너의 한계 목록에 그대로 나오게 합니다
+
+use airlock_policy::rule::{Matcher, ProgramMatch};
 use airlock_policy::{Action, FileMode, ModeSet, Policy};
 
 use crate::sbpl;
@@ -77,10 +86,13 @@ impl ProfileOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeneratedProfile {
     pub text: String,
+    /// SBPL로 옮길 수 없어 커널이 판정하지 못하는 규칙의 id와 사유
     pub untranslatable: Vec<String>,
+    /// 일부러 방출하지 않은 `ask` exec 규칙의 id. 사유는 [`exec_ask_note`]
+    pub ask_exec: Vec<String>,
 }
 
 fn mode_reads(modes: ModeSet) -> bool {
@@ -98,6 +110,7 @@ fn mode_writes(modes: ModeSet) -> bool {
 pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     let mut out = String::new();
     let mut untranslatable = Vec::new();
+    let mut ask_exec = Vec::new();
 
     out.push_str("(version 1)\n");
     out.push_str(";; airlock 생성 프로파일. deny-default이며 마지막 규칙이 이김\n");
@@ -162,12 +175,19 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
         }
     }
 
-    if opts.allow_network {
-        out.push_str(";; --- 네트워크 ---\n");
+    out.push_str(";; --- 네트워크 ---\n");
+    if network_allowed(policy, opts) {
         out.push_str(";; 주의 호스트 단위 제어는 Seatbelt로 표현할 수 없음\n");
         out.push_str(";; egress 정책은 프록시 층에서 강제함\n");
         out.push_str("(allow network-outbound)\n");
         out.push_str("(allow network-bind (local ip))\n\n");
+        // 아웃바운드가 열린 채로는 egress 제한 규칙 중 어느 것도 커널이 판정하지 못합니다
+        for rule in restrictive_egress_ids(policy) {
+            untranslatable.push(format!("{rule} (호스트·포트 egress)"));
+        }
+    } else {
+        out.push_str(";; 정책에 egress allow 규칙이 없어 아웃바운드를 통째로 차단함\n");
+        out.push_str(";; deny-default 프로파일이므로 규칙을 방출하지 않는 것이 곧 차단임\n\n");
     }
 
     out.push_str(";; --- 정책 allow 규칙 ---\n");
@@ -179,11 +199,112 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     emit_file_rules(policy, &mut out, &mut untranslatable, |a| {
         matches!(a, Action::Deny | Action::Forbid | Action::Ask)
     });
+    emit_exec_rules(policy, &mut out, &mut untranslatable, &mut ask_exec);
 
     GeneratedProfile {
         text: out,
         untranslatable,
+        ask_exec,
     }
+}
+
+/// 아웃바운드를 열어도 되는지.
+///
+/// `--no-network`가 우선이며, 그다음은 정책입니다. egress allow 규칙이 하나도 없으면
+/// 모든 연결이 `[defaults].egress`(allow 금지, 곧 deny 또는 ask)로 떨어지므로 통째로
+/// 막습니다. 같은 정책이 Landlock에서 TCP 전면 차단이 되는 것과 결론을 맞춥니다
+fn network_allowed(policy: &Policy, opts: &ProfileOptions) -> bool {
+    if !opts.allow_network {
+        return false;
+    }
+    tiers(policy)
+        .into_iter()
+        .flatten()
+        .any(|r| r.action == Action::Allow && matches!(r.matcher, Matcher::Egress { .. }))
+}
+
+fn restrictive_egress_ids(policy: &Policy) -> Vec<String> {
+    tiers(policy)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.action != Action::Allow && matches!(r.matcher, Matcher::Egress { .. }))
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+fn tiers(policy: &Policy) -> [&[airlock_policy::Rule]; 3] {
+    [
+        policy.self_protect_rules(),
+        policy.user_rules(),
+        policy.baseline_rules(),
+    ]
+}
+
+/// exec 제한 규칙을 `process-exec*` 차단으로 옮깁니다.
+///
+/// `ask`는 일부러 방출하지 않습니다. macOS에서 답을 받을 수 있는 ask는 브로커가 spawn
+/// 전에 묻는 최상위 exec 하나뿐인데, 그것을 프로파일에서 deny로 내려 버리면 사람이
+/// 승인한 실행이 커널에서 막혀 아무 방법으로도 진행할 수 없습니다. 파일 규칙의
+/// `ask` -> `deny` 강하와 다른 이유가 여기에 있습니다
+fn emit_exec_rules(
+    policy: &Policy,
+    out: &mut String,
+    untranslatable: &mut Vec<String>,
+    ask_exec: &mut Vec<String>,
+) {
+    for tier in tiers(policy) {
+        for rule in tier {
+            let Matcher::Exec { .. } = &rule.matcher else {
+                continue;
+            };
+            if rule.action == Action::Allow {
+                // 위에서 process-exec*를 통째로 열어 두었으므로 더 넓힐 것이 없습니다
+                continue;
+            }
+            if rule.action == Action::Ask {
+                ask_exec.push(rule.id.clone());
+                continue;
+            }
+            match exec_targets(&rule.matcher) {
+                Ok(targets) => {
+                    for target in targets {
+                        out.push_str(&format!(
+                            "(deny process-exec* {}) ;; {}\n",
+                            target.render(),
+                            rule.id
+                        ));
+                    }
+                }
+                Err(why) => untranslatable.push(format!("{} ({why})", rule.id)),
+            }
+        }
+    }
+}
+
+fn exec_targets(matcher: &Matcher) -> std::result::Result<Vec<sbpl::Target>, &'static str> {
+    let Matcher::Exec {
+        program,
+        argv_contains,
+        argv_pattern,
+    } = matcher
+    else {
+        return Err("exec 규칙이 아님");
+    };
+    if !argv_contains.is_empty() || argv_pattern.is_some() {
+        // argv를 보고 좁힌 규칙을 프로그램 경로만으로 옮기면 정책보다 넓게 막습니다
+        return Err("argv 조건은 Seatbelt가 볼 수 없어 표현 불가");
+    }
+    let Some(pm) = program else {
+        return Err("프로그램 조건이 없어 실행 대상을 특정할 수 없음");
+    };
+    let targets = match pm {
+        ProgramMatch::Basename(name) => sbpl::basename_targets(name),
+        ProgramMatch::Path(pattern) => sbpl::targets_for(pattern),
+    };
+    if targets.is_empty() {
+        return Err("경로 패턴을 SBPL 대상으로 옮길 수 없음");
+    }
+    Ok(targets)
 }
 
 fn emit_file_rules(
@@ -192,16 +313,14 @@ fn emit_file_rules(
     untranslatable: &mut Vec<String>,
     keep: impl Fn(Action) -> bool,
 ) {
-    let tiers: [&[airlock_policy::Rule]; 3] = [
-        policy.self_protect_rules(),
-        policy.user_rules(),
-        policy.baseline_rules(),
-    ];
-    for tier in tiers {
+    for tier in tiers(policy) {
         for rule in tier {
             if !keep(rule.action) {
                 continue;
             }
+            // exec 과 egress 는 이 함수의 대상이 아닙니다. 각각 emit_exec_rules 와
+            // 네트워크 절이 처리하며, 여기서 조용히 버리면 강제되지 않는 규칙이
+            // 강제된 것처럼 보입니다
             let Matcher::File { paths, modes } = &rule.matcher else {
                 continue;
             };
@@ -245,7 +364,12 @@ fn emit_file_rules(
 }
 
 pub fn ask_rules_are_denied_note() -> &'static str {
-    "Seatbelt는 사람 승인을 표현할 수 없으므로 ask 규칙은 프로파일에서 deny로 내려감"
+    "Seatbelt는 사람 승인을 표현할 수 없으므로 ask 파일 규칙은 프로파일에서 deny로 내려감"
+}
+
+pub fn exec_ask_note() -> &'static str {
+    "ask exec 규칙은 커널에서 강제되지 않음. macOS 에서 답을 받을 수 있는 ask 는 브로커가 \
+     spawn 전에 묻는 최상위 exec 하나뿐이라, deny 로 내리면 승인된 실행까지 막히기 때문임"
 }
 
 #[cfg(test)]
@@ -374,13 +498,152 @@ action = "allow"
         assert!(!line.contains("file-write*"), "{line}");
     }
 
+    fn with_egress(extra: &str) -> Policy {
+        let src = format!(
+            r#"
+version = 1
+[defaults]
+egress = "deny"
+{extra}
+"#
+        );
+        Policy::load_str(&src, &ctx()).unwrap()
+    }
+
     #[test]
-    fn network_section_records_the_enforcement_gap() {
+    fn egress_deny_default_closes_outbound_entirely() {
         let p = generate(&baseline(), &ProfileOptions::default());
+        assert!(
+            !p.text.contains("(allow network-outbound)"),
+            "egress allow 규칙이 없는 정책이 아웃바운드를 열면 정책과 정면으로 모순됨: {}",
+            p.text
+        );
+        assert!(
+            p.text.contains("아웃바운드를 통째로 차단함"),
+            "차단했다는 사실을 프로파일이 밝혀야 함"
+        );
+    }
+
+    #[test]
+    fn egress_allow_rule_opens_outbound_and_declares_the_gap() {
+        let policy = with_egress(
+            r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+"#,
+        );
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(p.text.contains("(allow network-outbound)"), "{}", p.text);
         assert!(
             p.text
                 .contains("호스트 단위 제어는 Seatbelt로 표현할 수 없음"),
             "강제할 수 없는 부분을 프로파일이 침묵하면 안 됨"
+        );
+    }
+
+    #[test]
+    fn egress_denies_are_untranslatable_once_outbound_is_open() {
+        let policy = with_egress(
+            r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "no-metadata"
+kind = "egress"
+host = "169.254.169.254"
+action = "deny"
+"#,
+        );
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(
+            p.untranslatable.iter().any(|u| u.contains("no-metadata")),
+            "커널이 판정하지 못하는 egress 규칙이 조용히 사라지면 안 됨: {:?}",
+            p.untranslatable
+        );
+    }
+
+    #[test]
+    fn exec_deny_reaches_the_profile() {
+        let src = r#"
+version = 1
+[[rules]]
+id = "no-curl"
+kind = "exec"
+program = "curl"
+action = "deny"
+"#;
+        let policy = Policy::load_str(src, &ctx()).unwrap();
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(
+            p.text
+                .contains(r##"(deny process-exec* (regex #"^.*/curl$")) ;; no-curl"##),
+            "exec deny 가 커널까지 내려가야 함: {}",
+            p.text
+        );
+        let deny_idx = p.text.find(";; no-curl").expect("규칙 없음");
+        let allow_idx = p
+            .text
+            .find("(allow process-exec*)")
+            .expect("기본 허용 없음");
+        assert!(
+            allow_idx < deny_idx,
+            "SBPL은 마지막 규칙이 이기므로 exec deny 가 기본 허용 뒤에 와야 함"
+        );
+    }
+
+    #[test]
+    fn exec_deny_by_path_uses_a_literal_target() {
+        let src = r#"
+version = 1
+[[rules]]
+id = "no-nc"
+kind = "exec"
+program = "/usr/bin/nc"
+action = "deny"
+"#;
+        let policy = Policy::load_str(src, &ctx()).unwrap();
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(
+            p.text
+                .contains(r#"(deny process-exec* (literal "/usr/bin/nc")) ;; no-nc"#),
+            "{}",
+            p.text
+        );
+    }
+
+    #[test]
+    fn exec_rule_with_argv_condition_is_untranslatable() {
+        let src = r#"
+version = 1
+[[rules]]
+id = "no-force-push"
+kind = "exec"
+program = "git"
+argv_contains = ["--force"]
+action = "deny"
+"#;
+        let policy = Policy::load_str(src, &ctx()).unwrap();
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(
+            !p.text.contains(";; no-force-push"),
+            "argv 조건을 프로그램 경로만으로 옮기면 정책보다 넓게 막음: {}",
+            p.text
+        );
+        assert!(
+            p.untranslatable
+                .iter()
+                .any(|u| u.contains("no-force-push") && u.contains("argv")),
+            "{:?}",
+            p.untranslatable
         );
     }
 
@@ -401,13 +664,40 @@ action = "allow"
     }
 
     #[test]
-    fn baseline_profile_has_no_untranslatable_rules() {
-        let p = generate(&baseline(), &ProfileOptions::default());
+    fn every_baseline_file_rule_is_translatable() {
+        let policy = baseline();
+        let p = generate(&policy, &ProfileOptions::default());
+        let file_ids: Vec<&str> = policy
+            .baseline_rules()
+            .iter()
+            .chain(policy.self_protect_rules())
+            .filter(|r| matches!(r.matcher, Matcher::File { .. }))
+            .map(|r| r.id.as_str())
+            .collect();
+        for id in file_ids {
+            assert!(
+                !p.untranslatable.iter().any(|u| u.starts_with(id)),
+                "베이스라인 파일 규칙 {id}가 프로파일로 옮겨지지 않았음: {:?}",
+                p.untranslatable
+            );
+        }
         assert!(
             p.untranslatable.is_empty(),
-            "내장 베이스라인은 전부 SBPL로 표현되어야 함: {:?}",
+            "베이스라인에 옮기지 못한 규칙이 있음: {:?}",
             p.untranslatable
         );
+    }
+
+    #[test]
+    fn baseline_exec_asks_are_declared_not_dropped() {
+        let p = generate(&baseline(), &ProfileOptions::default());
+        for id in ["danger-rm", "sudo-exec", "pipe-curl-to-shell"] {
+            assert!(
+                p.ask_exec.iter().any(|u| u == id),
+                "강제되지 않는 exec 규칙 {id}가 조용히 사라졌음: {:?}",
+                p.ask_exec
+            );
+        }
     }
 
     #[test]

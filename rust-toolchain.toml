@@ -1,0 +1,6 @@
+[toolchain]
+# 재현 빌드를 위해 툴체인을 고정합니다. 워크스페이스의 rust-version(1.87)은 하한이고
+# 이 값은 CI와 로컬이 같은 컴파일러를 쓰게 하는 기준입니다
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

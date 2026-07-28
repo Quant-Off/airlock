@@ -44,6 +44,7 @@ pub struct SeatbeltEnforcer {
     strategy: Strategy,
     compiled: Option<CString>,
     untranslatable: Vec<String>,
+    ask_exec: Vec<String>,
     denied_overrides: Vec<String>,
 }
 
@@ -60,6 +61,7 @@ impl SeatbeltEnforcer {
             strategy: Strategy::SandboxInit,
             compiled: None,
             untranslatable: Vec::new(),
+            ask_exec: Vec::new(),
             denied_overrides: Vec::new(),
         }
     }
@@ -116,6 +118,7 @@ impl Enforcer for SeatbeltEnforcer {
     fn prepare(&mut self, policy: &Policy) -> Result<()> {
         let generated = profile::generate(policy, &self.options);
         self.untranslatable = generated.untranslatable;
+        self.ask_exec = generated.ask_exec;
         self.denied_overrides = policy
             .user_rules()
             .iter()
@@ -189,6 +192,13 @@ impl Enforcer for SeatbeltEnforcer {
             gaps.push(format!(
                 "프로파일로 옮기지 못한 규칙: {}",
                 self.untranslatable.join(", ")
+            ));
+        }
+        if !self.ask_exec.is_empty() {
+            gaps.push(format!(
+                "{}: {}",
+                profile::exec_ask_note(),
+                self.ask_exec.join(", ")
             ));
         }
         if !self.denied_overrides.is_empty() {

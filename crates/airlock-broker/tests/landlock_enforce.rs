@@ -374,3 +374,94 @@ fn wrap_before_prepare_is_an_error() {
     let mut cmd = Command::new("/bin/true");
     assert!(e.wrap(&mut cmd).is_err());
 }
+
+// ---------- 심볼릭 링크 ----------
+
+/// 작업 공간 안의 링크가 정책이 막은 대상을 열어 주는지 봅니다.
+///
+/// 시크릿을 가짜 home 아래에 두어 베이스라인 forbid 가 걸리게 합니다. 스크래치가 `/tmp`
+/// 안에 있고 `/tmp` 는 임시 디렉토리로 통째로 열리므로, 단순히 작업 공간 밖에 두는 것만
+/// 으로는 대조군이 성립하지 않습니다
+#[test]
+fn symlink_does_not_open_a_forbidden_target() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let s = Scratch::new("symlink");
+
+    let home = s.path().join("home");
+    let ssh = home.join(".ssh");
+    fs::create_dir_all(&ssh).unwrap();
+    let secret = ssh.join("id_ed25519");
+    fs::write(&secret, b"PRIVATE KEY\n").unwrap();
+
+    // 작업 공간. .env 하나만 있어도 이 디렉토리는 Partial 이 되어 자식이 개별 규칙을 받습니다
+    let ws = s.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    fs::write(ws.join(".env"), b"K=1\n").unwrap();
+    fs::write(ws.join("ok.txt"), b"fine\n").unwrap();
+    std::os::unix::fs::symlink(&ssh, ws.join("link")).unwrap();
+    std::os::unix::fs::symlink(&secret, ws.join("key")).unwrap();
+
+    let src = r#"
+version = 1
+name = "landlock-symlink"
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+"#;
+    let ctx = LoadContext::new(&home, s.path().join("audit"));
+    let policy = Policy::load_str(src, &ctx).unwrap();
+
+    assert!(
+        read_under_sandbox(&policy, &ws, &ws.join("ok.txt")),
+        "작업 공간의 평범한 파일을 읽지 못함. 이 테스트의 대조군이 무의미해짐"
+    );
+    assert!(
+        !read_under_sandbox(&policy, &ws, &secret),
+        "정책이 막은 경로를 직접 열었는데 읽힘. 계획 자체가 잘못됨"
+    );
+    assert!(
+        !read_under_sandbox(&policy, &ws, &ws.join("key")),
+        "파일 링크를 통해 시크릿이 읽힘. 링크 자신에게 규칙을 걸면 대상 inode 가 열림"
+    );
+    assert!(
+        !read_under_sandbox(&policy, &ws, &ws.join("link/id_ed25519")),
+        "ln -s ~/.ssh link 하나로 시크릿 트리 전체가 열림"
+    );
+}
+
+#[test]
+fn a_directory_that_cannot_be_listed_is_not_granted_wholesale() {
+    if skip_if_unsupported() {
+        return;
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("root 는 나열 권한 검사를 우회하므로 건너뜀");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("unlistable");
+    let ws = s.path().join("ws");
+    let closed = ws.join("closed");
+    fs::create_dir_all(&closed).unwrap();
+    fs::write(closed.join("inside.txt"), b"hidden\n").unwrap();
+    fs::write(ws.join("ok.txt"), b"fine\n").unwrap();
+    // 나열은 못 하지만 통과는 되는 디렉토리. 이름을 아는 하위는 DAC 로는 열립니다
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o311)).unwrap();
+
+    let policy = permissive_policy(&ws);
+
+    let readable = read_under_sandbox(&policy, &ws, &ws.join("ok.txt"));
+    let hidden = read_under_sandbox(&policy, &ws, &closed.join("inside.txt"));
+
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(readable, "형제 파일 읽기가 막히면 계획이 과도하게 좁음");
+    assert!(
+        !hidden,
+        "나열할 수 없는 디렉토리의 하위가 검사 없이 통째로 허용됨"
+    );
+}

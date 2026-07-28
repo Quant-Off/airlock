@@ -30,7 +30,20 @@ const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
+/// 프로세스 전체를 즉시 죽입니다.
+///
+/// 중계할 수 없는 ABI로 들어온 syscall에 씁니다. 통과시키면 그 ABI로 부른 exec과
+/// connect가 승인 흐름을 통째로 우회하고, errno로 거부하면 프로그램이 무엇이 실패했는지
+/// 모른 채 같은 호출을 반복합니다
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+
+/// x86_64에서 x32 ABI로 부른 syscall은 번호에 이 비트가 켜집니다.
+///
+/// `arch`는 여전히 `AUDIT_ARCH_X86_64`라서 아키텍처 검사를 통과하지만 번호 체계가
+/// 달라 비교가 모두 빗나갑니다. 검사 없이 통과시키면 중계가 우회됩니다
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 // _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr, type = '!'
 const fn ioc(dir: libc::c_ulong, nr: libc::c_ulong, size: libc::c_ulong) -> libc::c_ulong {
@@ -99,10 +112,47 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
 
+/// 이 빌드가 도는 아키텍처의 `AUDIT_ARCH_*` 값.
+///
+/// `__AUDIT_ARCH_64BIT`(0x8000_0000)과 `__AUDIT_ARCH_LE`(0x4000_0000)에 ELF 머신 번호를
+/// 더한 값입니다. 모르는 아키텍처에서 컴파일이 깨지지 않도록 `None`으로 두고, 중계를
+/// 켜려는 시점에 런타임 오류로 알립니다. 아키텍처 검사 없는 필터를 거는 것보다 낫습니다
 #[cfg(target_arch = "x86_64")]
-const NATIVE_ARCH: u32 = 0xc000_003e;
+const NATIVE_ARCH: Option<u32> = Some(0xc000_003e);
 #[cfg(target_arch = "aarch64")]
-const NATIVE_ARCH: u32 = 0xc000_00b7;
+const NATIVE_ARCH: Option<u32> = Some(0xc000_00b7);
+#[cfg(target_arch = "riscv64")]
+const NATIVE_ARCH: Option<u32> = Some(0xc000_00f3);
+#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+const NATIVE_ARCH: Option<u32> = Some(0xc000_0015);
+#[cfg(target_arch = "s390x")]
+const NATIVE_ARCH: Option<u32> = Some(0x8000_0016);
+#[cfg(target_arch = "loongarch64")]
+const NATIVE_ARCH: Option<u32> = Some(0xc000_0102);
+#[cfg(target_arch = "x86")]
+const NATIVE_ARCH: Option<u32> = Some(0x4000_0003);
+#[cfg(all(target_arch = "arm", target_endian = "little"))]
+const NATIVE_ARCH: Option<u32> = Some(0x4000_0028);
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    all(target_arch = "powerpc64", target_endian = "little"),
+    target_arch = "s390x",
+    target_arch = "loongarch64",
+    target_arch = "x86",
+    all(target_arch = "arm", target_endian = "little"),
+)))]
+const NATIVE_ARCH: Option<u32> = None;
+
+/// 이 아키텍처에 남아 있는 `open` syscall 번호.
+///
+/// `openat`만 있는 아키텍처에서는 `None`입니다. 빠뜨리면 `open`으로 파일을 여는
+/// 프로그램이 관측되지 않습니다
+#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm"))]
+const LEGACY_OPEN: Option<i32> = Some(libc::SYS_open as i32);
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm")))]
+const LEGACY_OPEN: Option<i32> = None;
 
 /// 어디까지 중계할지.
 ///
@@ -145,7 +195,6 @@ impl Level {
 /// `openat2`는 두 아키텍처에서 번호가 같아 리터럴로 적습니다. 빠뜨리면 그 경로로
 /// 파일을 여는 프로그램이 관측되지 않습니다
 fn mediated_syscalls(level: Level) -> Vec<u32> {
-    #[allow(unused_mut)]
     let mut v: Vec<u32> = vec![
         libc::SYS_connect as u32,
         libc::SYS_execve as u32,
@@ -154,26 +203,43 @@ fn mediated_syscalls(level: Level) -> Vec<u32> {
     if level == Level::Full {
         v.push(libc::SYS_openat as u32);
         v.push(437); // openat2
-        #[cfg(target_arch = "x86_64")]
-        v.push(libc::SYS_open as u32);
+        if let Some(nr) = LEGACY_OPEN {
+            v.push(nr as u32);
+        }
     }
     v
 }
 
-fn build_filter(level: Level) -> Vec<SockFilter> {
+/// 중계 필터를 조립합니다.
+///
+/// # Errors
+/// 이 아키텍처의 `AUDIT_ARCH_*` 값을 모르면 `None`입니다. 아키텍처 검사를 뺀 필터는
+/// 다른 ABI의 syscall 번호를 자기 것으로 착각하므로 만들지 않습니다
+fn build_filter(level: Level) -> Option<Vec<SockFilter>> {
     const LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
     const JMP_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
     const RET_K: u16 = 0x06; // BPF_RET | BPF_K
 
+    let native = NATIVE_ARCH?;
     let nrs = mediated_syscalls(level);
-    let mut prog = Vec::with_capacity(nrs.len().saturating_add(5));
+    let mut prog = Vec::with_capacity(nrs.len().saturating_add(8));
 
-    // 아키텍처가 다르면 판단하지 않고 통과시킵니다. 모르는 ABI를 잘못 읽느니 낫습니다
+    // 아키텍처가 다르면 죽입니다. 32비트 바이너리를 실행하면 syscall 번호 체계가 달라
+    // 비교가 전부 빗나가는데, 통과시키면 exec·connect 중계를 통째로 우회합니다.
+    // exec ask 는 이 층에만 있으므로 그 우회는 곧 승인 우회입니다
     prog.push(stmt(LD_W_ABS, 4)); // seccomp_data.arch
-    prog.push(jump(JMP_JEQ_K, NATIVE_ARCH, 1, 0));
-    prog.push(stmt(RET_K, SECCOMP_RET_ALLOW));
+    prog.push(jump(JMP_JEQ_K, native, 1, 0));
+    prog.push(stmt(RET_K, SECCOMP_RET_KILL_PROCESS));
 
     prog.push(stmt(LD_W_ABS, 0)); // seccomp_data.nr
+
+    // x32 는 arch 가 같으므로 번호로만 걸러 냅니다
+    #[cfg(target_arch = "x86_64")]
+    {
+        const JMP_JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
+        prog.push(jump(JMP_JGE_K, X32_SYSCALL_BIT, 0, 1));
+        prog.push(stmt(RET_K, SECCOMP_RET_KILL_PROCESS));
+    }
 
     // 마지막 두 명령이 ALLOW, USER_NOTIF이므로 매칭되면 그 지점으로 점프합니다
     let total_after = nrs.len();
@@ -185,7 +251,7 @@ fn build_filter(level: Level) -> Vec<SockFilter> {
     }
     prog.push(stmt(RET_K, SECCOMP_RET_ALLOW));
     prog.push(stmt(RET_K, SECCOMP_RET_USER_NOTIF));
-    prog
+    Some(prog)
 }
 
 /// 자식에서 seccomp 필터를 걸고 listener fd를 돌려줍니다.
@@ -294,11 +360,17 @@ unsafe fn recv_fd(sock: RawFd) -> std::io::Result<OwnedFd> {
     }
 }
 
+/// 읽을 문자열의 최대 길이. 리눅스 `PATH_MAX`와 같습니다.
+///
+/// 상한을 넘기면 잘린 값을 돌려주지 않고 실패로 처리합니다. 부분 경로로 정책을 평가하면
+/// 실제로 열리는 대상과 다른 것을 판정하게 됩니다
+const MAX_CSTR: usize = 4096;
+
 /// 대상 프로세스의 메모리에서 널 종료 문자열을 읽습니다.
 ///
 /// # Errors
-/// 대상이 이미 죽었거나 주소가 유효하지 않으면 실패합니다. 실패는 곧 판단 불가이며
-/// 호출자는 제한 방향으로 처리합니다
+/// 대상이 이미 죽었거나 주소가 유효하지 않거나 [`MAX_CSTR`]를 넘으면 실패합니다.
+/// 실패는 곧 판단 불가이며 호출자는 제한 방향으로 처리합니다
 fn read_cstr(pid: u32, addr: u64) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 
@@ -330,7 +402,7 @@ fn read_cstr(pid: u32, addr: u64) -> Option<PathBuf> {
             return Some(PathBuf::from(std::ffi::OsString::from_vec(out)));
         }
         out.extend_from_slice(&buf[..n]);
-        if out.len() > 4096 {
+        if out.len() > MAX_CSTR {
             return None;
         }
         offset = offset.saturating_add(n as u64);
@@ -355,12 +427,32 @@ fn resolve_at(pid: u32, dirfd: i64, path: PathBuf) -> PathBuf {
     }
 }
 
-fn sockaddr_of(pid: u32, addr: u64, len: u64) -> Option<(String, u16, Protocol)> {
+/// `connect`의 대상 주소를 읽은 결과.
+///
+/// "정책 대상이 아님"과 "판단할 수 없음"을 반드시 구분합니다. 둘을 같은 값으로 뭉개면
+/// 유닉스 소켓을 통과시키려던 경로가 주소를 읽지 못한 경우까지 통과시킵니다
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Peer {
+    Inet {
+        host: String,
+        port: u16,
+        protocol: Protocol,
+    },
+    /// 유닉스 소켓 등 egress 정책의 대상이 아닌 주소 계열
+    NotInet,
+    /// 읽지 못했거나 길이·형태가 규격에 맞지 않음
+    Unreadable,
+}
+
+fn sockaddr_of(pid: u32, addr: u64, len: u64) -> Peer {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    let len = usize::try_from(len).ok()?;
+    let Ok(len) = usize::try_from(len) else {
+        return Peer::Unreadable;
+    };
+    // sockaddr_storage 보다 큰 길이나 sa_family 도 담기지 못하는 길이는 커널도 거부합니다
     if !(2..=128).contains(&len) {
-        return None;
+        return Peer::Unreadable;
     }
     let mut buf = vec![0u8; len];
     let local = libc::iovec {
@@ -374,25 +466,40 @@ fn sockaddr_of(pid: u32, addr: u64, len: u64) -> Option<(String, u16, Protocol)>
     // # Safety
     // 두 iovec는 유효하고 len 바이트만 복사합니다
     let n = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
-    if n <= 0 {
-        return None;
+    // 짧게 읽힌 버퍼의 나머지는 0으로 남아 있어 엉뚱한 주소로 해석됩니다
+    if n < 0 || usize::try_from(n).map(|got| got != len).unwrap_or(true) {
+        return Peer::Unreadable;
     }
 
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     match i32::from(family) {
-        libc::AF_INET if len >= 8 => {
+        libc::AF_INET => {
+            if len < 8 {
+                return Peer::Unreadable;
+            }
             let port = u16::from_be_bytes([buf[2], buf[3]]);
             let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-            Some((ip.to_string(), port, Protocol::Tcp))
+            Peer::Inet {
+                host: ip.to_string(),
+                port,
+                protocol: Protocol::Tcp,
+            }
         }
-        libc::AF_INET6 if len >= 24 => {
+        libc::AF_INET6 => {
+            if len < 24 {
+                return Peer::Unreadable;
+            }
             let port = u16::from_be_bytes([buf[2], buf[3]]);
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&buf[8..24]);
             let ip = Ipv6Addr::from(octets);
-            Some((ip.to_canonical().to_string(), port, Protocol::Tcp))
+            Peer::Inet {
+                host: ip.to_canonical().to_string(),
+                port,
+                protocol: Protocol::Tcp,
+            }
         }
-        _ => None,
+        _ => Peer::NotInet,
     }
 }
 
@@ -487,17 +594,23 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
 
         let allow = if nr == connect_nr {
             match sockaddr_of(pid, args[1], args[2]) {
-                Some((host, port, proto)) => {
+                Peer::Inet {
+                    host,
+                    port,
+                    protocol,
+                } => {
                     let mut s = match session.lock() {
                         Ok(s) => s,
                         Err(_) => break,
                     };
-                    s.check_egress(&host, port, proto)
+                    s.check_egress(&host, port, protocol)
                         .map(|o| o.permitted())
                         .unwrap_or(false)
                 }
-                // 주소를 읽지 못하면 유닉스 소켓 등 판단 대상이 아닙니다. 통과시킵니다
-                None => true,
+                // 유닉스 소켓 등은 egress 정책의 대상이 아니므로 통과시킵니다
+                Peer::NotInet => true,
+                // 주소를 읽지 못한 것은 판단 불가입니다. exec 과 open 이 그렇게 하듯 거부합니다
+                Peer::Unreadable => false,
             }
         } else if nr == execve_nr || nr == execveat_nr {
             if !first_exec_seen {
@@ -530,19 +643,12 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
             // openat / openat2 / open
             let (dirfd, path_arg, mode) = if nr == openat_nr {
                 (args[0] as i64, args[1], file_mode_for(args[2]))
+            } else if LEGACY_OPEN == Some(nr) {
+                (libc::AT_FDCWD as i64, args[0], file_mode_for(args[1]))
             } else {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if nr == libc::SYS_open as i32 {
-                        (libc::AT_FDCWD as i64, args[0], file_mode_for(args[1]))
-                    } else {
-                        (args[0] as i64, args[1], FileMode::Read)
-                    }
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    (args[0] as i64, args[1], FileMode::Read)
-                }
+                // openat2 는 세 번째 인자가 open_how 구조체 포인터입니다. 플래그를 따로
+                // 읽지 않고 읽기로 보수적으로 잡아 정책 평가만 받습니다
+                (args[0] as i64, args[1], FileMode::Read)
             };
             match read_cstr(pid, path_arg) {
                 Some(p) => {
@@ -567,12 +673,25 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
     }
 }
 
+/// 읽을 argv 원소 수 상한.
+///
+/// 상한 자체는 필요합니다. 대상 프로세스의 포인터 배열이 널로 끝난다는 보장이 없으므로
+/// 무한히 따라갈 수 없습니다
+const MAX_ARGV: usize = 256;
+
+/// 잘렸다는 사실을 엔트리에 남기는 표시.
+///
+/// 감사 로그는 "관측된 사실"을 주장하므로, 부분값을 전부인 것처럼 남길 수 없습니다.
+/// 정책 평가도 이 잘린 목록으로 이루어졌음을 사후에 알 수 있어야 합니다
+const ARGV_TRUNCATED: &str = "…airlock: argv가 상한에서 잘림";
+const ARGV_UNREADABLE: &str = "…airlock: argv 원소를 읽지 못해 여기서 멈춤";
+
 fn read_argv(pid: u32, addr: u64) -> Vec<String> {
     let mut out = Vec::new();
     if addr == 0 {
         return out;
     }
-    for i in 0..64u64 {
+    for i in 0..MAX_ARGV as u64 {
         let mut slot: u64 = 0;
         let local = libc::iovec {
             iov_base: (&raw mut slot).cast(),
@@ -585,13 +704,23 @@ fn read_argv(pid: u32, addr: u64) -> Vec<String> {
         // # Safety
         // 포인터 배열을 한 칸씩 읽습니다. 실패하면 거기서 멈춥니다
         let n = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
-        if n != 8 || slot == 0 {
+        if n != 8 {
+            out.push(ARGV_UNREADABLE.to_string());
             break;
+        }
+        if slot == 0 {
+            return out;
         }
         match read_cstr(pid, slot) {
             Some(s) => out.push(s.to_string_lossy().into_owned()),
-            None => break,
+            None => {
+                out.push(ARGV_UNREADABLE.to_string());
+                break;
+            }
         }
+    }
+    if out.len() >= MAX_ARGV {
+        out.push(ARGV_TRUNCATED.to_string());
     }
     out
 }
@@ -601,7 +730,7 @@ fn read_argv(pid: u32, addr: u64) -> Vec<String> {
 pub struct NotifyChannel {
     parent: OwnedFd,
     child: OwnedFd,
-    level: Level,
+    prog: Vec<SockFilter>,
 }
 
 impl NotifyChannel {
@@ -609,6 +738,10 @@ impl NotifyChannel {
         if level == Level::Off {
             return Err(std::io::Error::other("중계가 꺼져 있음"));
         }
+        // 필터를 fork 전에 만들어 둡니다. 자식의 pre_exec 문맥에서는 새로 할당하지 않습니다
+        let prog = build_filter(level).ok_or_else(|| {
+            std::io::Error::other("이 아키텍처의 seccomp arch 값을 모름. 중계 필터를 만들 수 없음")
+        })?;
         let mut fds = [0 as RawFd; 2];
         // # Safety
         // fds는 두 칸짜리 배열이며 커널이 두 fd를 채웁니다
@@ -629,14 +762,14 @@ impl NotifyChannel {
             Ok(Self {
                 parent: OwnedFd::from_raw_fd(fds[0]),
                 child: OwnedFd::from_raw_fd(fds[1]),
-                level,
+                prog,
             })
         }
     }
 
     /// 자식에서 실행할 클로저를 만듭니다. `pre_exec` 안에서 호출됩니다
     pub fn child_hook(&self) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
-        let prog = build_filter(self.level);
+        let prog = self.prog.clone();
         let child_fd = self.child.as_raw_fd();
         move || {
             // # Safety
@@ -666,9 +799,13 @@ impl NotifyChannel {
 mod tests {
     use super::*;
 
+    fn filter(level: Level) -> Vec<SockFilter> {
+        build_filter(level).expect("이 아키텍처의 필터를 만들 수 없음")
+    }
+
     #[test]
     fn filter_program_is_well_formed() {
-        let prog = build_filter(Level::Full);
+        let prog = filter(Level::Full);
         assert!(prog.len() >= 6, "필터가 너무 짧음");
         let last = prog.last().copied().expect("빈 필터");
         assert_eq!(last.k, SECCOMP_RET_USER_NOTIF, "마지막은 USER_NOTIF여야 함");
@@ -682,13 +819,55 @@ mod tests {
     #[test]
     fn every_mediated_syscall_has_a_comparison() {
         let nrs = mediated_syscalls(Level::Full);
-        let prog = build_filter(Level::Full);
+        let prog = filter(Level::Full);
         for nr in nrs {
             assert!(
                 prog.iter().any(|i| i.k == nr && i.code == 0x15),
                 "syscall {nr} 비교가 필터에 없음"
             );
         }
+    }
+
+    #[test]
+    fn foreign_architecture_is_killed_not_allowed() {
+        let prog = filter(Level::ExecNet);
+        // 첫 세 명령이 arch 적재, 비교, 불일치 처리입니다
+        assert_eq!(
+            prog.first().map(|i| i.k),
+            Some(4),
+            "arch 적재가 먼저여야 함"
+        );
+        assert_eq!(
+            prog.get(1).map(|i| i.k),
+            NATIVE_ARCH,
+            "네이티브 arch 비교가 없음"
+        );
+        assert_eq!(
+            prog.get(2).map(|i| i.k),
+            Some(SECCOMP_RET_KILL_PROCESS),
+            "아키텍처 불일치를 통과시키면 중계가 통째로 우회됨"
+        );
+        assert!(
+            !prog
+                .iter()
+                .take(3)
+                .any(|i| i.k == SECCOMP_RET_ALLOW && i.code == 0x06),
+            "아키텍처 검사 구간에 ALLOW가 있으면 안 됨"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_syscall_numbers_are_killed() {
+        let prog = filter(Level::ExecNet);
+        let idx = prog
+            .iter()
+            .position(|i| i.k == X32_SYSCALL_BIT)
+            .expect("x32 비트 검사가 없음. arch 검사를 통과하면서 번호가 어긋나 우회됨");
+        assert_eq!(
+            prog.get(idx.saturating_add(1)).map(|i| i.k),
+            Some(SECCOMP_RET_KILL_PROCESS)
+        );
     }
 
     #[test]

@@ -14,7 +14,8 @@ pub use log::{
 };
 pub use time::{format_rfc3339_nanos, now_unix_nanos};
 pub use types::{
-    CanonicalTag, Decision, Enforcement, ExitStatus, FileMode, Granted, Hash, Protocol, SessionId,
+    CanonicalTag, Decision, Enforcement, ExitStatus, FileMode, Granted, Hash, Mediation, Protocol,
+    SessionId,
 };
 pub use verify::{Failure, VerifyReport, Warning, verify_dir, verify_stream};
 

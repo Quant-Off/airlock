@@ -13,7 +13,8 @@
 //! 경로가 아니라 inode에 걸리므로 `docs/policy-dsl.md` 4.2절의 TOCTOU를 겪지 않습니다.
 
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,7 +23,7 @@ use airlock_audit::Enforcement;
 use airlock_policy::rule::Matcher;
 use airlock_policy::{Action, FileMode, Policy};
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus,
 };
 
@@ -72,13 +73,43 @@ fn list_access() -> landlock::BitFlags<AccessFs> {
     AccessFs::ReadDir.into()
 }
 
+/// 규칙 하나가 걸릴 경로.
+///
+/// `follow`는 이 경로의 마지막 성분이 심볼릭 링크일 때 대상을 따라가도 되는지입니다.
+/// 설정으로 들어온 루트는 따라가야 합니다. `/lib`가 `/usr/lib` 링크인 배포판이 많고
+/// `/proc/self`는 자식에서 해소되어야 자기 pid를 가리키기 때문입니다. 반대로 순회 중
+/// 발견한 항목은 절대 따라가지 않습니다. 계획을 세운 시점과 규칙을 거는 시점 사이에
+/// 항목이 링크로 바뀌면 링크 대상 inode에 규칙이 걸리기 때문입니다
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanPath {
+    path: PathBuf,
+    follow: bool,
+}
+
+impl PlanPath {
+    /// 설정에서 온 루트. 링크 해소를 허용합니다
+    fn root(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            follow: true,
+        }
+    }
+
+    /// 순회 중 발견한 항목. 링크 해소를 금지합니다
+    fn child(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            follow: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct Plan {
-    read_only: Vec<PathBuf>,
-    read_write: Vec<PathBuf>,
-    list_only: Vec<PathBuf>,
+    read_only: Vec<PlanPath>,
+    read_write: Vec<PlanPath>,
+    list_only: Vec<PlanPath>,
     tcp_connect: BTreeSet<u16>,
-    tcp_bind: BTreeSet<u16>,
     unrestricted_net: bool,
     gaps: Vec<String>,
 }
@@ -97,12 +128,16 @@ enum Grant {
 ///
 /// 큰 작업 공간에서는 항목마다 전체 규칙을 glob 매칭하는 비용이 시작 시간을 지배합니다.
 /// 필터는 **보수적**입니다. 매칭 가능성이 조금이라도 있으면 통과시켜 실제 평가로 넘기므로
-/// 결정이 달라지지 않고, 확실히 무관한 항목만 걸러 냅니다
+/// 결정이 달라지지 않고, 확실히 무관한 항목만 걸러 냅니다.
+///
+/// 비교는 전부 ASCII 소문자로 내려서 합니다. 제한 규칙은 엔진에서 대소문자를 무시하고
+/// 매칭되므로(`Rule::case_insensitive`), 필터가 대소문자를 구분하면 대소문자 무구분
+/// 마운트에서 `.SSH` 같은 표기가 걸러져 나가 결정이 뒤집힙니다
 #[derive(Debug, Default)]
 struct Prefilter {
-    /// 구체 경로로 고정된 규칙의 접두
-    anchors: Vec<PathBuf>,
-    /// `**`로 시작해 어디서든 매칭될 수 있는 규칙의 마지막 세그먼트 리터럴 접두
+    /// 구체 경로로 고정된 규칙의 접두. 소문자 바이트열
+    anchors: Vec<Vec<u8>>,
+    /// `**`로 시작해 어디서든 매칭될 수 있는 규칙의 마지막 세그먼트 리터럴 접두. 소문자
     anywhere: Vec<Vec<u8>>,
     /// 필터가 판단할 수 없는 모양이 있어 전부 평가해야 합니다
     always: bool,
@@ -127,7 +162,9 @@ impl Prefilter {
                     let segs = pattern.segments();
                     match segs.first() {
                         Some(SegmentKind::AnyDepth) => match segs.last() {
-                            Some(SegmentKind::Literal(b)) => out.anywhere.push(b.to_vec()),
+                            Some(SegmentKind::Literal(b)) => {
+                                out.anywhere.push(b.to_ascii_lowercase());
+                            }
                             Some(SegmentKind::Wildcard(w)) => {
                                 // `*` 앞의 리터럴 접두까지만 봅니다. 접두가 비면
                                 // 무엇이든 매칭될 수 있으므로 전부 평가합니다
@@ -139,7 +176,7 @@ impl Prefilter {
                                 if lit.is_empty() {
                                     out.always = true;
                                 } else {
-                                    out.anywhere.push(lit);
+                                    out.anywhere.push(lit.to_ascii_lowercase());
                                 }
                             }
                             _ => out.always = true,
@@ -154,7 +191,8 @@ impl Prefilter {
                                     _ => break,
                                 }
                             }
-                            out.anchors.push(anchor);
+                            out.anchors
+                                .push(anchor.as_os_str().as_bytes().to_ascii_lowercase());
                         }
                         _ => out.always = true,
                     }
@@ -170,20 +208,18 @@ impl Prefilter {
             return true;
         }
         if let Some(name) = path.file_name() {
-            let name = name.as_bytes();
-            let lower: Vec<u8> = name.to_ascii_lowercase();
-            if self
-                .anywhere
-                .iter()
-                .any(|p| lower.starts_with(&p.to_ascii_lowercase()))
-            {
+            let lower: Vec<u8> = name.as_bytes().to_ascii_lowercase();
+            if self.anywhere.iter().any(|p| lower.starts_with(p)) {
                 return true;
             }
         }
-        // 규칙 접두가 이 경로 아래에 있거나, 이 경로가 규칙 접두 아래에 있으면 평가합니다
+        // 규칙 접두가 이 경로 아래에 있거나, 이 경로가 규칙 접두 아래에 있으면 평가합니다.
+        // 성분 경계를 보지 않는 바이트 접두 비교라 실제보다 조금 넓게 통과시키는데,
+        // 넓게 통과시키는 쪽은 그냥 평가를 한 번 더 하는 것이라 결정에 영향이 없습니다
+        let lower: Vec<u8> = path.as_os_str().as_bytes().to_ascii_lowercase();
         self.anchors
             .iter()
-            .any(|a| path.starts_with(a) || a.starts_with(path))
+            .any(|a| lower.starts_with(a) || a.starts_with(&lower))
     }
 }
 
@@ -192,6 +228,10 @@ struct Walker<'a> {
     filter: Prefilter,
     budget: usize,
     exhausted: Vec<PathBuf>,
+    /// 나열할 수 없어 하위를 확인하지 못한 디렉토리
+    unreadable: Vec<PathBuf>,
+    /// 계획에서 제외한 심볼릭 링크 수
+    links: usize,
 }
 
 impl<'a> Walker<'a> {
@@ -201,6 +241,8 @@ impl<'a> Walker<'a> {
             filter: Prefilter::build(policy),
             budget: WALK_BUDGET,
             exhausted: Vec::new(),
+            unreadable: Vec::new(),
+            links: 0,
         }
     }
 
@@ -240,8 +282,18 @@ impl<'a> Walker<'a> {
         }
 
         let Ok(entries) = std::fs::read_dir(dir) else {
-            // 열 수 없는 디렉토리는 하위를 확인할 수 없습니다. 통째로 주지 않습니다
-            return Grant::Whole;
+            // 나열 실패를 세 가지로 나눕니다. 파일은 하위가 없으므로 그 자체를 허용하면
+            // 되고, 순회 중 사라진 항목은 허용할 대상 자체가 없으며(규칙을 걸 때 open 이
+            // 실패해 저절로 빠집니다), 디렉토리인데 열 수 없는 경우만 통째로 주지 않습니다.
+            // 마지막을 구분하지 않으면 나열 불가 디렉토리의 하위가 검사 없이 열립니다
+            return match std::fs::symlink_metadata(dir) {
+                Ok(m) if !m.is_dir() => Grant::Whole,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Grant::Whole,
+                _ => {
+                    self.unreadable.push(dir.to_path_buf());
+                    Grant::Denied
+                }
+            };
         };
 
         let mut children: Vec<(PathBuf, bool)> = Vec::new();
@@ -252,8 +304,19 @@ impl<'a> Walker<'a> {
             }
             self.budget = self.budget.saturating_sub(1);
             let path = entry.path();
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            children.push((path, is_dir));
+            let Ok(kind) = entry.file_type() else {
+                // 종류를 모르는 항목은 계획에 넣지 않습니다. 판단 불가는 제한 방향입니다
+                continue;
+            };
+            if kind.is_symlink() {
+                // 심볼릭 링크는 규칙 대상이 아닙니다. 규칙이 inode 에 걸리므로 링크
+                // 자신에게 규칙을 걸면 열리는 것은 링크가 가리키는 **대상** inode 입니다.
+                // 여기서 계획에 넣으면 `ln -s ~/.ssh link` 하나로 대상 전체가 열립니다.
+                // 링크를 통한 접근은 대상이 따로 허용되었을 때만 열려야 합니다
+                self.links = self.links.saturating_add(1);
+                continue;
+            }
+            children.push((path, kind.is_dir()));
         }
 
         let mut partial: Vec<PathBuf> = Vec::new();
@@ -284,14 +347,14 @@ impl<'a> Walker<'a> {
                 continue;
             }
             if writable {
-                plan.read_write.push(path.clone());
+                plan.read_write.push(PlanPath::child(path));
             } else {
-                plan.read_only.push(path.clone());
+                plan.read_only.push(PlanPath::child(path));
             }
         }
         // 상위는 나열만 허용합니다. 이름은 보이지만 내용은 열리지 않으며,
         // Seatbelt 프로파일이 file-read-metadata를 여는 것과 같은 수준입니다
-        plan.list_only.push(dir.to_path_buf());
+        plan.list_only.push(PlanPath::child(dir));
         Grant::Partial
     }
 }
@@ -303,12 +366,12 @@ fn add_root(walker: &mut Walker<'_>, root: &Path, writable: bool, plan: &mut Pla
     match walker.walk(root, writable, plan) {
         Grant::Whole => {
             if writable {
-                plan.read_write.push(root.to_path_buf());
+                plan.read_write.push(PlanPath::root(root));
             } else {
-                plan.read_only.push(root.to_path_buf());
+                plan.read_only.push(PlanPath::root(root));
             }
         }
-        Grant::Partial => plan.list_only.push(root.to_path_buf()),
+        Grant::Partial => plan.list_only.push(PlanPath::root(root)),
         Grant::Denied => {}
     }
 }
@@ -323,7 +386,7 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
     for p in DEV_RW_PATHS {
         let path = Path::new(p);
         if path.exists() {
-            plan.read_write.push(path.to_path_buf());
+            plan.read_write.push(PlanPath::root(path));
         }
     }
     for dir in &opts.temp_dirs {
@@ -357,6 +420,19 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
         plan.gaps.push(format!(
             "{} 아래는 검사 예산({WALK_BUDGET} 항목)을 넘겨 허용하지 않았음. 필요하면 작업 공간을 좁혀야 함",
             dir.display()
+        ));
+    }
+    for dir in walker.unreadable.iter().take(5) {
+        plan.gaps.push(format!(
+            "{} 는 나열할 수 없어 하위를 검사하지 못했음. 통째로 허용하지 않았으므로 그 아래는 열리지 않음",
+            dir.display()
+        ));
+    }
+    if walker.links > 0 {
+        plan.gaps.push(format!(
+            "심볼릭 링크 {}개를 허용 계획에서 제외했음. 규칙이 inode 에 걸리므로 \
+             링크가 가리키는 대상이 따로 허용되지 않으면 링크로도 열리지 않음",
+            walker.links
         ));
     }
 
@@ -482,6 +558,48 @@ fn detect_abi() -> ABI {
     }
 }
 
+/// 규칙을 걸 대상 fd를 엽니다.
+///
+/// `O_PATH`는 파일을 여는 것이 아니라 경로를 가리키는 핸들만 얻습니다. 순회 중 발견한
+/// 항목에는 `O_NOFOLLOW`를 함께 주어, 계획을 세운 뒤 항목이 링크로 바뀌어도 규칙이
+/// 링크 대상에 걸리지 않게 합니다
+///
+/// # Safety
+/// `libc::open`을 직접 부르는 이유는 `O_NOFOLLOW`를 붙일 방법이 표준 API에 없기
+/// 때문입니다. 인자는 널 종료 문자열과 플래그 비트뿐이며, 성공 시 돌려받은 fd의
+/// 소유권을 `OwnedFd`로 옮겨 누출과 이중 close를 막습니다
+fn open_rule_target(target: &PlanPath) -> Option<OwnedFd> {
+    let mut flags = libc::O_PATH | libc::O_CLOEXEC;
+    if !target.follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let raw = CString::new(target.path.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(raw.as_ptr(), flags) };
+    if fd < 0 {
+        return None;
+    }
+    // # Safety
+    // open이 방금 돌려준 유효한 fd이며 다른 소유자가 없습니다
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// 커널이 요청한 접근 종류 일부만 받아들였다는 사실을 알립니다.
+///
+/// 커널이 규칙을 부분만 걸었는데 조용히 넘어가면 강제되지 않은 것이 강제된 것처럼
+/// 보입니다. 부분 강제를 실패로 처리하지 않는 이유는 `NotEnforced`와 달리 실제로
+/// 무언가는 걸려 있고, 그 상태에서 실행을 막으면 구형 커널에서 아무것도 돌지 않기 때문입니다
+///
+/// # Safety
+/// `pre_exec` 문맥에서 부르므로 할당 없이 정적 바이트열만 fd 2로 씁니다.
+/// `write`는 async-signal-safe 하며 실패는 무시합니다
+fn warn_partial() {
+    const MSG: &str =
+        "airlock: 경고 커널이 Landlock 규칙을 부분만 적용했음. 일부 접근 종류가 강제되지 않음\n";
+    unsafe {
+        libc::write(2, MSG.as_ptr().cast(), MSG.len());
+    }
+}
+
 fn apply(plan: &Plan, abi: ABI) -> std::io::Result<RulesetStatus> {
     let mut ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
@@ -501,8 +619,8 @@ fn apply(plan: &Plan, abi: ABI) -> std::io::Result<RulesetStatus> {
         (&plan.read_write, full_access(abi)),
         (&plan.list_only, list_access()),
     ] {
-        for path in paths {
-            let Ok(fd) = PathFd::new(path) else {
+        for target in paths {
+            let Some(fd) = open_rule_target(target) else {
                 continue;
             };
             created = created
@@ -515,11 +633,6 @@ fn apply(plan: &Plan, abi: ABI) -> std::io::Result<RulesetStatus> {
         for port in &plan.tcp_connect {
             created = created
                 .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
-                .map_err(std::io::Error::other)?;
-        }
-        for port in &plan.tcp_bind {
-            created = created
-                .add_rule(NetPort::new(*port, AccessNet::BindTcp))
                 .map_err(std::io::Error::other)?;
         }
     }
@@ -579,6 +692,9 @@ impl Enforcer for LandlockEnforcer {
                     return Err(std::io::Error::other(
                         "Landlock 규칙이 적용되지 않았음. 강제 없이 실행하지 않음",
                     ));
+                }
+                if status != RulesetStatus::FullyEnforced {
+                    warn_partial();
                 }
                 Ok(())
             });

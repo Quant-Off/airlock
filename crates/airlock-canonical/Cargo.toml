@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+description = "Airlock 감사 로그와 정책 다이제스트가 쓰는 길이 접두 정규 인코딩"
 
 [dependencies]
 

@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml이 채널과 컴포넌트를 정합니다. 여기서 버전을 다시 적으면
+      # 로컬과 CI가 갈라집니다
+      - name: 툴체인 확인
+        run: |
+          rustc -V
+          cargo -V
+          cargo fmt --version
+          cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 커널 강제 층 확인
+        run: |
+          uname -a
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Landlock ABI 조회가 실패하면 강제 층 테스트가 조용히 건너뜁니다.
+            # 건너뛴 사실이 로그에 보여야 합니다
+            grep -o 'landlock' /proc/kallsyms 2>/dev/null | head -1 || true
+            ls /sys/kernel/security/lsm 2>/dev/null && cat /sys/kernel/security/lsm || true
+          fi
+
+      - name: 전체 검증
+        run: ./scripts/check.sh
+
+  cross:
+    name: cross compile
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      # 중계 층은 아키텍처마다 seccomp arch 값과 syscall 번호가 다릅니다.
+      # 한 아키텍처에서만 컴파일되는 코드를 릴리즈에 넣지 않습니다
+      - name: 아키텍처별 컴파일
+        run: |
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+          cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu
+          cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu
+
+# 배포 메타데이터 검사는 scripts/check.sh 안에 있습니다. CI와 로컬이 같은 것을 돌립니다

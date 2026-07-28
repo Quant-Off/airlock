@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+description = "Airlock의 OS 강제 층. Linux Landlock과 seccomp, macOS Seatbelt로 파일·exec·네트워크를 중재함"
 
 [dependencies]
 airlock-audit.workspace = true
@@ -14,6 +15,9 @@ unicode-normalization.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

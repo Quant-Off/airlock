@@ -755,6 +755,58 @@ action = "deny"
 }
 
 #[test]
+fn user_rule_cannot_take_a_baseline_id() {
+    let h = Home::new("reserved-baseline");
+    let src = r#"
+version = 1
+[[rules]]
+id = "ssh-private-keys"
+kind = "file"
+path = "/tmp/anything"
+action = "allow"
+"#;
+    assert!(
+        matches!(load_err(&h, src), LoadError::ReservedId { .. }),
+        "내장 id를 그대로 쓴 규칙이 로드되면 감사 로그의 rule 필드가 어느 티어를 \
+         가리키는지 알 수 없게 됨"
+    );
+}
+
+#[test]
+fn user_rule_cannot_take_a_self_protect_id() {
+    let h = Home::new("reserved-self");
+    let src = r#"
+version = 1
+[[rules]]
+id = "self:audit-log"
+kind = "file"
+path = "/tmp/anything"
+action = "allow"
+"#;
+    assert!(matches!(load_err(&h, src), LoadError::ReservedId { .. }));
+}
+
+#[test]
+fn overrides_still_names_a_baseline_id() {
+    let h = Home::new("reserved-override");
+    let src = r#"
+version = 1
+[[rules]]
+id = "read-ssh-config"
+kind = "file"
+path = "~/.ssh/config"
+mode = ["read"]
+action = "allow"
+overrides = "ssh-private-keys"
+reason = "배포 대상 호스트 별칭을 읽어야 함"
+"#;
+    assert!(
+        Policy::load_str(src, &h.ctx()).is_ok(),
+        "id 예약 검사가 overrides 지목까지 막으면 정당한 완화가 불가능해짐"
+    );
+}
+
+#[test]
 fn wrong_version_is_rejected() {
     let h = Home::new("version");
     assert!(matches!(

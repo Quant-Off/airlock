@@ -149,6 +149,17 @@ pub fn targets_for(pattern: &Pattern) -> Vec<Target> {
     target_for(pattern).map(variants_of).unwrap_or_default()
 }
 
+/// 파일 이름만 지정한 exec 규칙을 경로 정규식으로 옮깁니다.
+///
+/// `program = "curl"`은 경로를 특정하지 않으므로 `subpath`나 `literal`로 옮길 수 없고,
+/// 마지막 세그먼트가 그 이름인 모든 경로를 잡는 정규식이 됩니다
+pub fn basename_targets(name: &str) -> Vec<Target> {
+    let mut re = String::from("^.*/");
+    escape_regex_str(name, &mut re);
+    re.push('$');
+    variants_of(Target::Regex(re))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

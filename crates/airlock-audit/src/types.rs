@@ -76,11 +76,16 @@ pub trait CanonicalTag {
 }
 
 macro_rules! tagged_enum {
-    ($name:ident { $($variant:ident = $tag:expr => $repr:literal),+ $(,)? }) => {
+    (
+        $(#[$outer:meta])*
+        $name:ident { $($(#[$vattr:meta])* $variant:ident = $tag:expr => $repr:literal),+ $(,)? }
+    ) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        $(#[$outer])*
         pub enum $name {
             $(
                 #[serde(rename = $repr)]
+                $(#[$vattr])*
                 $variant,
             )+
         }
@@ -143,6 +148,31 @@ tagged_enum!(Granted {
     Refused = 2 => "refused",
     TimedOut = 3 => "timed_out",
 });
+
+tagged_enum!(
+    #[derive(Default)]
+    Mediation {
+        Off = 1 => "off",
+        #[default]
+        ExecNet = 2 => "exec-net",
+        Full = 3 => "full",
+    }
+);
+
+impl Mediation {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "exec-net" => Some(Self::ExecNet),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn observes(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
 
 impl Enforcement {
     pub fn enforces(&self) -> bool {

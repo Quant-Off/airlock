@@ -30,6 +30,7 @@ dependencies = [
  "airlock-policy",
  "landlock",
  "libc",
+ "serde_json",
  "unicode-normalization",
 ]
 

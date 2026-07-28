@@ -14,6 +14,14 @@ pub enum LoadError {
     },
     UnsupportedVersion(u32),
     DuplicateId(String),
+    /// 사용자 규칙 id가 내장 규칙 id와 겹칩니다.
+    ///
+    /// 감사 로그의 `rule` 필드는 티어를 담지 않으므로, 겹치면 그 결정을 낸 규칙이 어느
+    /// 티어의 것인지 로그만으로 알 수 없습니다 (`docs/policy-dsl.md` 10절)
+    ReservedId {
+        id: String,
+        tier: &'static str,
+    },
     UnknownAction {
         id: String,
         value: String,
@@ -81,6 +89,12 @@ impl fmt::Display for LoadError {
                 write!(f, "지원하지 않는 정책 version {v}. v1만 지원함")
             }
             Self::DuplicateId(id) => write!(f, "규칙 id `{id}`가 중복됨"),
+            Self::ReservedId { id, tier } => write!(
+                f,
+                "규칙 id `{id}`가 내장 {tier} 규칙과 겹침. 감사 로그의 rule 필드가 \
+                 어느 티어를 가리키는지 알 수 없게 되므로 다른 id를 쓸 것. \
+                 내장 규칙을 완화하려면 id 대신 overrides로 지목할 것"
+            ),
             Self::UnknownAction { id, value } => write!(
                 f,
                 "`{id}`의 action `{value}`를 알 수 없음. allow, deny, ask, forbid 중 하나여야 함"

@@ -11,10 +11,12 @@ rust-version = "1.87"
 repository = "https://github.com/Quant-Off/airlock"
 
 [workspace.dependencies]
-airlock-audit = { path = "crates/airlock-audit" }
-airlock-broker = { path = "crates/airlock-broker" }
-airlock-canonical = { path = "crates/airlock-canonical" }
-airlock-policy = { path = "crates/airlock-policy" }
+# version이 없으면 crates.io 업로드가 거부됩니다. 로컬 빌드는 path를 쓰고 배포된
+# 패키지는 version을 씁니다.
+airlock-audit = { path = "crates/airlock-audit", version = "0.1.0" }
+airlock-broker = { path = "crates/airlock-broker", version = "0.1.0" }
+airlock-canonical = { path = "crates/airlock-canonical", version = "0.1.0" }
+airlock-policy = { path = "crates/airlock-policy", version = "0.1.0" }
 
 sha2 = "0.11"
 serde = { version = "1.0", features = ["derive"] }

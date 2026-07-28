@@ -9,7 +9,7 @@ use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::time::now_unix_nanos;
-use crate::types::{Decision, Enforcement, Hash, SessionId};
+use crate::types::{Decision, Enforcement, Hash, Mediation, SessionId};
 
 pub const CHAIN_FILE: &str = "chain.jsonl";
 pub const HEAD_FILE: &str = "head.json";
@@ -35,6 +35,7 @@ pub struct GenesisInfo {
     pub cwd: String,
     pub policy_digest: Hash,
     pub policy_source: Option<String>,
+    pub mediation: Mediation,
 }
 
 #[derive(Debug)]
@@ -93,6 +94,7 @@ impl AuditLog {
             policy_digest: genesis.policy_digest,
             policy_source: genesis.policy_source,
             fsync_per_entry,
+            mediation: genesis.mediation,
         };
         log.append(Record::new(BROKER_ACTOR, genesis_event, Decision::Allow))?;
         Ok(log)
@@ -239,6 +241,7 @@ mod tests {
             cwd: "/tmp".into(),
             policy_digest: Hash::from_bytes([0x11; 32]),
             policy_source: Some("policy.toml".into()),
+            mediation: Mediation::ExecNet,
         }
     }
 

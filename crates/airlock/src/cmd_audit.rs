@@ -117,6 +117,7 @@ fn describe_event(event: &Event) -> String {
             policy_digest,
             policy_source,
             fsync_per_entry,
+            mediation,
             ..
         } => {
             let short: String = policy_digest.to_hex().chars().take(12).collect();
@@ -126,7 +127,12 @@ fn describe_event(event: &Event) -> String {
             } else {
                 " [fsync 없음]"
             };
-            format!("세션 시작 정책={source} 다이제스트={short}{sync} argv={argv:?}")
+            // 중계 수준을 함께 보여 줍니다. exec 엔트리가 없는 체인이 "아무 일도 없었음"
+            // 인지 "중계가 꺼져 있어 보이지 않았음"인지 구분되어야 합니다
+            format!(
+                "세션 시작 정책={source} 다이제스트={short} 중계={}{sync} argv={argv:?}",
+                mediation.as_str()
+            )
         }
         Event::SessionEnd { status } => format!("세션 종료 {status:?}"),
         Event::FileAccess {

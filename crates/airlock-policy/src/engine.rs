@@ -166,10 +166,25 @@ impl Policy {
         })?;
         let self_protect = baseline::self_protect(&ctx.self_protect);
 
+        // 내장 규칙 id는 예약어입니다. 겹치는 id를 허용하면 감사 로그의 rule 필드가
+        // 어느 티어의 규칙을 가리키는지 알 수 없어집니다 (10절 3번)
+        let reserved: Vec<(&str, &'static str)> = base
+            .rules
+            .iter()
+            .map(|r| (r.id.as_str(), "베이스라인"))
+            .chain(self_protect.iter().map(|r| (r.id.as_str(), "자기보호")))
+            .collect();
+
         let mut seen: HashSet<&str> = HashSet::new();
         for r in &user {
             if !seen.insert(r.id.as_str()) {
                 return Err(LoadError::DuplicateId(r.id.clone()));
+            }
+            if let Some((_, tier)) = reserved.iter().find(|(id, _)| *id == r.id.as_str()) {
+                return Err(LoadError::ReservedId {
+                    id: r.id.clone(),
+                    tier,
+                });
             }
             if r.action == Action::Forbid {
                 return Err(LoadError::ForbidInUserRule { id: r.id.clone() });

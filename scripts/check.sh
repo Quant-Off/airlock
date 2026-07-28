@@ -33,5 +33,15 @@ for p in examples/policy/*.toml; do
   cargo run -q -p airlock -- policy check --policy "$p"
 done
 
+echo "== 배포 메타데이터 =="
+# description 이나 의존 version 누락은 릴리즈를 누르는 순간에야 드러납니다.
+# 아직 crates.io 에 없는 크레이트는 cargo package 가 색인을 찾지 못하므로
+# 매니페스트 자체를 검사합니다
+cargo metadata --no-deps --format-version 1 | python3 scripts/metadata-check.py
+
+# 의존이 없는 리프는 실제 패키징까지 검사할 수 있습니다
+cargo package -p airlock-canonical --allow-dirty -q >/dev/null
+echo "airlock-canonical 패키징 통과"
+
 echo
 echo "전부 통과"

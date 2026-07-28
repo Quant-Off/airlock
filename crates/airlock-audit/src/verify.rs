@@ -263,14 +263,13 @@ pub fn verify_stream<R: BufRead>(
         let trimmed = buf.trim_end_matches(['\n', '\r']);
         line_no = line_no.saturating_add(1);
 
-        if trimmed.trim().is_empty() {
-            if ended_with_newline {
-                return Err(Failure::BlankLine { line: line_no });
-            }
-            break;
-        }
+        // read가 0이 아니면 최소 한 바이트를 읽었습니다. 개행으로 끝나지 않은 마지막 줄은
+        // 내용이 공백뿐이어도 쓰기 도중 중단된 흔적이므로 조용히 넘기지 않습니다
         if !ended_with_newline {
             return Err(Failure::TruncatedFinalLine { line: line_no });
+        }
+        if trimmed.trim().is_empty() {
+            return Err(Failure::BlankLine { line: line_no });
         }
 
         let entry: Entry = serde_json::from_str(trimmed).map_err(|e| Failure::MalformedLine {

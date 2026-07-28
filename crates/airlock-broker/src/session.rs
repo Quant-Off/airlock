@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use airlock_audit as audit;
-use airlock_audit::{AuditLog, Decision, Enforcement, Event, GenesisInfo, Granted, Record};
+use airlock_audit::{
+    AuditLog, Decision, Enforcement, Event, GenesisInfo, Granted, Mediation, Record,
+};
 use airlock_policy::{Action, Evaluation, FileMode, Policy};
 
 use crate::approve::{ApprovalRequest, Approver};
@@ -53,39 +55,66 @@ pub struct SessionConfig {
     pub fsync_per_entry: bool,
     pub policy_source: Option<String>,
     pub airlock_version: String,
-    /// 자식의 syscall을 어디까지 브로커로 중계할지. Linux에서만 의미가 있습니다
+    /// 요청된 중계 수준. 이 플랫폼에서 실제로 적용되는 값은
+    /// [`effective_mediation`]이 정하며, 제네시스에는 적용된 값이 기록됩니다
     pub mediation: Mediation,
 }
 
-/// 런타임 중계 수준.
+/// 요청한 중계 수준이 이 플랫폼에서 실제로 무엇이 되는지.
 ///
 /// Linux에서는 `crate::notify::Level`로 옮겨져 seccomp user notification 필터가 됩니다.
-/// 다른 플랫폼에는 중계 기구가 없으므로 값이 무시되고 그 사실이 gap으로 노출됩니다
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Mediation {
-    Off,
-    #[default]
-    ExecNet,
-    Full,
+/// 다른 플랫폼에는 중계 기구가 아예 없으므로 무엇을 요청해도 `Off`입니다
+pub fn effective_mediation(requested: Mediation) -> Mediation {
+    #[cfg(target_os = "linux")]
+    {
+        requested
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = requested;
+        Mediation::Off
+    }
 }
 
-impl Mediation {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "off" => Some(Self::Off),
-            "exec-net" => Some(Self::ExecNet),
-            "full" => Some(Self::Full),
-            _ => None,
-        }
+/// 중계 층이 이 플랫폼에서 무엇을 못 보는지.
+///
+/// 요청한 수준이 조용히 무시되면 감사 로그가 실제보다 완전해 보입니다. 값이 무시되었다는
+/// 사실 자체를 배너와 제네시스 양쪽에 남깁니다
+pub fn mediation_gaps(requested: Mediation) -> Vec<String> {
+    let effective = effective_mediation(requested);
+    let mut gaps = Vec::new();
+
+    if effective != requested {
+        gaps.push(format!(
+            "이 플랫폼에는 런타임 중계 기구가 없어 --mediate {}가 적용되지 않음. \
+             감사 로그에는 중계 수준 {}가 기록됨",
+            requested.as_str(),
+            effective.as_str()
+        ));
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::ExecNet => "exec-net",
-            Self::Full => "full",
-        }
+    match effective {
+        Mediation::Off => gaps.push(
+            "중계가 꺼져 있어 자식 프로세스의 exec·연결·파일 열기가 감사에 남지 않음. \
+             체인에는 세션 단위 기록만 있음"
+                .to_string(),
+        ),
+        Mediation::ExecNet => gaps.push(
+            "파일 열기는 중계하지 않음. 파일 접근은 커널 강제만 받고 감사에는 남지 않음 \
+             (--mediate full로 켤 수 있으나 느려짐)"
+                .to_string(),
+        ),
+        Mediation::Full => {}
     }
+
+    if effective.observes() {
+        gaps.push(
+            "중계 층이 읽은 경로와 커널이 실제로 여는 대상은 다를 수 있음(TOCTOU). \
+             실제 경계는 커널 강제 층이며 중계는 기록과 승인 채널임"
+                .to_string(),
+        );
+    }
+    gaps
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +173,7 @@ impl Session {
                 cwd: config.cwd.to_string_lossy().into_owned(),
                 policy_digest: audit::Hash::from_bytes(policy.digest()),
                 policy_source: config.policy_source.clone(),
+                mediation: config.mediation,
             },
         )?;
 
@@ -343,10 +373,30 @@ pub struct RunReport {
     pub head_seq: Option<u64>,
     pub head_hash: audit::Hash,
     pub exit_code: Option<i32>,
+    /// 자식이 시그널로 죽었을 때의 시그널 번호. `exit_code`가 없으면 이쪽을 봅니다
+    pub signal: Option<i32>,
     pub asked: u64,
     pub denied: u64,
     pub enforcement: Enforcement,
+    /// 실제로 적용된 중계 수준
+    pub mediation: Mediation,
     pub gaps: Vec<String>,
+}
+
+impl RunReport {
+    /// 브로커 자신의 종료 코드.
+    ///
+    /// 자식이 시그널로 죽은 것을 성공으로 보고하면 래퍼를 CI에 넣은 순간 실패가 사라집니다.
+    /// 셸 관례대로 128에 시그널 번호를 더해 돌려줍니다
+    pub fn exit_status(&self) -> i32 {
+        if let Some(code) = self.exit_code {
+            return code;
+        }
+        if let Some(signal) = self.signal {
+            return 128i32.saturating_add(signal);
+        }
+        if self.denied > 0 { 77 } else { 70 }
+    }
 }
 
 pub fn run(
@@ -362,7 +412,33 @@ pub fn run(
     enforcer.prepare(&policy)?;
 
     let enforcement = enforcer.kind();
-    let gaps = enforcer.gaps();
+    let mut gaps = enforcer.gaps();
+    gaps.extend(mediation_gaps(config.mediation));
+
+    let mut cmd = Command::new(&resolved);
+    cmd.args(args);
+    cmd.current_dir(&config.cwd);
+
+    // 중계 훅을 강제 층보다 먼저 겁니다. listener fd를 부모에게 넘기는 sendmsg가
+    // 샌드박스 적용 전에 끝나야 합니다
+    #[cfg(target_os = "linux")]
+    let channel = setup_mediation(&mut cmd, config.mediation);
+
+    // 제네시스에는 요청값이 아니라 실제로 걸린 수준을 씁니다. 중계를 켤 수 없었는데
+    // 요청값을 기록하면 로그가 실제보다 완전해 보입니다
+    #[cfg(target_os = "linux")]
+    let effective = if channel.is_some() {
+        effective_mediation(config.mediation)
+    } else {
+        Mediation::Off
+    };
+    #[cfg(not(target_os = "linux"))]
+    let effective = effective_mediation(config.mediation);
+
+    let config = &SessionConfig {
+        mediation: effective,
+        ..config.clone()
+    };
 
     let mut session = Session::start(policy, enforcement, approver, config)?;
 
@@ -381,21 +457,14 @@ pub fn run(
             head_seq,
             head_hash: hash,
             exit_code: None,
+            signal: None,
             asked,
             denied,
             enforcement,
+            mediation: effective,
             gaps,
         });
     }
-
-    let mut cmd = Command::new(&resolved);
-    cmd.args(args);
-    cmd.current_dir(&config.cwd);
-
-    // 중계 훅을 강제 층보다 먼저 겁니다. listener fd를 부모에게 넘기는 sendmsg가
-    // 샌드박스 적용 전에 끝나야 합니다
-    #[cfg(target_os = "linux")]
-    let channel = setup_mediation(&mut cmd, config.mediation);
 
     enforcer.wrap(&mut cmd)?;
 
@@ -443,9 +512,14 @@ pub fn run(
         head_seq,
         head_hash: hash,
         exit_code: status.code(),
+        signal: {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        },
         asked,
         denied,
         enforcement,
+        mediation: effective,
         gaps,
     })
 }

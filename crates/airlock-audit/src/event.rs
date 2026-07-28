@@ -1,7 +1,7 @@
 use airlock_canonical::Encoder;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{CanonicalTag, ExitStatus, FileMode, Granted, Hash, Protocol};
+use crate::types::{CanonicalTag, ExitStatus, FileMode, Granted, Hash, Mediation, Protocol};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -13,6 +13,8 @@ pub enum Event {
         policy_digest: Hash,
         policy_source: Option<String>,
         fsync_per_entry: bool,
+        /// 이 세션에서 **실제로** 적용된 중계 수준. 요청값이 아닙니다
+        mediation: Mediation,
     },
     SessionEnd {
         status: ExitStatus,
@@ -78,13 +80,15 @@ impl Event {
                 policy_digest,
                 policy_source,
                 fsync_per_entry,
+                mediation,
             } => {
                 enc.str(airlock_version)
                     .list_str(argv)
                     .str(cwd)
                     .bytes(policy_digest.as_bytes())
                     .opt_str(policy_source.as_deref())
-                    .bool(*fsync_per_entry);
+                    .bool(*fsync_per_entry)
+                    .tag(mediation.tag());
             }
             Self::SessionEnd { status } => {
                 enc.tag(status.tag()).u32(status.value());
@@ -218,6 +222,7 @@ mod tests {
                 policy_digest: Hash::from_bytes([7; 32]),
                 policy_source: Some("policy.toml".into()),
                 fsync_per_entry: true,
+                mediation: Mediation::ExecNet,
             },
             Event::SessionEnd {
                 status: ExitStatus::Signaled { signal: 9 },

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+description = "Airlock의 해시체인 append-only 감사 로그와 검증기"
 
 [dependencies]
 airlock-canonical.workspace = true

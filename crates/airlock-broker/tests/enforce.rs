@@ -262,3 +262,134 @@ egress = "deny"
         "`**/.env` 정규식이 커널에서 실제로 강제되지 않음"
     );
 }
+
+// ---------- exec 과 아웃바운드 ----------
+
+fn run_under_sandbox(policy: &Policy, workspace: &Path, argv: &[&str]) -> bool {
+    let opts = ProfileOptions::default().with_workspace(workspace);
+    let mut enforcer = SeatbeltEnforcer::new().with_options(opts);
+    enforcer.prepare(policy).unwrap();
+
+    let (program, rest) = argv.split_first().expect("빈 argv");
+    let mut cmd = Command::new(program);
+    cmd.args(rest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+    enforcer.wrap(&mut cmd).unwrap();
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+fn policy_with(scratch: &Path, rules: &str) -> Policy {
+    let src = format!(
+        r#"
+version = 1
+name = "enforce-test"
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+{rules}
+"#
+    );
+    let ctx = LoadContext::new(scratch, scratch.join("audit"));
+    Policy::load_str(&src, &ctx).unwrap()
+}
+
+#[test]
+fn exec_deny_is_enforced_by_the_kernel() {
+    let s = Scratch::new("exec-deny");
+
+    let permissive = policy_with(s.path(), "");
+    assert!(
+        run_under_sandbox(
+            &permissive,
+            s.path(),
+            &["/bin/sh", "-c", "exec /usr/bin/true"]
+        ),
+        "제한 없는 정책에서 exec 이 실패하면 이 테스트의 대조군이 무의미함"
+    );
+
+    let denied = policy_with(
+        s.path(),
+        r#"
+[[rules]]
+id = "no-true"
+kind = "exec"
+program = "/usr/bin/true"
+action = "deny"
+reason = "테스트용 exec 차단"
+"#,
+    );
+    assert!(
+        !run_under_sandbox(&denied, s.path(), &["/bin/sh", "-c", "exec /usr/bin/true"]),
+        "exec deny 규칙이 커널에서 강제되지 않음"
+    );
+}
+
+#[test]
+fn exec_deny_by_basename_is_enforced_by_the_kernel() {
+    let s = Scratch::new("exec-basename");
+    let denied = policy_with(
+        s.path(),
+        r#"
+[[rules]]
+id = "no-true-anywhere"
+kind = "exec"
+program = "true"
+action = "deny"
+reason = "이름만으로 차단"
+"#,
+    );
+    assert!(
+        !run_under_sandbox(&denied, s.path(), &["/bin/sh", "-c", "exec /usr/bin/true"]),
+        "파일 이름만 지정한 exec deny 가 강제되지 않음"
+    );
+}
+
+#[test]
+fn outbound_is_blocked_when_the_policy_allows_no_egress() {
+    use std::net::TcpListener;
+
+    let s = Scratch::new("egress");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepting = std::thread::spawn(move || {
+        // 대조군이 실제로 연결에 성공할 수 있어야 함
+        for _ in 0..2 {
+            if listener.accept().is_err() {
+                break;
+            }
+        }
+    });
+
+    let port_s = port.to_string();
+    let argv = ["/usr/bin/nc", "-z", "127.0.0.1", port_s.as_str()];
+
+    let open = policy_with(
+        s.path(),
+        &format!(
+            r#"
+[[rules]]
+id = "loopback"
+kind = "egress"
+host = "127.0.0.1"
+port = {port}
+action = "allow"
+"#
+        ),
+    );
+    assert!(
+        run_under_sandbox(&open, s.path(), &argv),
+        "egress allow 규칙이 있는데 연결이 막히면 프로파일이 과도하게 좁음"
+    );
+
+    let closed = policy_with(s.path(), "");
+    assert!(
+        !run_under_sandbox(&closed, s.path(), &argv),
+        "egress allow 규칙이 없는 정책에서 아웃바운드가 나갔음. \
+         [defaults].egress = \"deny\"와 정면으로 모순됨"
+    );
+
+    drop(accepting);
+}
