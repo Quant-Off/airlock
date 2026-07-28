@@ -179,10 +179,10 @@ impl Rule {
                     argv,
                 },
             ) => {
-                if let Some(pm) = program {
-                    if !pm.matches(prog, ci) {
-                        return false;
-                    }
+                if let Some(pm) = program
+                    && !pm.matches(prog, ci)
+                {
+                    return false;
                 }
                 if !argv_contains.is_empty() {
                     let all_present = argv_contains.iter().all(|want| {
@@ -207,10 +207,10 @@ impl Rule {
                 true
             }
             (Matcher::Egress { host, port }, Query::Egress { host: h, port: p }) => {
-                if let Some(want) = port {
-                    if want != p {
-                        return false;
-                    }
+                if let Some(want) = port
+                    && want != p
+                {
+                    return false;
                 }
                 host.matches(h)
             }

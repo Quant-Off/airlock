@@ -31,10 +31,15 @@ use crate::enforcer::Enforcer;
 use crate::error::{BrokerError, Result};
 use crate::profile::ProfileOptions;
 
-/// 걸어 내려가며 검사할 최대 디렉토리 항목 수.
+/// 루트 하나를 걸어 내려가며 검사할 최대 디렉토리 항목 수.
 ///
 /// 예산을 넘기면 남은 하위 트리를 허용하지 않고 gap으로 보고합니다. 넘겨서 통째로
-/// 허용하면 그 안의 시크릿이 열리므로 제한 방향으로 실패시킵니다
+/// 허용하면 그 안의 시크릿이 열리므로 제한 방향으로 실패시킵니다.
+///
+/// 예산은 **루트마다** 새로 줍니다. 하나로 공유하면 앞선 루트의 거대한 하위 트리가
+/// 예산을 다 써서 그 뒤의 모든 루트가 규칙 없이 남습니다. `/usr` 아래에 큰 SDK 가
+/// 깔린 머신에서 `/etc` 와 `/sbin` 이 통째로 빠져 프로그램이 뜨지 못하는 것이
+/// 그 경우입니다
 const WALK_BUDGET: usize = 200_000;
 
 const SYSTEM_READ_PATHS: &[&str] = &[
@@ -84,23 +89,49 @@ fn list_access() -> landlock::BitFlags<AccessFs> {
 struct PlanPath {
     path: PathBuf,
     follow: bool,
+    /// 이 경로가 디렉토리인지.
+    ///
+    /// 디렉토리 전용 권한(`ReadDir` 등)을 일반 파일에 걸면 커널이 EINVAL 을 돌려주고
+    /// 크레이트는 그것을 호환성 강등으로 처리해 ruleset 을 `PartiallyEnforced` 로
+    /// 만듭니다. 그러면 커널이 기능을 실제로 못 거는 경우와 구분되지 않아 부분 강제
+    /// 경고가 늘 켜져 있게 되므로, 대상 종류에 맞는 권한만 겁니다
+    dir: bool,
 }
 
 impl PlanPath {
     /// 설정에서 온 루트. 링크 해소를 허용합니다
     fn root(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let dir = path.is_dir();
         Self {
-            path: path.into(),
+            path,
             follow: true,
+            dir,
         }
     }
 
     /// 순회 중 발견한 항목. 링크 해소를 금지합니다
-    fn child(path: impl Into<PathBuf>) -> Self {
+    fn child(path: impl Into<PathBuf>, dir: bool) -> Self {
         Self {
             path: path.into(),
             follow: false,
+            dir,
         }
+    }
+}
+
+/// 이 대상에 실제로 걸 권한.
+///
+/// 디렉토리가 아니면 디렉토리 전용 비트를 뺍니다
+fn rule_access(
+    target: &PlanPath,
+    access: landlock::BitFlags<AccessFs>,
+    abi: ABI,
+) -> landlock::BitFlags<AccessFs> {
+    if target.dir {
+        access
+    } else {
+        access & AccessFs::from_file(abi)
     }
 }
 
@@ -226,7 +257,10 @@ impl Prefilter {
 struct Walker<'a> {
     policy: &'a Policy,
     filter: Prefilter,
-    budget: usize,
+    /// 루트 하나에 주는 예산
+    budget_per_root: usize,
+    /// 지금 걷고 있는 루트의 남은 예산
+    remaining: usize,
     exhausted: Vec<PathBuf>,
     /// 나열할 수 없어 하위를 확인하지 못한 디렉토리
     unreadable: Vec<PathBuf>,
@@ -239,11 +273,17 @@ impl<'a> Walker<'a> {
         Self {
             policy,
             filter: Prefilter::build(policy),
-            budget: WALK_BUDGET,
+            budget_per_root: WALK_BUDGET,
+            remaining: WALK_BUDGET,
             exhausted: Vec::new(),
             unreadable: Vec::new(),
             links: 0,
         }
+    }
+
+    /// 루트 하나를 새로 걷기 시작합니다. 예산을 되돌립니다
+    fn begin_root(&mut self) {
+        self.remaining = self.budget_per_root;
     }
 
     /// 이 경로를 허용 계획에서 빼야 하는지 봅니다.
@@ -297,12 +337,16 @@ impl<'a> Walker<'a> {
         };
 
         let mut children: Vec<(PathBuf, bool)> = Vec::new();
+        // 예산이 끊긴 자리에서 바로 돌아가면 이미 검사를 마친 형제까지 규칙 없이 남습니다.
+        // 끊겼다는 사실만 기록하고 나머지 처리는 아래 Partial 경로와 똑같이 갑니다
+        let mut truncated = false;
         for entry in entries.flatten() {
-            if self.budget == 0 {
+            if self.remaining == 0 {
+                truncated = true;
                 self.exhausted.push(dir.to_path_buf());
-                return Grant::Partial;
+                break;
             }
-            self.budget = self.budget.saturating_sub(1);
+            self.remaining = self.remaining.saturating_sub(1);
             let path = entry.path();
             let Ok(kind) = entry.file_type() else {
                 // 종류를 모르는 항목은 계획에 넣지 않습니다. 판단 불가는 제한 방향입니다
@@ -319,6 +363,11 @@ impl<'a> Walker<'a> {
             children.push((path, kind.is_dir()));
         }
 
+        // 계획은 read_dir 이 돌려주는 순서에 기대면 안 됩니다. 그 순서는 파일시스템의
+        // 해시 순서라 같은 패키지 구성에서도 머신마다 다르고, 예산이 끊기는 지점이
+        // 달라지면 같은 정책이 머신마다 다른 강제 범위를 냅니다
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+
         let mut partial: Vec<PathBuf> = Vec::new();
         let mut any_denied = false;
 
@@ -334,12 +383,12 @@ impl<'a> Walker<'a> {
             }
         }
 
-        if !any_denied && partial.is_empty() {
+        if !truncated && !any_denied && partial.is_empty() {
             return Grant::Whole;
         }
 
         // 이 디렉토리는 통째로 줄 수 없습니다. 허용 가능한 자식만 개별로 줍니다
-        for (path, _) in &children {
+        for (path, is_dir) in &children {
             if partial.iter().any(|p| p == path) {
                 continue;
             }
@@ -347,14 +396,14 @@ impl<'a> Walker<'a> {
                 continue;
             }
             if writable {
-                plan.read_write.push(PlanPath::child(path));
+                plan.read_write.push(PlanPath::child(path, *is_dir));
             } else {
-                plan.read_only.push(PlanPath::child(path));
+                plan.read_only.push(PlanPath::child(path, *is_dir));
             }
         }
         // 상위는 나열만 허용합니다. 이름은 보이지만 내용은 열리지 않으며,
         // Seatbelt 프로파일이 file-read-metadata를 여는 것과 같은 수준입니다
-        plan.list_only.push(PlanPath::child(dir));
+        plan.list_only.push(PlanPath::child(dir, true));
         Grant::Partial
     }
 }
@@ -363,6 +412,7 @@ fn add_root(walker: &mut Walker<'_>, root: &Path, writable: bool, plan: &mut Pla
     if !root.exists() {
         return;
     }
+    walker.begin_root();
     match walker.walk(root, writable, plan) {
         Grant::Whole => {
             if writable {
@@ -620,11 +670,15 @@ fn apply(plan: &Plan, abi: ABI) -> std::io::Result<RulesetStatus> {
         (&plan.list_only, list_access()),
     ] {
         for target in paths {
+            let granted = rule_access(target, access, abi);
+            if granted.is_empty() {
+                continue;
+            }
             let Some(fd) = open_rule_target(target) else {
                 continue;
             };
             created = created
-                .add_rule(PathBeneath::new(fd, access))
+                .add_rule(PathBeneath::new(fd, granted))
                 .map_err(std::io::Error::other)?;
         }
     }
@@ -722,5 +776,154 @@ impl Enforcer for LandlockEnforcer {
         );
         gaps.extend(self.gaps.iter().cloned());
         gaps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use airlock_policy::LoadContext;
+    use std::fs;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p = std::env::temp_dir()
+                .join(format!("airlock-plan-{tag}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&p).unwrap();
+            Self(fs::canonicalize(&p).unwrap())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn baseline(home: &Path) -> Policy {
+        Policy::baseline_only(&LoadContext::new(home, home.join("audit"))).unwrap()
+    }
+
+    /// 예산은 루트마다 새로 주어야 합니다.
+    ///
+    /// 하나로 공유하면 앞선 루트가 예산을 다 쓴 뒤의 모든 루트가 규칙 없이 남고,
+    /// `/usr` 에 큰 트리가 있는 머신에서 `/etc` 와 `/sbin` 이 통째로 빠집니다
+    #[test]
+    fn one_huge_root_does_not_starve_the_next_root() {
+        let s = Scratch::new("starve");
+        let big = s.0.join("big");
+        let small = s.0.join("small");
+        fs::create_dir_all(&big).unwrap();
+        fs::create_dir_all(&small).unwrap();
+        for i in 0..8 {
+            fs::write(big.join(format!("f{i}")), b"x").unwrap();
+        }
+        fs::write(small.join("tool"), b"x").unwrap();
+
+        let policy = baseline(&s.0);
+        let mut walker = Walker::new(&policy);
+        walker.budget_per_root = 4;
+        let mut plan = Plan::default();
+
+        add_root(&mut walker, &big, false, &mut plan);
+        assert!(
+            !walker.exhausted.is_empty(),
+            "첫 루트에서 예산이 소진되어야 함"
+        );
+
+        add_root(&mut walker, &small, false, &mut plan);
+        assert!(
+            plan.read_only.iter().any(|p| p.path == small),
+            "예산이 루트마다 새로 주어져 두 번째 루트가 통째로 허용되어야 함"
+        );
+    }
+
+    /// 예산이 끊겨도 그 전에 검사를 마친 형제는 규칙을 받아야 합니다
+    #[test]
+    fn entries_examined_before_exhaustion_still_get_rules() {
+        let s = Scratch::new("partial");
+        let root = s.0.join("root");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..6 {
+            fs::write(root.join(format!("f{i}")), b"x").unwrap();
+        }
+
+        let policy = baseline(&s.0);
+        let mut walker = Walker::new(&policy);
+        walker.budget_per_root = 3;
+        let mut plan = Plan::default();
+        add_root(&mut walker, &root, false, &mut plan);
+
+        assert_eq!(
+            plan.read_only.len(),
+            3,
+            "예산 안에서 본 항목은 개별 규칙을 받아야 함"
+        );
+        assert!(
+            plan.list_only.iter().any(|p| p.path == root),
+            "상위는 나열만 허용으로 남아야 함"
+        );
+    }
+
+    /// 계획은 read_dir 순서에 기대면 안 됩니다
+    #[test]
+    fn walk_order_is_deterministic() {
+        let s = Scratch::new("order");
+        let root = s.0.join("root");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["zeta", "alpha", "mid", "beta"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("x"), b"x").unwrap();
+        }
+        // 최상위 4개는 다 나열되고 그 아래로 내려갈 예산만 2개 남게 잡습니다.
+        // 어디까지 내려갈 수 있는지가 read_dir 순서에 좌우되면 안 됩니다
+        let policy = baseline(&s.0);
+        let mut walker = Walker::new(&policy);
+        walker.budget_per_root = 6;
+        let mut plan = Plan::default();
+        add_root(&mut walker, &root, false, &mut plan);
+
+        let seen: Vec<String> = plan
+            .read_only
+            .iter()
+            .filter_map(|p| p.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(seen, vec!["alpha", "beta"], "이름 순으로 걸어야 함");
+    }
+
+    /// 디렉토리 전용 권한을 일반 파일에 걸면 커널이 EINVAL 을 내고 크레이트가
+    /// ruleset 을 부분 강제로 표시합니다. 그러면 진짜 부분 강제와 구분되지 않습니다
+    #[test]
+    fn file_targets_do_not_get_directory_only_rights() {
+        let file = PlanPath {
+            path: PathBuf::from("/dev/null"),
+            follow: true,
+            dir: false,
+        };
+        let granted = rule_access(&file, full_access(ABI::V5), ABI::V5);
+        assert!(!granted.contains(AccessFs::ReadDir));
+        assert!(!granted.contains(AccessFs::MakeDir));
+        assert!(granted.contains(AccessFs::ReadFile));
+        assert!(granted.contains(AccessFs::WriteFile));
+
+        let dir = PlanPath {
+            path: PathBuf::from("/tmp"),
+            follow: true,
+            dir: true,
+        };
+        assert!(rule_access(&dir, read_access(ABI::V5), ABI::V5).contains(AccessFs::ReadDir));
+    }
+
+    #[test]
+    fn dev_nodes_are_planned_as_non_directories() {
+        let p = PlanPath::root("/dev/null");
+        assert!(!p.dir, "문자 장치는 디렉토리가 아님");
     }
 }

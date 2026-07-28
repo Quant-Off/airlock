@@ -459,13 +459,13 @@ fn collect_warnings(user: &[Rule], used_overrides: &HashSet<String>) -> Vec<Load
     let mut warnings = Vec::new();
 
     for r in user {
-        if let Some(target) = &r.overrides {
-            if !used_overrides.contains(&r.id) {
-                warnings.push(LoadWarning::UnusedOverride {
-                    id: r.id.clone(),
-                    target: target.clone(),
-                });
-            }
+        if let Some(target) = &r.overrides
+            && !used_overrides.contains(&r.id)
+        {
+            warnings.push(LoadWarning::UnusedOverride {
+                id: r.id.clone(),
+                target: target.clone(),
+            });
         }
         if let Matcher::Egress { host, .. } = &r.matcher {
             // 포트 단위까지만 강제하는 백엔드는 주소 단위 규칙을 표현할 수 없습니다.

@@ -267,10 +267,10 @@ fn build_enforcer(workspace: &std::path::Path, allow_network: bool) -> Box<dyn E
         let mut opts = ProfileOptions::default()
             .with_workspace(workspace)
             .with_network(allow_network);
-        if let Some(tmp) = std::env::var_os("TMPDIR") {
-            if let Ok(canon) = std::fs::canonicalize(PathBuf::from(tmp)) {
-                opts = opts.with_temp_dir(canon);
-            }
+        if let Some(tmp) = std::env::var_os("TMPDIR")
+            && let Ok(canon) = std::fs::canonicalize(PathBuf::from(tmp))
+        {
+            opts = opts.with_temp_dir(canon);
         }
         Box::new(airlock_broker::SeatbeltEnforcer::new().with_options(opts))
     }

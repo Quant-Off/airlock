@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Q. T. Felix <qtfelix@qu4nt.space>"]
 license = "AGPL-3.0-only"
-rust-version = "1.87"
+rust-version = "1.88"
 repository = "https://github.com/Quant-Off/airlock"
 
 [workspace.dependencies]
