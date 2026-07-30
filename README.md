@@ -1,6 +1,6 @@
 # Airlock
 
-[//]: # ([![Language]&#40;https://img.shields.io/badge/README-English_Ver-blue?style=for-the-badge&#41;]&#40;README_EN.md&#41;)
+[![Language](https://img.shields.io/badge/README-English_Ver-blue?style=for-the-badge)](README_EN.md)
 [![Qu4nt-Space-Discord](https://img.shields.io/badge/Qu4nt_Space-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/9utg4hp3m8)
 
 에이전트는 신뢰할 수 없는 코드 실행자입니다. LLM은 확률적이고 프롬프트 인젝션에 취약하므로, 에이전트가 무엇을 하려는지가 아니라 실제로 무엇을 하는지를 경계에서 강제해야 합니다.
