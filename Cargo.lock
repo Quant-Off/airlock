@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "airlock-audit",
  "airlock-broker",
+ "airlock-canonical",
  "airlock-policy",
  "clap",
 ]
@@ -17,6 +18,7 @@ name = "airlock-audit"
 version = "0.1.0"
 dependencies = [
  "airlock-canonical",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -27,6 +29,7 @@ name = "airlock-broker"
 version = "0.1.0"
 dependencies = [
  "airlock-audit",
+ "airlock-canonical",
  "airlock-policy",
  "landlock",
  "libc",
@@ -43,6 +46,7 @@ name = "airlock-policy"
 version = "0.1.0"
 dependencies = [
  "airlock-canonical",
+ "libc",
  "serde",
  "sha2",
  "toml",
