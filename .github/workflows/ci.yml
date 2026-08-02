@@ -44,6 +44,21 @@ jobs:
       - name: 전체 검증
         run: ./scripts/check.sh
 
+  # 보안 도구의 의존성에 권고가 뜨면 알아야 합니다. 이 게이트가 없으면 RUSTSEC이
+  # 올라와도 아무도 모릅니다
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo-deny 설치
+        run: cargo install cargo-deny --locked
+
+      - name: 권고와 라이선스 검사
+        run: cargo deny check advisories bans sources licenses
+
   cross:
     name: cross compile
     runs-on: ubuntu-24.04
