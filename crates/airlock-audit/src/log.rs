@@ -17,6 +17,30 @@ pub const BROKER_ACTOR: &str = "airlock";
 
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+
+/// 감사 루트와 그 상위를 0700으로 만듭니다.
+///
+/// `create_dir_all` 은 umask 를 따르므로 umask 022 에서 `sessions/` 가 0755 가 됩니다.
+/// 같은 머신의 다른 사용자가 세션 이름을 훑거나 디렉토리를 미리 놓아둘 수 있으므로,
+/// 우리가 만드는 구성 요소는 전부 소유자 전용으로 둡니다.
+///
+/// # Errors
+/// 중간 구성 요소를 만들지 못하면 실패합니다.
+fn create_dir_all_private(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        create_dir_all_private(parent)?;
+    }
+    match fs::DirBuilder::new().mode(DIR_MODE).create(dir) {
+        Ok(()) => Ok(()),
+        // 경쟁으로 누가 먼저 만들었으면 그대로 씁니다
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(Error::io(dir, e)),
+    }
+}
+
 pub const HEAD_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +86,7 @@ impl AuditLog {
             return Err(Error::SessionDirExists(dir));
         }
         if let Some(parent) = dir.parent() {
-            fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+            create_dir_all_private(parent)?;
         }
         fs::DirBuilder::new()
             .mode(DIR_MODE)
@@ -142,11 +166,14 @@ impl AuditLog {
         let tmp = self.dir.join("head.json.tmp");
         let final_path = self.dir.join(HEAD_FILE);
         {
+            // 남아 있는 tmp 는 지우고 새로 만듭니다. create_new 와 O_NOFOLLOW 로 열어
+            // 미리 놓인 심볼릭 링크를 따라가지 않게 합니다
+            let _ = fs::remove_file(&tmp);
             let mut f = OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(FILE_MODE)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&tmp)
                 .map_err(|e| Error::io(&tmp, e))?;
             f.write_all(&body).map_err(|e| Error::io(&tmp, e))?;
@@ -197,7 +224,13 @@ pub fn read_entries_lossy(dir: impl AsRef<Path>) -> Result<(Vec<Entry>, Option<S
     for (idx, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| Error::io(&path, e))?;
         if line.trim().is_empty() {
-            continue;
+            // 검증기는 빈 줄을 치명적 오류로 봅니다(docs/audit-format.md 8절). 뷰어가
+            // 조용히 건너뛰면 같은 파일을 두 리더가 다르게 읽어 절단 탐지에 구멍이 납니다
+            problem = Some(format!(
+                "{}번째 줄이 비어 있음. 엔트리가 아닌 줄이 끼어들었음",
+                idx.saturating_add(1)
+            ));
+            break;
         }
         match serde_json::from_str::<Entry>(&line) {
             Ok(entry) => entries.push(entry),

@@ -187,6 +187,9 @@ impl Enforcer for SeatbeltEnforcer {
             "커널이 거부한 개별 파일·네트워크 접근은 감사 로그에 남지 않음. \
              체인에는 세션 단위 기록만 있음"
                 .to_string(),
+            "mach 서비스는 클립보드를 뺀 나머지가 열려 있음. XPC 로 오가는 것은 \
+             정책 모델과 감사 로그 밖임"
+                .to_string(),
         ];
         if !self.untranslatable.is_empty() {
             gaps.push(format!(

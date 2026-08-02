@@ -411,6 +411,54 @@ pub fn run(
         which(program).ok_or_else(|| BrokerError::ProgramNotFound(program.to_string()))?;
     enforcer.prepare(&policy)?;
 
+    /// 로더 주입에 쓰이는 환경 변수 접두.
+    ///
+    /// 이 값들이 살아 있으면 정책이 경로로 허용한 프로그램 안에서 남의 코드가 돕니다.
+    /// `kind = "exec"` allowlist 가 통째로 무의미해지므로 전달하지 않습니다
+    const INJECTION_PREFIXES: &[&str] = &["LD_", "DYLD_"];
+
+    /// 셸이 시작할 때 읽어 실행하는 환경 변수.
+    const INJECTION_EXACT: &[&str] = &[
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "IFS",
+        "PS4",
+        "PERL5OPT",
+        "PERL5LIB",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_SSH_COMMAND",
+    ];
+
+    /// 자식에게 넘길 환경에서 코드 주입 통로를 걷어냅니다.
+    ///
+    /// 통째로 비우지 않는 이유는 에이전트가 `PATH`, `HOME`, `TERM` 없이는 정상 동작하지
+    /// 않기 때문입니다. 대신 로더와 인터프리터가 시작 시점에 실행하는 값만 지웁니다.
+    ///
+    /// # Arguments
+    /// `cmd` - 환경을 정리할 명령
+    fn sanitize_env(cmd: &mut Command) {
+        for (key, _) in std::env::vars_os() {
+            let Some(k) = key.to_str() else {
+                // UTF-8이 아닌 변수 이름은 검사할 수 없으므로 넘기지 않습니다
+                cmd.env_remove(&key);
+                continue;
+            };
+            let strip = INJECTION_PREFIXES.iter().any(|p| k.starts_with(p))
+                || INJECTION_EXACT.contains(&k)
+                // 감사 로그 위치를 알려 줄 이유가 없습니다
+                || k == "AIRLOCK_AUDIT_DIR";
+            if strip {
+                cmd.env_remove(&key);
+            }
+        }
+    }
+
     let enforcement = enforcer.kind();
     let mut gaps = enforcer.gaps();
     gaps.extend(mediation_gaps(config.mediation));
@@ -418,6 +466,7 @@ pub fn run(
     let mut cmd = Command::new(&resolved);
     cmd.args(args);
     cmd.current_dir(&config.cwd);
+    sanitize_env(&mut cmd);
 
     // 중계 훅을 강제 층보다 먼저 겁니다. listener fd를 부모에게 넘기는 sendmsg가
     // 샌드박스 적용 전에 끝나야 합니다
