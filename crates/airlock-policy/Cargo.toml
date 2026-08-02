@@ -9,6 +9,7 @@ description = "Airlock의 capability 정책 모델과 TOML DSL, 평가 엔진"
 
 [dependencies]
 airlock-canonical.workspace = true
+libc.workspace = true
 serde.workspace = true
 sha2.workspace = true
 toml.workspace = true

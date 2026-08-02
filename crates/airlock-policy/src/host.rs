@@ -43,6 +43,12 @@ pub fn normalize_host(raw: &str) -> Option<String> {
     if let Ok(ip) = t.parse::<IpAddr>() {
         return Some(ip.to_canonical().to_string());
     }
+    // Rust의 파서는 점 4개 십진 표기만 받지만 getaddrinfo는 8진, 16진, 정수 하나,
+    // 생략형까지 받습니다. 여기서 잡지 않으면 169.254.169.254 deny를 2852039166으로
+    // 그대로 지나갑니다
+    if let Some(ip) = parse_inet_aton(t) {
+        return Some(IpAddr::V4(ip).to_string());
+    }
     let ok = t
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
@@ -50,6 +56,52 @@ pub fn normalize_host(raw: &str) -> Option<String> {
         return None;
     }
     Some(t.to_ascii_lowercase())
+}
+
+/// `inet_aton` 의미론으로 IPv4를 읽습니다.
+///
+/// 1개에서 4개의 부분을 받고 각 부분은 10진, `0` 접두 8진, `0x` 접두 16진입니다. 마지막
+/// 부분이 남은 바이트를 통째로 채웁니다. 곧 `127.1`은 127.0.0.1, `2130706433`도 같습니다.
+///
+/// # Arguments
+/// `t` - 검사할 문자열
+fn parse_inet_aton(t: &str) -> Option<std::net::Ipv4Addr> {
+    // 순수 도메인 이름이 여기 걸리면 안 되므로 숫자 표기만 받습니다
+    let parts: Vec<&str> = t.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut vals: Vec<u32> = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let (digits, radix) = if let Some(h) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X"))
+        {
+            (h, 16)
+        } else if p.len() > 1 && p.starts_with('0') {
+            (&p[1..], 8)
+        } else {
+            (*p, 10)
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
+            return None;
+        }
+        vals.push(u32::from_str_radix(digits, radix).ok()?);
+    }
+    // 마지막을 뺀 나머지는 한 바이트씩이고, 마지막이 남은 자리를 전부 채웁니다
+    let last = *vals.last()?;
+    let head = &vals[..vals.len() - 1];
+    if head.iter().any(|v| *v > 0xFF) {
+        return None;
+    }
+    let tail_bytes = 4 - head.len() as u32;
+    if tail_bytes < 4 && last >= 1u32 << (8 * tail_bytes) {
+        return None;
+    }
+    let mut addr: u32 = 0;
+    for (i, v) in head.iter().enumerate() {
+        addr |= v << (8 * (3 - i as u32));
+    }
+    addr |= last;
+    Some(std::net::Ipv4Addr::from(addr))
 }
 
 fn is_ip_literal(host: &str) -> bool {
@@ -98,7 +150,9 @@ impl HostPattern {
 
     pub fn matches(&self, host: &str) -> bool {
         let Some(norm) = normalize_host(host) else {
-            return false;
+            // `*`는 "전부"라는 뜻이며 정규화할 수 없는 값도 전부에 들어갑니다. 여기서
+            // false를 돌려주면 deny host="*"가 [defaults].egress보다 느슨해집니다
+            return matches!(self, Self::Any);
         };
         match self {
             Self::Any => true,
@@ -189,11 +243,18 @@ mod tests {
     }
 
     #[test]
-    fn any_matches_everything_resolvable() {
+    fn any_matches_everything_including_unparseable() {
+        // `*`는 "전부"입니다. 정규화할 수 없는 값을 비켜 가면 deny host="*"가
+        // [defaults].egress 보다 느슨해집니다. allow 에는 `*`를 쓸 수 없으므로
+        // (engine 의 WildcardHostAllow) 이 넓힘이 통과를 만들지는 않습니다
         let h = p("*");
         assert!(h.matches("example.com"));
         assert!(h.matches("10.0.0.1"));
-        assert!(!h.matches(""));
+        assert!(h.matches(""));
+        assert!(h.matches("한국.com"));
+        assert!(h.matches("fe80::1%en0"));
+        assert!(h.matches("exfil.com:443"));
+        assert!(h.matches(".evil.com"));
     }
 
     #[test]
@@ -229,9 +290,53 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_runtime_host_never_matches() {
-        assert!(!p("*").matches("한국.com"));
+    fn non_ascii_runtime_host_matches_nothing_but_any() {
+        assert!(!p("example.com").matches("한국.com"));
+        assert!(!p("*.com").matches("한국.com"));
         assert!(normalize_host("한국.com").is_none());
+    }
+
+    #[test]
+    fn alternate_ipv4_notations_normalize_to_the_same_address() {
+        // getaddrinfo 가 받는 표기를 정책도 같은 주소로 봐야 합니다. 그렇지 않으면
+        // 클라우드 메타데이터 deny 를 정수 표기 하나로 지나갑니다
+        let meta = p("169.254.169.254");
+        for raw in [
+            "169.254.169.254",
+            "2852039166",
+            "0xA9FEA9FE",
+            "0xa9fea9fe",
+            "169.254.43518",
+            "169.16689662",
+            "0251.0376.0251.0376",
+        ] {
+            assert!(
+                meta.matches(raw),
+                "{raw}가 메타데이터 주소로 정규화되어야 함"
+            );
+        }
+
+        let loopback = p("127.0.0.1");
+        for raw in ["127.0.0.1", "127.1", "2130706433", "0x7f000001"] {
+            assert!(loopback.matches(raw), "{raw}가 루프백으로 정규화되어야 함");
+        }
+    }
+
+    #[test]
+    fn ordinary_domains_are_not_read_as_numeric_ipv4() {
+        for raw in [
+            "example.com",
+            "a.b.c.d",
+            "1foo.com",
+            "0x.com",
+            "8.8.8.8.com",
+        ] {
+            let norm = normalize_host(raw).unwrap_or_default();
+            assert!(
+                norm.parse::<IpAddr>().is_err(),
+                "{raw}는 IP 로 읽히면 안 됨: {norm}"
+            );
+        }
     }
 
     #[test]

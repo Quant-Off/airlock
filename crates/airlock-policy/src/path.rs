@@ -14,11 +14,77 @@ impl NormalizedPath {
     }
 }
 
+/// `HOME`을 읽습니다.
+///
+/// 값이 없거나 절대 경로가 아니면 `None`입니다. 예전에는 `/`로 물러섰지만, 그러면
+/// `~/.ssh/**` 같은 베이스라인 forbid가 전부 `/.ssh/**`로 붕괴해 진짜 홈이 무방비가
+/// 됩니다. 시크릿 보호가 조용히 사라지는 유일한 방향이므로 실패로 다룹니다.
+pub fn home_dir_checked() -> Option<PathBuf> {
+    let raw = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    home_dir_checked().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// 신뢰 경계를 정의하는 파일을 출처 확인과 함께 읽습니다.
+///
+/// `O_NOFOLLOW`로 열어 마지막 구성 요소가 심볼릭 링크면 거부하고, 열린 fd를 그대로
+/// `fstat` 해 TOCTOU 없이 소유자와 권한을 봅니다. 검사한 fd에서 그대로 읽으므로 검사 후
+/// 파일이 바뀌어도 읽는 대상은 달라지지 않습니다.
+///
+/// # Arguments
+/// `path` - 읽을 파일
+///
+/// # Errors
+/// 열기·읽기 실패, 심볼릭 링크, 호출자 소유가 아닌 파일, 그룹이나 그 밖의 사용자가 쓸 수
+/// 있는 파일은 전부 거부합니다.
+///
+/// # Safety
+/// `libc::getuid`는 인자가 없고 실패하지 않으며 스레드 상태를 건드리지 않습니다. 반환값은
+/// 항상 유효한 uid이므로 이 호출에는 지켜야 할 사전 조건이 없습니다.
+pub fn read_trusted(path: &Path) -> Result<String, crate::error::LoadError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let io_err = |source| crate::error::LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(io_err)?;
+
+    let meta = file.metadata().map_err(io_err)?;
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(crate::error::LoadError::UntrustedFile {
+            path: path.to_path_buf(),
+            why: format!("uid {}의 소유임. 호출자는 uid {uid}", meta.uid()),
+        });
+    }
+    // 022. 그룹이나 그 밖의 사용자가 쓸 수 있으면 그들이 곧 정책 작성자입니다
+    if meta.mode() & 0o022 != 0 {
+        return Err(crate::error::LoadError::UntrustedFile {
+            path: path.to_path_buf(),
+            why: format!(
+                "권한이 {:04o}로 다른 사용자가 쓸 수 있음",
+                meta.mode() & 0o7777
+            ),
+        });
+    }
+
+    let mut src = String::new();
+    file.read_to_string(&mut src).map_err(io_err)?;
+    Ok(src)
 }
 
 pub fn expand_tilde(raw: &Path, home: &Path) -> PathBuf {
@@ -87,7 +153,51 @@ fn resolve_symlinks(absolute: &Path) -> PathBuf {
     absolute.to_path_buf()
 }
 
+/// 첫 NUL 바이트에서 경로를 자릅니다.
+///
+/// 커널은 C 문자열을 받으므로 NUL 뒤는 존재하지 않는 것과 같습니다. 정책이 뒤까지 읽으면
+/// `~/.ssh/id_ed25519\0/../../work/ok.txt` 가 작업 공간 파일로 판정되는데 커널은 개인키를
+/// 엽니다. 커널이 보는 것과 같은 것을 보게 맞춥니다.
+fn truncate_at_nul(path: &Path) -> PathBuf {
+    let bytes = path.as_os_str().as_bytes();
+    match bytes.iter().position(|b| *b == 0) {
+        None => path.to_path_buf(),
+        Some(i) => PathBuf::from(OsString::from_vec(bytes[..i].to_vec())),
+    }
+}
+
+/// 마지막 구성 요소가 심볼릭 링크면 그 대상까지 따라갑니다.
+///
+/// `canonicalize` 는 대상이 없으면 실패하므로, 아직 만들어지지 않은 파일을 가리키는 링크는
+/// 해소되지 않은 채 남습니다. 그 상태로 `create` 를 판정하면 링크 경로만 보고 허용하게 되고
+/// 커널은 링크를 따라가 시크릿 자리에 파일을 만듭니다.
+fn follow_dangling_link(path: &Path) -> PathBuf {
+    let mut cur = path.to_path_buf();
+    // ELOOP 방지. 커널의 통상 상한과 같은 자리에서 멈춥니다
+    for _ in 0..40 {
+        let Ok(meta) = std::fs::symlink_metadata(&cur) else {
+            return cur;
+        };
+        if !meta.file_type().is_symlink() {
+            return cur;
+        }
+        let Ok(target) = std::fs::read_link(&cur) else {
+            return cur;
+        };
+        cur = if target.is_absolute() {
+            target
+        } else {
+            match cur.parent() {
+                Some(parent) => lexical_clean(&parent.join(target)),
+                None => return cur,
+            }
+        };
+    }
+    cur
+}
+
 pub fn normalize(raw: &Path, cwd: &Path, home: &Path) -> NormalizedPath {
+    let raw = &truncate_at_nul(raw);
     let expanded = expand_tilde(raw, home);
     let absolute = if expanded.is_absolute() {
         expanded
@@ -97,7 +207,8 @@ pub fn normalize(raw: &Path, cwd: &Path, home: &Path) -> NormalizedPath {
         p
     };
     let requested = lexical_clean(&absolute);
-    let resolved = lexical_clean(&resolve_symlinks(&absolute));
+    // 대상이 아직 없는 링크는 canonicalize 가 놓치므로 한 번 더 따라갑니다
+    let resolved = lexical_clean(&resolve_symlinks(&follow_dangling_link(&absolute)));
     NormalizedPath {
         requested,
         resolved,

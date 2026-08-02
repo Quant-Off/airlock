@@ -159,6 +159,63 @@ impl Pattern {
         PathBuf::from(std::ffi::OsString::from_vec(out))
     }
 
+    /// 앞쪽 고정 구간이 다른 실제 경로로 해소되면 그 표기의 패턴을 하나 더 만듭니다.
+    ///
+    /// macOS 에서 `/etc`, `/var`, `/tmp` 는 `/private/*` 로 가는 firmlink 입니다. 요청이
+    /// `/private/etc/sudoers` 로 오면 요청 경로도 해소 경로도 `/etc/...` 가 아니므로
+    /// `/etc/sudoers` 로 적은 forbid 가 통째로 비켜 갑니다. 반대로 `/tmp/**` 로 적은
+    /// allow 는 해소 경로가 `/private/tmp/...` 라 아무 것도 열지 못합니다. 양쪽 표기를
+    /// 모두 규칙에 넣어야 정책이 적은 대로 걸립니다.
+    pub fn resolved_variant(&self) -> Option<Pattern> {
+        // 앞에서부터 고정 세그먼트만 모읍니다. 와일드카드가 나오면 거기서 멈춥니다
+        let fixed: Vec<&Vec<u8>> = self
+            .segs
+            .iter()
+            .take_while(|s| matches!(s, Seg::Exact(_)))
+            .map(|s| match s {
+                Seg::Exact(b) => b,
+                _ => unreachable!("take_while 가 Exact 만 남김"),
+            })
+            .collect();
+        if fixed.is_empty() {
+            return None;
+        }
+
+        // 존재하는 가장 긴 접두를 찾습니다. `/etc/shadow` 처럼 대상 파일이 없어도
+        // `/etc` 는 해소되므로 앞에서부터 줄여 가며 봅니다
+        let mut taken = fixed.len();
+        let (prefix_path, canonical) = loop {
+            if taken == 0 {
+                return None;
+            }
+            let mut prefix: Vec<u8> = Vec::new();
+            for seg in fixed.iter().take(taken) {
+                prefix.push(b'/');
+                prefix.extend_from_slice(seg);
+            }
+            let candidate = PathBuf::from(std::ffi::OsString::from_vec(prefix));
+            if let Ok(c) = std::fs::canonicalize(&candidate) {
+                break (candidate, c);
+            }
+            taken -= 1;
+        };
+        if canonical == prefix_path {
+            return None;
+        }
+
+        let mut segs = literal_segs(&canonical);
+        segs.extend(self.segs.iter().skip(taken).cloned());
+
+        // raw 는 사람이 읽는 설명이므로 앞부분만 바꿔 붙입니다. 원래 raw 가 그 접두로
+        // 시작하지 않으면(홈 확장 등) 접두를 통째로 갈아 끼웁니다
+        let old_prefix = prefix_path.to_string_lossy().into_owned();
+        let tail = self.raw.strip_prefix(&old_prefix).unwrap_or("");
+        Some(Pattern {
+            raw: format!("{}{tail}", canonical.to_string_lossy()),
+            segs,
+        })
+    }
+
     pub fn matches(&self, path: &Path, case_insensitive: bool) -> bool {
         let bytes = path.as_os_str().as_bytes();
         let segments: Vec<&[u8]> = bytes
@@ -291,20 +348,49 @@ impl TextPattern {
     }
 }
 
+/// 패턴 세그먼트와 경로 세그먼트를 맞춰 봅니다.
+///
+/// `(패턴 위치, 경로 위치)` 쌍으로 메모이제이션합니다. 같은 쌍을 두 번 계산하지 않으므로
+/// 비용이 두 길이의 곱으로 묶입니다. 메모 없이 `**` 마다 되돌아가면 `**` 개수만큼 지수가
+/// 붙어, 경로가 긴 요청 하나로 판정이 초 단위까지 늘어납니다. 경로는 공격자가 정합니다.
 fn match_segs(pat: &[Seg], path: &[&[u8]], ci: bool) -> bool {
-    match pat.split_first() {
-        None => path.is_empty(),
-        Some((Seg::DoubleStar, rest)) => {
-            if rest.is_empty() {
-                return true;
-            }
-            (0..=path.len()).any(|i| match_segs(rest, &path[i..], ci))
-        }
-        Some((seg, rest)) => match path.split_first() {
-            None => false,
-            Some((head, tail)) => match_one(seg, head, ci) && match_segs(rest, tail, ci),
-        },
+    let mut memo = vec![None; pat.len().saturating_add(1) * path.len().saturating_add(1)];
+    match_segs_memo(pat, path, ci, 0, 0, &mut memo)
+}
+
+fn match_segs_memo(
+    pat: &[Seg],
+    path: &[&[u8]],
+    ci: bool,
+    pi: usize,
+    ti: usize,
+    memo: &mut [Option<bool>],
+) -> bool {
+    let width = path.len().saturating_add(1);
+    let key = pi * width + ti;
+    if let Some(hit) = memo[key] {
+        return hit;
     }
+
+    let out = match pat.get(pi) {
+        None => ti == path.len(),
+        Some(Seg::DoubleStar) => {
+            if pi + 1 == pat.len() {
+                true
+            } else {
+                (ti..=path.len()).any(|i| match_segs_memo(pat, path, ci, pi + 1, i, memo))
+            }
+        }
+        Some(seg) => match path.get(ti) {
+            None => false,
+            Some(head) => {
+                match_one(seg, head, ci) && match_segs_memo(pat, path, ci, pi + 1, ti + 1, memo)
+            }
+        },
+    };
+
+    memo[key] = Some(out);
+    out
 }
 
 fn match_one(seg: &Seg, text: &[u8], ci: bool) -> bool {
@@ -313,6 +399,11 @@ fn match_one(seg: &Seg, text: &[u8], ci: bool) -> bool {
         Seg::Exact(p) => {
             if ci {
                 if eq_ascii_ci(p, text) {
+                    return true;
+                }
+                if let (Some(fp), Some(ft)) = (fold_bytes(p), fold_bytes(text))
+                    && fp == ft
+                {
                     return true;
                 }
                 match (nfc_bytes(p), nfc_bytes(text)) {
@@ -332,6 +423,11 @@ fn match_one(seg: &Seg, text: &[u8], ci: bool) -> bool {
             if !ci {
                 return false;
             }
+            if let (Some(fp), Some(ft)) = (fold_bytes(p), fold_bytes(text))
+                && wildcard_match(&fp, &ft, false)
+            {
+                return true;
+            }
             match (nfc_bytes(p), nfc_bytes(text)) {
                 (None, None) => false,
                 (np, nt) => wildcard_match(
@@ -350,6 +446,19 @@ fn nfc_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     let s = std::str::from_utf8(bytes).ok()?;
     Some(s.nfc().collect::<String>().into_bytes())
+}
+
+/// 케이스 무시 파일시스템이 같은 이름으로 보는 것들을 한 표기로 모읍니다.
+///
+/// ASCII 만 접으면 부족합니다. APFS 는 유니코드 표까지 써서 접기 때문에 `U+017F`(ſ)가
+/// `s` 와 같은 파일이 되고, NFC 는 이 글자를 건드리지 않습니다. 그래서 `~/.awſ/credentials`
+/// 로 쓰면 `~/.aws/**` deny 를 비켜 가면서 커널에는 `~/.aws/credentials` 로 들어갑니다.
+/// NFC 로 모은 뒤 대문자로 접으면 ſ 는 S 가 되고 é/É 같은 비ASCII 짝도 함께 잡힙니다.
+///
+/// 넓어지는 방향이므로 제한적인 규칙(`deny`, `forbid`, `ask`)에만 씁니다.
+fn fold_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    Some(s.nfc().collect::<String>().to_uppercase().into_bytes())
 }
 
 fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {

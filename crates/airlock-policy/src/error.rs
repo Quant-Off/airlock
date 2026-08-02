@@ -13,7 +13,22 @@ pub enum LoadError {
         source: std::io::Error,
     },
     UnsupportedVersion(u32),
+    /// 정책 파일의 출처를 믿을 수 없습니다.
+    ///
+    /// 심볼릭 링크이거나, 호출자 소유가 아니거나, 다른 사용자가 쓸 수 있는 경우입니다
+    UntrustedFile {
+        path: PathBuf,
+        why: String,
+    },
     DuplicateId(String),
+    /// 규칙 id에 허용되지 않는 문자가 있습니다.
+    ///
+    /// id는 커널 강제 프로파일에 주석으로 들어가므로 개행이나 제어 문자가 섞이면
+    /// 주석을 탈출해 프로파일을 다시 쓸 수 있습니다 (`docs/policy-dsl.md` 10절)
+    InvalidId {
+        id: String,
+        offender: char,
+    },
     /// 사용자 규칙 id가 내장 규칙 id와 겹칩니다.
     ///
     /// 감사 로그의 `rule` 필드는 티어를 담지 않으므로, 겹치면 그 결정을 낸 규칙이 어느
@@ -88,7 +103,20 @@ impl fmt::Display for LoadError {
             Self::UnsupportedVersion(v) => {
                 write!(f, "지원하지 않는 정책 version {v}. v1만 지원함")
             }
+            Self::UntrustedFile { path, why } => write!(
+                f,
+                "{} 를 신뢰할 수 없음: {why}. 정책 파일은 신뢰 경계 전체를 정의하므로 \
+                 호출자 소유이고 남이 쓸 수 없어야 함",
+                path.display()
+            ),
             Self::DuplicateId(id) => write!(f, "규칙 id `{id}`가 중복됨"),
+            Self::InvalidId { id, offender } => write!(
+                f,
+                "규칙 id `{}`에 쓸 수 없는 문자 {:?}가 있음. \
+                 id는 커널 프로파일에 주석으로 들어가므로 영숫자와 . _ - : 만 허용함",
+                id.escape_debug(),
+                offender
+            ),
             Self::ReservedId { id, tier } => write!(
                 f,
                 "규칙 id `{id}`가 내장 {tier} 규칙과 겹침. 감사 로그의 rule 필드가 \
