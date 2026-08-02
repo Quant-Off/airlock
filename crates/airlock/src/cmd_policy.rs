@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use airlock_canonical::display::sanitize;
 use airlock_policy::{Action, FileMode, LoadContext, Policy};
 
 use crate::paths;
@@ -58,13 +59,26 @@ fn load(
     audit_root: Option<PathBuf>,
 ) -> Result<(Policy, Option<PathBuf>), i32> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let audit_root = audit_root.unwrap_or_else(paths::audit_root);
-    let mut ctx = LoadContext::new(airlock_policy::path::home_dir(), &audit_root);
+    let audit_root = paths::absolutize(&audit_root.unwrap_or_else(paths::audit_root), &cwd);
+    let path = paths::discover_policy(explicit, &cwd).map(|p| paths::absolutize_lexical(&p, &cwd));
+
+    let mut candidates: Vec<PathBuf> = paths::policy_candidates(&cwd)
+        .iter()
+        .flat_map(|p| paths::protect_forms(p, &cwd))
+        .collect();
+    if let Some(p) = &path {
+        for form in paths::protect_forms(p, &cwd) {
+            if !candidates.contains(&form) {
+                candidates.push(form);
+            }
+        }
+    }
+
+    let mut ctx = LoadContext::new(airlock_policy::path::home_dir(), &audit_root)
+        .with_policy_files(candidates);
     if let Ok(exe) = std::env::current_exe() {
         ctx = ctx.with_binary(exe);
     }
-
-    let path = paths::discover_policy(explicit, &cwd);
     let policy = match &path {
         Some(p) => Policy::load_file(p, &ctx).map_err(|e| {
             eprintln!("airlock: {e}");
@@ -168,14 +182,21 @@ pub fn exec(cmd: PolicyCommand, audit_root: Option<PathBuf>) -> i32 {
                 Ok(v) => v,
                 Err(code) => return code,
             };
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let opts = airlock_broker::ProfileOptions {
-                workspace: workspace.or_else(|| std::env::current_dir().ok()),
+                workspace: Some(paths::absolutize(
+                    &workspace.unwrap_or_else(|| cwd.clone()),
+                    &cwd,
+                )),
                 ..Default::default()
             };
             let generated = airlock_broker::profile::generate(&policy, &opts);
             print!("{}", generated.text);
             for item in &generated.untranslatable {
-                eprintln!("airlock: 경고 프로파일로 옮기지 못한 규칙 {item}");
+                eprintln!(
+                    "airlock: 경고 프로파일로 옮기지 못한 규칙 {}",
+                    sanitize(item)
+                );
             }
             0
         }
@@ -202,10 +223,10 @@ fn colored(action: Action) -> String {
 fn print_rule(ev: &airlock_policy::Evaluation) {
     match &ev.rule {
         Some(rule) => {
-            println!("규칙     {} ({} tier)", rule.id, rule.tier);
-            println!("매칭     {}", rule.pattern);
+            println!("규칙     {} ({} tier)", sanitize(&rule.id), rule.tier);
+            println!("매칭     {}", sanitize(&rule.pattern));
             if let Some(reason) = &rule.reason {
-                println!("근거     {reason}");
+                println!("근거     {}", sanitize(reason));
             }
         }
         None => println!("규칙     없음 (기본값 적용)"),
@@ -214,8 +235,8 @@ fn print_rule(ev: &airlock_policy::Evaluation) {
 
 fn print_file(ev: &airlock_policy::Evaluation, mode: FileMode) {
     if let Some(np) = &ev.path {
-        println!("요청     {}", np.requested.display());
-        println!("해소     {}", np.resolved.display());
+        println!("요청     {}", sanitize(&np.requested.display().to_string()));
+        println!("해소     {}", sanitize(&np.resolved.display().to_string()));
         if np.diverges() {
             println!("         \x1b[35m경로가 다름. 더 제한적인 쪽이 채택됨\x1b[0m");
         }
@@ -227,9 +248,9 @@ fn print_file(ev: &airlock_policy::Evaluation, mode: FileMode) {
 
 fn print_exec(ev: &airlock_policy::Evaluation, argv: &[String]) {
     if let Some(np) = &ev.path {
-        println!("프로그램 {}", np.requested.display());
+        println!("프로그램 {}", sanitize(&np.requested.display().to_string()));
         if np.diverges() {
-            println!("해소     {}", np.resolved.display());
+            println!("해소     {}", sanitize(&np.resolved.display().to_string()));
         }
     }
     println!("argv     {argv:?}");
@@ -243,7 +264,7 @@ fn print_exec(ev: &airlock_policy::Evaluation, argv: &[String]) {
 }
 
 fn print_egress(ev: &airlock_policy::Evaluation, host: &str, port: u16) {
-    println!("호스트   {host}:{port}");
+    println!("호스트   {}:{port}", sanitize(host));
     println!("결정     {}", colored(ev.action));
     print_rule(ev);
 }

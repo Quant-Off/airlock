@@ -72,15 +72,41 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         return 64;
     };
 
-    let audit_root = args
-        .audit_dir
-        .clone()
-        .or(global_audit_root)
-        .unwrap_or_else(paths::audit_root);
+    let audit_root = paths::absolutize(
+        &args
+            .audit_dir
+            .clone()
+            .or(global_audit_root)
+            .unwrap_or_else(paths::audit_root),
+        &cwd,
+    );
     let session_dir = paths::session_dir(&audit_root);
-    let policy_path = paths::discover_policy(args.policy.as_deref(), &cwd);
+    // 여는 경로는 해소하지 않습니다. 미리 해소하면 O_NOFOLLOW 검사가 무의미해집니다
+    let policy_path = paths::discover_policy(args.policy.as_deref(), &cwd)
+        .map(|p| paths::absolutize_lexical(&p, &cwd));
 
-    let mut ctx = LoadContext::new(airlock_policy::path::home_dir(), &audit_root);
+    // 실제로 읽은 파일뿐 아니라 탐색 후보 전체를 자기보호 대상으로 둡니다
+    let mut candidates: Vec<PathBuf> = paths::policy_candidates(&cwd)
+        .iter()
+        .flat_map(|p| paths::protect_forms(p, &cwd))
+        .collect();
+    if let Some(p) = &policy_path {
+        for form in paths::protect_forms(p, &cwd) {
+            if !candidates.contains(&form) {
+                candidates.push(form);
+            }
+        }
+    }
+
+    // HOME이 없거나 상대 경로면 ~/ 앵커 forbid가 전부 엉뚱한 곳을 가리킵니다. 시크릿
+    // 보호가 사라진 채로 도는 것보다 중단이 낫습니다
+    let Some(home) = airlock_policy::path::home_dir_checked() else {
+        eprintln!("airlock: HOME이 비어 있거나 절대 경로가 아님");
+        eprintln!("airlock: ~/ 로 시작하는 시크릿 보호 규칙이 전부 무효가 되므로 실행을 중단함");
+        return 78;
+    };
+
+    let mut ctx = LoadContext::new(home, &audit_root).with_policy_files(candidates);
     if let Ok(exe) = std::env::current_exe() {
         ctx = ctx.with_binary(exe);
     }
@@ -107,7 +133,7 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         eprintln!("airlock: 경고 {w}");
     }
 
-    let workspace = args.workspace.clone().unwrap_or_else(|| cwd.clone());
+    let workspace = paths::absolutize(&args.workspace.clone().unwrap_or_else(|| cwd.clone()), &cwd);
     if let Err(why) = check_workspace(&workspace, args.workspace.is_some()) {
         eprintln!("airlock: {why}");
         return 64;
@@ -116,7 +142,17 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
     let mut enforcer: Box<dyn Enforcer> = if args.observe {
         Box::new(ObserveEnforcer)
     } else {
-        build_enforcer(&workspace, !args.no_network)
+        match build_enforcer(&workspace, !args.no_network) {
+            Ok(e) => e,
+            Err(why) => {
+                eprintln!("airlock: {why}");
+                eprintln!(
+                    "airlock: 커널 강제 없이는 에이전트를 격리할 수 없으므로 실행을 중단함. \
+                     기록만 원하면 --observe를 명시할 것"
+                );
+                return 70;
+            }
+        }
     };
 
     let approver: Box<dyn Approver> = if args.yes {
@@ -261,7 +297,16 @@ fn check_workspace(workspace: &std::path::Path, explicit: bool) -> Result<(), St
     Ok(())
 }
 
-fn build_enforcer(workspace: &std::path::Path, allow_network: bool) -> Box<dyn Enforcer> {
+/// 커널 강제 백엔드를 만듭니다.
+///
+/// # Errors
+/// 이 플랫폼에 백엔드가 없거나 커널이 지원하지 않으면 그 사유를 담아 실패합니다. 호출부는
+/// 실행을 중단해야 합니다. 강제를 관측으로 조용히 바꾸는 것은 격리를 포기하는 것이므로
+/// 사용자가 `--observe`로 명시할 때만 허용합니다.
+fn build_enforcer(
+    workspace: &std::path::Path,
+    allow_network: bool,
+) -> Result<Box<dyn Enforcer>, String> {
     #[cfg(target_os = "macos")]
     {
         let mut opts = ProfileOptions::default()
@@ -272,16 +317,15 @@ fn build_enforcer(workspace: &std::path::Path, allow_network: bool) -> Box<dyn E
         {
             opts = opts.with_temp_dir(canon);
         }
-        Box::new(airlock_broker::SeatbeltEnforcer::new().with_options(opts))
+        Ok(Box::new(
+            airlock_broker::SeatbeltEnforcer::new().with_options(opts),
+        ))
     }
     #[cfg(target_os = "linux")]
     {
         if !airlock_broker::LandlockEnforcer::available() {
             let _ = (workspace, allow_network);
-            eprintln!(
-                "airlock: 경고 커널이 Landlock을 지원하지 않음(5.13 이상 필요). observe 모드로 내려감"
-            );
-            return Box::new(ObserveEnforcer);
+            return Err("커널이 Landlock을 지원하지 않음(5.13 이상 필요)".to_string());
         }
         let mut opts = ProfileOptions::default()
             .with_workspace(workspace)
@@ -291,13 +335,14 @@ fn build_enforcer(workspace: &std::path::Path, allow_network: bool) -> Box<dyn E
         {
             opts = opts.with_temp_dir(canon);
         }
-        Box::new(airlock_broker::LandlockEnforcer::new().with_options(opts))
+        Ok(Box::new(
+            airlock_broker::LandlockEnforcer::new().with_options(opts),
+        ))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (workspace, allow_network);
-        eprintln!("airlock: 경고 이 플랫폼의 커널 강제 백엔드가 아직 없음. observe 모드로 내려감");
-        Box::new(ObserveEnforcer)
+        Err("이 플랫폼의 커널 강제 백엔드가 아직 없음".to_string())
     }
 }
 

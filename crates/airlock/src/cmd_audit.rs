@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use airlock_audit::{Entry, Event, Warning, verify_dir};
+use airlock_canonical::display::sanitize;
 
 use crate::paths;
 
@@ -121,7 +122,10 @@ fn describe_event(event: &Event) -> String {
             ..
         } => {
             let short: String = policy_digest.to_hex().chars().take(12).collect();
-            let source = policy_source.as_deref().unwrap_or("내장 베이스라인");
+            let source = policy_source
+                .as_deref()
+                .map(sanitize)
+                .unwrap_or_else(|| "내장 베이스라인".to_string());
             let sync = if *fsync_per_entry {
                 ""
             } else {
@@ -140,18 +144,20 @@ fn describe_event(event: &Event) -> String {
             path_resolved,
             mode,
         } => {
-            if path_requested == path_resolved {
-                format!("파일 {mode} {path_requested}")
+            let requested = sanitize(path_requested);
+            let resolved = sanitize(path_resolved);
+            if requested == resolved {
+                format!("파일 {mode} {requested}")
             } else {
-                format!("파일 {mode} {path_requested} \x1b[35m-> {path_resolved}\x1b[0m")
+                format!("파일 {mode} {requested} \x1b[35m-> {resolved}\x1b[0m")
             }
         }
-        Event::Exec { program, argv, .. } => format!("실행 {program} {argv:?}"),
+        Event::Exec { program, argv, .. } => format!("실행 {} {argv:?}", sanitize(program)),
         Event::Egress {
             host,
             port,
             protocol,
-        } => format!("아웃바운드 {protocol} {host}:{port}"),
+        } => format!("아웃바운드 {protocol} {}:{port}", sanitize(host)),
         Event::Approval {
             for_seq,
             granted,
@@ -159,7 +165,7 @@ fn describe_event(event: &Event) -> String {
         } => {
             let mut s = format!("승인응답 seq={for_seq} {granted}");
             if let Some(n) = note {
-                s.push_str(&format!(" ({n})"));
+                s.push_str(&format!(" ({})", sanitize(n)));
             }
             s
         }
@@ -171,6 +177,10 @@ fn describe_event(event: &Event) -> String {
 }
 
 fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
+    // 렌더링 전에 체인을 먼저 검증합니다. 위조된 엔트리를 아무 표시 없이 사람에게
+    // 보여 주면 뷰어가 공격자의 출력 장치가 됩니다
+    let integrity = airlock_audit::verify_dir(dir);
+
     let (entries, problem) = match airlock_audit::read_entries_lossy(dir) {
         Ok(v) => v,
         Err(e) => {
@@ -179,8 +189,18 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
         }
     };
     if let Some(p) = &problem {
-        eprintln!("airlock: 경고 {p}");
-        eprintln!("airlock: airlock audit verify로 무결성을 확인할 것");
+        // 경고와 엔트리를 같은 스트림에 둡니다. 리다이렉트나 페이저로 경고만 사라지면
+        // 조용히 뚫린 것과 같습니다
+        println!("\x1b[1;31mairlock 경고\x1b[0m {p}");
+    }
+
+    if let Err(failure) = &integrity {
+        println!(
+            "\x1b[1;31m╔══ 무결성 실패 ═══════════════════════════════════\x1b[0m\n\
+             \x1b[1;31m║\x1b[0m {failure}\n\
+             \x1b[1;31m║\x1b[0m 아래 내용은 검증되지 않았으므로 증거로 쓸 수 없음\n\
+             \x1b[1;31m╚═════════════════════════════════════════════════\x1b[0m"
+        );
     }
 
     if entries.is_empty() {
@@ -214,8 +234,15 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
 
     for e in window {
         let color = decision_color(e);
-        let time = e.ts_rfc3339.get(0..19).unwrap_or(&e.ts_rfc3339);
-        let rule = e.rule.as_deref().unwrap_or("기본값");
+        // 저장된 ts_rfc3339은 해시 대상이 아니므로 위조할 수 있습니다. 해시가 보증하는
+        // ts에서 다시 만들어 표시합니다
+        let derived = airlock_audit::format_rfc3339_nanos(e.ts);
+        let time = derived.get(0..19).unwrap_or(&derived).to_string();
+        let rule = e
+            .rule
+            .as_deref()
+            .map(sanitize)
+            .unwrap_or_else(|| "기본값".to_string());
         println!(
             "{:>5} {time}Z {color}{:<6}\x1b[0m {:<9} {} \x1b[2m[{rule}]\x1b[0m",
             e.seq,
@@ -233,6 +260,11 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
         println!(
             "\n\x1b[33m주의\x1b[0m {observed}개 엔트리가 observe 모드임. 기록되었지만 강제되지 않음"
         );
+    }
+
+    // 검증 실패는 종료 코드로도 드러냅니다. 파이프라인이 show 만 부르고도 알아챌 수 있어야 합니다
+    if integrity.is_err() || problem.is_some() {
+        return 2;
     }
     0
 }
