@@ -16,6 +16,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use airlock_audit::Granted;
+use airlock_canonical::display::sanitize;
 use airlock_policy::MatchedRule;
 
 /// 사람 응답을 기다리는 기본 상한.
@@ -164,33 +165,6 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
             return false;
         }
     }
-}
-
-/// 승인 화면에 그대로 넣으면 화면을 다시 칠하거나 글자 순서를 뒤집을 수 있는 문자인지 봅니다.
-///
-/// 제어 문자와 양방향 텍스트 재정렬 문자가 대상입니다. 경로와 argv는 신뢰할 수 없는
-/// 입력이므로 여기를 통과하지 않으면 승인 프롬프트 자체가 위조 가능해집니다
-fn is_display_unsafe(ch: char) -> bool {
-    ch.is_control()
-        || matches!(ch,
-            '\u{200E}' | '\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}')
-}
-
-fn sanitize(value: &str) -> String {
-    if !value.chars().any(is_display_unsafe) {
-        return value.to_string();
-    }
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if is_display_unsafe(ch) {
-            out.push_str(&format!("\\u{{{:04x}}}", ch as u32));
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 fn render(request: &ApprovalRequest) -> String {

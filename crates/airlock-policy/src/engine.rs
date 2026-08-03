@@ -22,14 +22,26 @@ impl LoadContext {
             home: home.into(),
             self_protect: SelfProtectPaths {
                 audit_root: audit_root.into(),
-                policy_file: None,
+                policy_files: Vec::new(),
                 binary: None,
             },
         }
     }
 
     pub fn with_policy_file(mut self, path: impl Into<PathBuf>) -> Self {
-        self.self_protect.policy_file = Some(path.into());
+        self.self_protect.policy_files = vec![path.into()];
+        self
+    }
+
+    /// 자기보호할 정책 파일 후보를 통째로 지정합니다.
+    ///
+    /// 탐색 후보는 아직 존재하지 않아도 막아야 합니다. 비어 있는 자리에 대상이 정책을
+    /// 만들어 두면 다음 실행이 그것을 읽기 때문입니다.
+    ///
+    /// # Arguments
+    /// `paths` - 막을 후보 경로 전체
+    pub fn with_policy_files(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.self_protect.policy_files = paths.into_iter().collect();
         self
     }
 
@@ -37,6 +49,28 @@ impl LoadContext {
         self.self_protect.binary = Some(path.into());
         self
     }
+}
+
+/// 파일 규칙의 각 패턴에 해소된 표기를 하나씩 더합니다.
+///
+/// macOS 의 `/etc` -> `/private/etc` 같은 firmlink 때문입니다. 한쪽 표기로만 적힌 규칙은
+/// 다른 표기의 요청을 만나면 매칭되지 않습니다.
+///
+/// # Arguments
+/// `rule` - 패턴을 넓힐 규칙
+fn add_resolved_variants(rule: &mut Rule) {
+    let Matcher::File { paths, .. } = &mut rule.matcher else {
+        return;
+    };
+    let mut extra: Vec<crate::glob::Pattern> = Vec::new();
+    for p in paths.iter() {
+        if let Some(v) = p.resolved_variant()
+            && !paths.iter().any(|q| q.raw() == v.raw())
+        {
+            extra.push(v);
+        }
+    }
+    paths.extend(extra);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,16 +172,26 @@ impl Policy {
         Self::build(&name, defaults, user, ctx)
     }
 
+    /// 정책 파일을 읽어 로드합니다.
+    ///
+    /// # Errors
+    /// 읽기에 실패하거나, 파일이 호출한 사용자의 것이 아니거나, 다른 사용자가 쓸 수 있으면
+    /// 실패합니다. 정책 파일은 신뢰 경계 전체를 정의하므로 내용을 보기 전에 출처부터
+    /// 확인합니다.
     pub fn load_file(path: &Path, ctx: &LoadContext) -> Result<Self, LoadError> {
-        let src = std::fs::read_to_string(path).map_err(|source| LoadError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let src = crate::path::read_trusted(path)?;
         let ctx = LoadContext {
             home: ctx.home.clone(),
             self_protect: SelfProtectPaths {
                 audit_root: ctx.self_protect.audit_root.clone(),
-                policy_file: Some(path.to_path_buf()),
+                policy_files: {
+                    // 실제로 읽은 파일이 후보 목록에 없으면 더합니다
+                    let mut v = ctx.self_protect.policy_files.clone();
+                    if !v.iter().any(|p| p == path) {
+                        v.push(path.to_path_buf());
+                    }
+                    v
+                },
                 binary: ctx.self_protect.binary.clone(),
             },
         };
@@ -157,14 +201,24 @@ impl Policy {
     fn build(
         name: &str,
         defaults: Defaults,
-        user: Vec<Rule>,
+        mut user: Vec<Rule>,
         ctx: &LoadContext,
     ) -> Result<Self, LoadError> {
-        let base = baseline::build(&ctx.home).map_err(|source| LoadError::Pattern {
+        let mut base = baseline::build(&ctx.home).map_err(|source| LoadError::Pattern {
             id: "baseline".to_string(),
             source,
         })?;
-        let self_protect = baseline::self_protect(&ctx.self_protect);
+        let mut self_protect = baseline::self_protect(&ctx.self_protect);
+
+        // firmlink 로 다른 이름이 붙는 경로에 양쪽 표기를 모두 넣습니다. 티어를 가리지
+        // 않고 적용해야 deny 가 비켜 가지도, allow 가 죽지도 않습니다
+        for r in user
+            .iter_mut()
+            .chain(base.rules.iter_mut())
+            .chain(self_protect.iter_mut())
+        {
+            add_resolved_variants(r);
+        }
 
         // 내장 규칙 id는 예약어입니다. 겹치는 id를 허용하면 감사 로그의 rule 필드가
         // 어느 티어의 규칙을 가리키는지 알 수 없어집니다 (10절 3번)

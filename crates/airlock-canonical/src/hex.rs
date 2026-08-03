@@ -53,6 +53,14 @@ pub fn decode(s: &str) -> Result<Vec<u8>, HexError> {
 }
 
 pub fn decode_fixed<const N: usize>(s: &str) -> Result<[u8; N], HexError> {
+    // 길이부터 봅니다. 먼저 decode 하면 신뢰할 수 없는 입력이 아무리 길어도 통째로
+    // 할당하고 해독한 뒤에야 거부하게 됩니다
+    if s.len() != N.saturating_mul(2) {
+        return Err(HexError::WrongLength {
+            expected: N,
+            got: s.len() / 2,
+        });
+    }
     let v = decode(s)?;
     if v.len() != N {
         return Err(HexError::WrongLength {

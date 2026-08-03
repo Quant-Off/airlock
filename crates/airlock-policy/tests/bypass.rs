@@ -1543,3 +1543,236 @@ action = "deny"
         p.warnings()
     );
 }
+
+#[test]
+fn rule_id_with_a_newline_is_rejected_at_load() {
+    let h = Home::new("id-newline");
+    let src = "
+version = 1
+[[rules]]
+id = \"no-nc\\n(allow file-read* file-write* (subpath \\\"/\\\"))\\n;;\"
+kind = \"exec\"
+program = \"nc\"
+action = \"deny\"
+";
+    let err = Policy::load_str(src, &h.ctx()).unwrap_err();
+    assert!(
+        matches!(err, LoadError::InvalidId { offender, .. } if offender == '\n'),
+        "id의 개행은 커널 프로파일 주석을 탈출시키므로 로드를 거부해야 함: {err:?}"
+    );
+}
+
+#[test]
+fn rule_id_control_characters_are_rejected_at_load() {
+    // TOML 이스케이프 표기 그대로 넣습니다. \u{..} 는 TOML 문법이 아닙니다
+    for (label, toml_id) in [
+        ("캐리지 리턴", r"a\rb"),
+        ("ESC", r"a\u001B[2Kb"),
+        ("NUL", r"a\u0000b"),
+        ("탭", r"a\tb"),
+        ("공백", "a b"),
+        ("괄호", "a)b"),
+        ("따옴표", r#"a\"b"#),
+        ("역슬래시", r"a\\b"),
+    ] {
+        let h = Home::new("id-ctl");
+        let src = format!(
+            "
+version = 1
+[[rules]]
+id = \"{toml_id}\"
+kind = \"file\"
+path = \"~/work/**\"
+action = \"allow\"
+"
+        );
+        let err = Policy::load_str(&src, &h.ctx()).unwrap_err();
+        assert!(
+            matches!(err, LoadError::InvalidId { .. }),
+            "{label}이 든 id는 거부해야 함: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_rule_ids_still_load() {
+    let h = Home::new("id-ok");
+    let src = r#"
+version = 1
+[[rules]]
+id = "build-cache.v2_x-y"
+kind = "file"
+path = "~/work/**"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    assert_eq!(read(&p, &h, "~/work/a.rs"), Action::Allow);
+}
+
+fn mode(policy: &Policy, home: &Home, raw: &str, m: FileMode) -> Action {
+    policy.evaluate_file(Path::new(raw), m, home.path()).action
+}
+
+#[test]
+fn unicode_case_fold_aliases_cannot_evade_secret_denies() {
+    // APFS 는 U+017F(ſ)를 s 와 같은 파일로 봅니다. NFC 는 이 글자를 건드리지 않으므로
+    // ASCII 만 접으면 ~/.awſ/credentials 로 써 놓고 ~/.aws/credentials 로 읽힙니다
+    let h = Home::new("fold");
+    let p = Policy::baseline_only(&h.ctx()).unwrap();
+    for raw in [
+        "~/.aw\u{17f}/credentials",
+        "~/.\u{17f}\u{17f}h/id_rsa",
+        "~/.\u{17f}\u{17f}h/authorized_keys",
+        "~/.AWS/credentials",
+    ] {
+        assert!(
+            mode(&p, &h, raw, FileMode::Create).is_restrictive(),
+            "{raw}는 시크릿 규칙에 걸려야 함"
+        );
+        assert!(read(&p, &h, raw).is_restrictive(), "{raw} 읽기도 걸려야 함");
+    }
+    // 무관한 경로가 함께 막히면 안 됩니다
+    assert_eq!(read(&p, &h, "~/work/awesome/notes.txt"), Action::Ask);
+}
+
+#[test]
+fn dangling_symlink_to_a_secret_is_resolved_before_deciding() {
+    // 대상이 아직 없는 링크는 canonicalize 가 놓칩니다. create 는 대상이 없는 것이
+    // 정상이므로 이 경로가 곧 시크릿 자리에 파일을 만드는 통로가 됩니다
+    let h = Home::new("dangling");
+    let ws = h.join("work");
+    fs::create_dir_all(&ws).unwrap();
+    let link = ws.join("ak");
+    std::os::unix::fs::symlink(h.join(".ssh/authorized_keys"), &link).unwrap();
+
+    let p = Policy::baseline_only(&h.ctx()).unwrap();
+    let raw = link.to_string_lossy().into_owned();
+    for m in [FileMode::Create, FileMode::Write, FileMode::Read] {
+        assert!(
+            mode(&p, &h, &raw, m).is_restrictive(),
+            "{m:?}가 링크를 따라 ~/.ssh 로 가야 함"
+        );
+    }
+}
+
+#[test]
+fn a_nul_byte_cannot_hide_the_real_target() {
+    // 커널은 NUL 에서 문자열을 끊습니다. 정책이 뒤까지 읽으면 작업 공간 파일로 보이지만
+    // 커널은 개인키를 엽니다
+    let h = Home::new("nul");
+    h.make_secret();
+    let p = Policy::baseline_only(&h.ctx()).unwrap();
+    let raw = format!(
+        "{}\u{0}/../../work/ok.txt",
+        h.join(".ssh/id_ed25519").display()
+    );
+    assert!(
+        read(&p, &h, &raw).is_restrictive(),
+        "NUL 뒤는 없는 것으로 보고 개인키로 판정해야 함"
+    );
+}
+
+#[test]
+fn every_policy_candidate_is_self_protected_even_when_absent() {
+    // 정책 파일이 없을 때 대상이 하나 만들어 두면 다음 실행이 그것을 읽습니다.
+    // 비어 있는 자리야말로 막아야 하는 자리입니다
+    let h = Home::new("candidates");
+    let ws = h.join("work");
+    fs::create_dir_all(&ws).unwrap();
+    let planted = ws.join("airlock.toml");
+
+    let ctx = LoadContext::new(h.path(), h.join(".local/share/airlock"))
+        .with_policy_files(vec![planted.clone(), ws.join(".airlock.toml")]);
+    let p = Policy::baseline_only(&ctx).unwrap();
+
+    let raw = planted.to_string_lossy().into_owned();
+    for m in [FileMode::Write, FileMode::Create, FileMode::Delete] {
+        let ev = p.evaluate_file(Path::new(&raw), m, h.path());
+        assert!(
+            ev.action.is_restrictive(),
+            "{m:?}로 정책을 심을 수 있으면 안 됨"
+        );
+        assert_eq!(
+            ev.rule.as_ref().map(|r| r.tier),
+            Some(Tier::SelfProtect),
+            "자기보호 티어가 잡아야 함"
+        );
+    }
+}
+
+#[test]
+fn deep_double_star_patterns_do_not_blow_up() {
+    // 메모 없이 되돌아가면 세그먼트 수의 네제곱으로 늘어납니다. 경로는 공격자가 정합니다
+    let h = Home::new("glob-perf");
+    let src = r#"
+version = 1
+[[rules]]
+id = "deep"
+kind = "file"
+path = "/**/a/**/a/**/a/**/z"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    let long = format!("/{}/q", vec!["a"; 600].join("/"));
+
+    let start = std::time::Instant::now();
+    let _ = p.evaluate_file(Path::new(&long), FileMode::Read, h.path());
+    let took = start.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "600 세그먼트 판정이 {took:?} 걸림. 메모이제이션이 빠졌는지 확인할 것"
+    );
+}
+
+#[test]
+fn firmlinked_prefixes_are_covered_in_both_spellings() {
+    // macOS 에서 /tmp 는 /private/tmp 로 가는 firmlink 입니다. 한쪽 표기로만 적힌
+    // deny 는 다른 표기의 요청을 놓치고, 한쪽으로만 적힌 allow 는 죽습니다
+    let Ok(canonical) = fs::canonicalize("/tmp") else {
+        return;
+    };
+    if canonical == Path::new("/tmp") {
+        // firmlink 가 없는 플랫폼입니다
+        return;
+    }
+
+    let h = Home::new("firmlink");
+    let src = r#"
+version = 1
+[defaults]
+file = "deny"
+[[rules]]
+id = "no-secrets-dir"
+kind = "file"
+path = "/tmp/secrets/**"
+action = "deny"
+[[rules]]
+id = "tmp-ok"
+kind = "file"
+path = "/tmp/**"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+
+    let other = canonical.join("build.o");
+    assert_eq!(
+        mode(&p, &h, "/tmp/build.o", FileMode::Write),
+        Action::Allow,
+        "allow 가 적은 표기로 동작해야 함"
+    );
+    assert_eq!(
+        mode(&p, &h, &other.to_string_lossy(), FileMode::Write),
+        Action::Allow,
+        "allow 가 해소된 표기로도 동작해야 함"
+    );
+
+    let secret = canonical.join("secrets/x");
+    assert!(
+        mode(&p, &h, "/tmp/secrets/x", FileMode::Read).is_restrictive(),
+        "deny 가 적은 표기로 걸려야 함"
+    );
+    assert!(
+        mode(&p, &h, &secret.to_string_lossy(), FileMode::Read).is_restrictive(),
+        "deny 가 해소된 표기로도 걸려야 함"
+    );
+}

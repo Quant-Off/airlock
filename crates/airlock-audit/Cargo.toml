@@ -9,6 +9,7 @@ description = "Airlock의 해시체인 append-only 감사 로그와 검증기"
 
 [dependencies]
 airlock-canonical.workspace = true
+libc.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

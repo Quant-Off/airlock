@@ -29,12 +29,17 @@ const SYSTEM_READ_SUBPATHS: &[&str] = &[
     "/Applications",
 ];
 
+/// 자식에게 열어 주는 장치 노드.
+///
+/// `/dev/tty`는 일부러 뺐습니다. 그것은 제어 터미널이며 승인 프롬프트가 나가는 통로입니다.
+/// 자식이 열 수 있으면 가짜 승인 화면을 그리거나 사용자가 입력한 답을 먼저 읽어 갈 수 있어
+/// `ask`가 무의미해집니다. 상속된 stdin·stdout·stderr는 그대로 두므로 보통의 대화형
+/// 프로그램은 영향받지 않습니다
 const DEV_RW_LITERALS: &[&str] = &[
     "/dev/null",
     "/dev/zero",
     "/dev/random",
     "/dev/urandom",
-    "/dev/tty",
     "/dev/stdin",
     "/dev/stdout",
     "/dev/stderr",
@@ -107,6 +112,17 @@ fn mode_writes(modes: ModeSet) -> bool {
         || modes.contains(FileMode::Delete)
 }
 
+/// 프로파일 주석에 넣을 문자열에서 줄을 깨는 문자를 지웁니다.
+///
+/// 정책 로더가 규칙 id를 이미 영숫자와 몇 개 기호로 제한하지만, 주석 한 줄이 깨지면
+/// 뒤 내용이 살아 있는 지시문이 되어 프로파일 전체가 뒤집힙니다. 강제 층은 로더의
+/// 검증을 신뢰하지 않고 방출 시점에서 한 번 더 막습니다.
+fn comment(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect()
+}
+
 pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     let mut out = String::new();
     let mut untranslatable = Vec::new();
@@ -122,9 +138,14 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     out.push_str("(allow process-exec*)\n");
     out.push_str("(allow signal (target self))\n");
     out.push_str("(allow sysctl-read)\n");
-    out.push_str("(allow mach-lookup)\n");
     out.push_str("(allow ipc-posix-shm)\n");
-    out.push_str("(allow file-ioctl)\n\n");
+    out.push_str("(allow file-ioctl)\n");
+    // mach 서비스는 통째로 열되 정책 밖 유출 통로로 알려진 것부터 되막습니다. 목록을
+    // 화이트리스트로 뒤집으면 개발 툴체인이 버전마다 깨지므로 deny 를 뒤에 둡니다
+    out.push_str("(allow mach-lookup)\n");
+    out.push_str(";; 클립보드는 정책 모델 밖의 읽기 쓰기 통로임\n");
+    out.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
+    out.push_str("(deny mach-lookup (global-name \"com.apple.pboard\"))\n\n");
 
     out.push_str(";; --- 경로 해석 ---\n");
     out.push_str(";; 루트 노드 자체를 읽지 못하면 어떤 절대 경로도 해석되지 않아\n");
@@ -271,11 +292,11 @@ fn emit_exec_rules(
                         out.push_str(&format!(
                             "(deny process-exec* {}) ;; {}\n",
                             target.render(),
-                            rule.id
+                            comment(&rule.id)
                         ));
                     }
                 }
-                Err(why) => untranslatable.push(format!("{} ({why})", rule.id)),
+                Err(why) => untranslatable.push(format!("{} ({why})", comment(&rule.id))),
             }
         }
     }
@@ -348,14 +369,18 @@ fn emit_file_rules(
                     sbpl::targets_for(pattern)
                 };
                 if targets.is_empty() {
-                    untranslatable.push(format!("{} {}", rule.id, pattern.raw()));
+                    untranslatable.push(format!(
+                        "{} {}",
+                        comment(&rule.id),
+                        comment(pattern.raw())
+                    ));
                 }
                 for target in targets {
                     out.push_str(&format!(
                         "({verb} {} {}) ;; {}\n",
                         ops.join(" "),
                         target.render(),
-                        rule.id
+                        comment(&rule.id)
                     ));
                 }
             }
@@ -698,6 +723,24 @@ action = "deny"
                 p.ask_exec
             );
         }
+    }
+
+    #[test]
+    fn comment_strips_control_characters() {
+        // 규칙 id 는 정책 로더가 이미 제한하지만 강제 층은 그 검증을 신뢰하지 않습니다.
+        // 주석 한 줄이 깨지면 뒤 내용이 살아 있는 지시문이 되어 프로파일이 뒤집힙니다
+        let payload = "ok\n(allow file-read* file-write* (subpath \"/\"))\n;;";
+        let out = comment(payload);
+        assert!(!out.contains('\n'), "개행이 남으면 주석을 탈출함: {out}");
+        assert_eq!(out.lines().count(), 1, "한 줄로 남아야 함: {out}");
+        for raw in ["a\rb", "a\u{1b}[2Kb", "a\u{0}b"] {
+            let got = comment(raw);
+            assert!(
+                !got.chars().any(char::is_control),
+                "{raw:?}에 제어 문자가 남음: {got}"
+            );
+        }
+        assert_eq!(comment("build-cache.v2_x-y"), "build-cache.v2_x-y");
     }
 
     #[test]

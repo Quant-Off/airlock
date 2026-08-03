@@ -1,0 +1,31 @@
+# cargo-deny 설정입니다. CI의 dependency audit 잡이 이 파일을 씁니다.
+# 보안 도구의 의존성에 권고가 뜨면 빌드를 세웁니다.
+
+[advisories]
+# RUSTSEC 권고가 하나라도 있으면 실패합니다
+yanked = "deny"
+ignore = []
+
+[licenses]
+# AGPL-3.0-only 프로젝트가 링크해도 되는 것만 둡니다
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "AGPL-3.0-only",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -24,7 +24,7 @@ use airlock_policy::rule::Matcher;
 use airlock_policy::{Action, FileMode, Policy};
 use landlock::{
     ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus,
+    RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use crate::enforcer::Enforcer;
@@ -53,13 +53,17 @@ const SYSTEM_READ_PATHS: &[&str] = &[
     "/proc/self",
 ];
 
+/// 자식에게 열어 주는 장치 노드.
+///
+/// `/dev/tty`는 일부러 뺐습니다. 그것은 제어 터미널이며 승인 프롬프트가 나가는 통로입니다.
+/// 자식이 열 수 있으면 가짜 승인 화면을 그리거나 사용자가 입력한 답을 먼저 읽어 갈 수 있어
+/// `ask`가 무의미해집니다
 const DEV_RW_PATHS: &[&str] = &[
     "/dev/null",
     "/dev/zero",
     "/dev/full",
     "/dev/random",
     "/dev/urandom",
-    "/dev/tty",
 ];
 
 fn read_access(abi: ABI) -> landlock::BitFlags<AccessFs> {
@@ -457,14 +461,19 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
         add_root(&mut walker, ws, true, &mut plan);
     }
 
-    // 정책이 명시적으로 allow 한 파일 경로 중 구체 경로를 추가로 엽니다
+    // 정책이 명시적으로 allow 한 파일 경로 중 구체 경로를 추가로 엽니다.
+    // mode 를 그대로 따릅니다. 읽기만 허용한 규칙에 쓰기까지 열어 주면 정책 파일이
+    // 말하는 것보다 커널이 넓어지고, 같은 정책이 macOS 와 Linux 에서 다르게 걸립니다
     for rule in policy.user_rules() {
         if rule.action != Action::Allow {
             continue;
         }
-        let Matcher::File { paths, .. } = &rule.matcher else {
+        let Matcher::File { paths, modes } = &rule.matcher else {
             continue;
         };
+        let writable = modes.contains(FileMode::Write)
+            || modes.contains(FileMode::Create)
+            || modes.contains(FileMode::Delete);
         for pattern in paths {
             let raw = pattern.raw();
             if raw.contains('*') || raw.contains('?') {
@@ -472,7 +481,7 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
             }
             let candidate = pattern.witness();
             if candidate.exists() {
-                add_root(&mut walker, &candidate, true, &mut plan);
+                add_root(&mut walker, &candidate, writable, &mut plan);
             }
         }
     }
@@ -497,8 +506,42 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
         ));
     }
 
+    plan_exec_gap(policy, &mut plan);
     plan_network(policy, opts, &mut plan);
     plan
+}
+
+/// exec 제한이 커널에 걸리지 않는다는 사실을 gap 으로 남깁니다.
+///
+/// Landlock 은 허용 목록 방식이라 "이 디렉토리는 열되 그 안의 이 바이너리만 실행 금지"를
+/// 표현할 수 없습니다. macOS 는 `(deny process-exec* ...)` 로 같은 규칙을 커널에 내리므로,
+/// 선언하지 않으면 같은 정책 파일이 플랫폼마다 다르게 걸리는데 사용자는 그것을 알 수
+/// 없습니다.
+fn plan_exec_gap(policy: &Policy, plan: &mut Plan) {
+    let mut ids: Vec<&str> = Vec::new();
+    for rule in policy.user_rules().iter().chain(policy.baseline_rules()) {
+        if !rule.action.is_restrictive() {
+            continue;
+        }
+        let names_exec = match &rule.matcher {
+            Matcher::Exec { .. } => true,
+            Matcher::File { modes, .. } => modes.contains(FileMode::Exec),
+            Matcher::Egress { .. } => false,
+        };
+        if names_exec {
+            ids.push(&rule.id);
+        }
+    }
+    if ids.is_empty() {
+        return;
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    plan.gaps.push(format!(
+        "exec 제한은 Landlock 이 표현할 수 없어 커널에서 강제되지 않음. \
+         중계 층이 관측할 뿐이며 --mediate off 면 아무것도 남지 않음: {}",
+        ids.join(", ")
+    ));
 }
 
 fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
@@ -533,7 +576,17 @@ fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
         return;
     }
 
-    if !host_scoped.is_empty() {
+    if plan.unrestricted_net {
+        // 포트를 적지 않은 allow 가 하나라도 있으면 TCP 제한 자체를 걸지 않습니다.
+        // 이때 "포트까지는 강제한다"고 알리면 사실과 정반대가 됩니다
+        plan.gaps.push(
+            "포트를 특정하지 않은 egress allow 규칙이 있어 아웃바운드를 통째로 열었음. \
+             포트 제한도 걸리지 않으므로 규칙마다 port 를 적어야 함"
+                .to_string(),
+        );
+    }
+
+    if !host_scoped.is_empty() && !plan.unrestricted_net {
         plan.gaps.push(format!(
             "호스트 단위 egress 규칙은 Landlock으로 강제되지 않음. 포트까지만 강제하며 \
              호스트 판정은 프록시 층이 필요함: {}",
@@ -670,6 +723,15 @@ fn apply(plan: &Plan, abi: ABI) -> std::io::Result<RulesetStatus> {
     if abi >= ABI::V4 && !plan.unrestricted_net {
         ruleset = ruleset
             .handle_access(AccessNet::from_all(abi))
+            .map_err(std::io::Error::other)?;
+    }
+
+    // ABI v6부터 도메인 밖으로 나가는 시그널과 추상 유닉스 소켓 연결을 막을 수 있습니다.
+    // 이것이 없으면 격리된 프로세스가 브로커와 감독 스레드에 시그널을 보내고,
+    // dbus 나 ssh-agent 같은 추상 소켓에 그대로 붙습니다
+    if abi >= ABI::V6 {
+        ruleset = ruleset
+            .scope(Scope::from_all(abi))
             .map_err(std::io::Error::other)?;
     }
 

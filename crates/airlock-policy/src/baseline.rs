@@ -311,7 +311,8 @@ pub fn build(home: &Path) -> Result<Baseline, PatternError> {
 #[derive(Debug, Clone)]
 pub struct SelfProtectPaths {
     pub audit_root: PathBuf,
-    pub policy_file: Option<PathBuf>,
+    /// 정책 파일 후보 전체. 아직 없는 후보도 포함합니다
+    pub policy_files: Vec<PathBuf>,
     pub binary: Option<PathBuf>,
 }
 
@@ -333,7 +334,9 @@ pub fn self_protect(paths: &SelfProtectPaths) -> Vec<Rule> {
         },
     });
 
-    if let Some(policy) = &paths.policy_file {
+    if !paths.policy_files.is_empty() {
+        // 아직 존재하지 않는 후보도 함께 막습니다. 정책 파일이 없을 때 대상이 하나 만들어
+        // 두면 다음 실행이 그것을 읽으므로, 없는 경로야말로 막아야 하는 경로입니다
         rules.push(Rule {
             id: "self:policy-file".to_string(),
             tier: Tier::SelfProtect,
@@ -341,7 +344,11 @@ pub fn self_protect(paths: &SelfProtectPaths) -> Vec<Rule> {
             reason: Some("정책 파일을 대상이 고칠 수 있으면 강제가 아님".to_string()),
             overrides: None,
             matcher: Matcher::File {
-                paths: vec![Pattern::literal(policy)],
+                paths: paths
+                    .policy_files
+                    .iter()
+                    .map(|p| Pattern::literal(p.as_path()))
+                    .collect(),
                 modes: ModeSet::from_modes(W),
             },
         });
@@ -451,7 +458,7 @@ mod tests {
         use crate::rule::Query;
         let paths = SelfProtectPaths {
             audit_root: PathBuf::from("/Users/me/.local/share/airlock"),
-            policy_file: Some(PathBuf::from("/Users/me/work/airlock.toml")),
+            policy_files: vec![PathBuf::from("/Users/me/work/airlock.toml")],
             binary: Some(PathBuf::from("/usr/local/bin/airlock")),
         };
         let rules = self_protect(&paths);
@@ -481,7 +488,7 @@ mod tests {
         let root = PathBuf::from("/Users/me/.local/share/airlock");
         let rules = self_protect(&SelfProtectPaths {
             audit_root: root.clone(),
-            policy_file: None,
+            policy_files: Vec::new(),
             binary: None,
         });
         assert!(rules[0].matches(&Query::File {
@@ -495,7 +502,7 @@ mod tests {
         use crate::rule::Query;
         let rules = self_protect(&SelfProtectPaths {
             audit_root: PathBuf::from("/tmp/a*b"),
-            policy_file: None,
+            policy_files: Vec::new(),
             binary: None,
         });
         assert!(rules[0].matches(&Query::File {
@@ -515,7 +522,7 @@ mod tests {
     fn optional_self_protect_targets_are_skipped_when_absent() {
         let rules = self_protect(&SelfProtectPaths {
             audit_root: PathBuf::from("/tmp/audit"),
-            policy_file: None,
+            policy_files: Vec::new(),
             binary: None,
         });
         assert_eq!(rules.len(), 1);
