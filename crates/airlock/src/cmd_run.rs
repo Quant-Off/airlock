@@ -4,7 +4,7 @@ use airlock_broker::{
     ApproveAll, Approver, Enforcer, ObserveEnforcer, ProfileOptions, RefuseAll, SessionConfig,
     TtyApprover,
 };
-use airlock_policy::{LoadContext, Policy};
+use airlock_policy::{LoadContext, LoadWarning, Policy};
 
 use crate::paths;
 
@@ -24,6 +24,13 @@ pub struct RunArgs {
 
     #[arg(long, help = "아웃바운드 네트워크를 통째로 차단함")]
     pub no_network: bool,
+
+    #[arg(
+        long,
+        help = "아웃바운드를 로컬 egress 프록시로 강제 경유시켜 호스트 단위 정책을 강제함. \
+                프록시 설정을 무시하는 도구는 연결에 실패함"
+    )]
+    pub egress_proxy: bool,
 
     #[arg(
         long,
@@ -129,7 +136,11 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         },
     };
 
+    let proxy_planned = args.egress_proxy && !args.no_network;
     for w in policy.warnings() {
+        if proxy_planned && matches!(w, LoadWarning::HostRuleNeedsProxy { .. }) {
+            continue;
+        }
         eprintln!("airlock: 경고 {w}");
     }
 
@@ -139,10 +150,34 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         return 64;
     }
 
+    // 프로파일이 프록시 포트를 알아야 아웃바운드를 그 하나로 좁힐 수 있으므로
+    // 강제 층을 세우기 전에 먼저 바인드합니다
+    let proxy = if proxy_planned {
+        match airlock_proxy::ProxyServer::bind() {
+            Ok(server) => Some(server),
+            Err(e) => {
+                eprintln!("airlock: egress 프록시를 띄우지 못함: {e}");
+                eprintln!(
+                    "airlock: 프록시 없이 계속하면 호스트 정책이 강제되지 않으므로 실행을 중단함"
+                );
+                return 70;
+            }
+        }
+    } else {
+        if args.egress_proxy && args.no_network {
+            eprintln!("airlock: --no-network가 있으므로 --egress-proxy는 무시됨");
+        }
+        None
+    };
+
     let mut enforcer: Box<dyn Enforcer> = if args.observe {
         Box::new(ObserveEnforcer)
     } else {
-        match build_enforcer(&workspace, !args.no_network) {
+        match build_enforcer(
+            &workspace,
+            !args.no_network,
+            proxy.as_ref().map(|p| p.addr()),
+        ) {
             Ok(e) => e,
             Err(why) => {
                 eprintln!("airlock: {why}");
@@ -199,6 +234,7 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         &session_dir,
         &workspace,
         mediation,
+        proxy.as_ref().map(|p| p.addr()),
     );
 
     let report = match airlock_broker::run(
@@ -208,6 +244,7 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         std::mem::replace(&mut enforcer, Box::new(ObserveEnforcer)),
         approver,
         &config,
+        proxy,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -244,6 +281,11 @@ fn genesis_argv(args: &RunArgs, workspace: &std::path::Path) -> Vec<String> {
     argv.push(workspace.display().to_string());
     if args.no_network {
         argv.push("--no-network".to_string());
+    }
+    // 이 플래그가 있었는지에 따라 호스트 규칙이 실제 경계였는지 의도 선언이었는지가
+    // 갈립니다. 같은 정책 다이제스트로도 결론이 달라지므로 반드시 남깁니다
+    if args.egress_proxy {
+        argv.push("--egress-proxy".to_string());
     }
     if args.yes {
         argv.push("--yes".to_string());
@@ -306,42 +348,55 @@ fn check_workspace(workspace: &std::path::Path, explicit: bool) -> Result<(), St
 fn build_enforcer(
     workspace: &std::path::Path,
     allow_network: bool,
+    proxy: Option<std::net::SocketAddr>,
 ) -> Result<Box<dyn Enforcer>, String> {
-    #[cfg(target_os = "macos")]
-    {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn options(
+        workspace: &std::path::Path,
+        allow_network: bool,
+        proxy: Option<std::net::SocketAddr>,
+    ) -> ProfileOptions {
         let mut opts = ProfileOptions::default()
             .with_workspace(workspace)
             .with_network(allow_network);
+        if let Some(addr) = proxy {
+            opts = opts.with_proxy(addr);
+        }
         if let Some(tmp) = std::env::var_os("TMPDIR")
             && let Ok(canon) = std::fs::canonicalize(PathBuf::from(tmp))
         {
             opts = opts.with_temp_dir(canon);
         }
+        opts
+    }
+
+    #[cfg(target_os = "macos")]
+    {
         Ok(Box::new(
-            airlock_broker::SeatbeltEnforcer::new().with_options(opts),
+            airlock_broker::SeatbeltEnforcer::new().with_options(options(
+                workspace,
+                allow_network,
+                proxy,
+            )),
         ))
     }
     #[cfg(target_os = "linux")]
     {
         if !airlock_broker::LandlockEnforcer::available() {
-            let _ = (workspace, allow_network);
+            let _ = (workspace, allow_network, proxy);
             return Err("커널이 Landlock을 지원하지 않음(5.13 이상 필요)".to_string());
         }
-        let mut opts = ProfileOptions::default()
-            .with_workspace(workspace)
-            .with_network(allow_network);
-        if let Some(tmp) = std::env::var_os("TMPDIR")
-            && let Ok(canon) = std::fs::canonicalize(PathBuf::from(tmp))
-        {
-            opts = opts.with_temp_dir(canon);
-        }
         Ok(Box::new(
-            airlock_broker::LandlockEnforcer::new().with_options(opts),
+            airlock_broker::LandlockEnforcer::new().with_options(options(
+                workspace,
+                allow_network,
+                proxy,
+            )),
         ))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (workspace, allow_network);
+        let _ = (workspace, allow_network, proxy);
         Err("이 플랫폼의 커널 강제 백엔드가 아직 없음".to_string())
     }
 }
@@ -353,6 +408,7 @@ fn print_banner(
     session_dir: &std::path::Path,
     workspace: &std::path::Path,
     mediation: airlock_broker::Mediation,
+    proxy: Option<std::net::SocketAddr>,
 ) {
     let digest = airlock_audit::Hash::from_bytes(policy.digest());
     let short: String = digest.to_hex().chars().take(12).collect();
@@ -376,6 +432,10 @@ fn print_banner(
         );
     }
     eprintln!("  작업공간 {}", workspace.display());
+    match proxy {
+        Some(addr) => eprintln!("  아웃바운드 {addr} 경유. 호스트 정책이 강제됨"),
+        None => eprintln!("  아웃바운드 프록시 없음. 호스트 규칙은 의도 선언에 그침"),
+    }
     eprintln!("  승인     {}", approver.describe());
     eprintln!("  감사     {}", session_dir.display());
     for gap in enforcer

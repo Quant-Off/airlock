@@ -5,11 +5,16 @@ use airlock_audit as audit;
 use airlock_audit::{
     AuditLog, Decision, Enforcement, Event, GenesisInfo, Granted, Mediation, Record,
 };
-use airlock_policy::{Action, Evaluation, FileMode, Policy};
+use airlock_policy::{Action, Evaluation, FileMode, MatchedRule, Policy, Tier};
 
 use crate::approve::{ApprovalRequest, Approver};
 use crate::enforcer::Enforcer;
 use crate::error::{BrokerError, Result};
+
+/// 프록시 채널 통과가 감사에 남을 때 쓰는 규칙 id.
+///
+/// 규칙 없는 allow 로 남기면 정책이 연 것처럼 보이므로 출처를 분명히 적습니다
+pub const PROXY_RULE_ID: &str = "airlock:egress-proxy";
 
 pub fn decision_of(action: Action) -> Decision {
     match action {
@@ -137,6 +142,7 @@ pub struct Session {
     cwd: PathBuf,
     asked: u64,
     denied: u64,
+    proxy: Option<std::net::SocketAddr>,
 }
 
 impl std::fmt::Debug for Session {
@@ -185,7 +191,32 @@ impl Session {
             cwd: config.cwd.clone(),
             asked: 0,
             denied: 0,
+            proxy: None,
         })
+    }
+
+    /// 이 세션의 egress 프록시 주소를 알려 줍니다.
+    ///
+    /// 중계 층은 자식이 프록시로 가는 루프백 연결도 그대로 봅니다. 정책에는 그
+    /// 주소를 여는 규칙이 없어 `[defaults].egress`로 떨어져 막히므로, 브로커가
+    /// 자기 채널임을 알고 통과시켜야 합니다. 실제 목적지 판정은 프록시가 합니다
+    pub fn set_proxy_endpoint(&mut self, addr: std::net::SocketAddr) {
+        self.proxy = Some(addr);
+    }
+
+    /// 관측된 주소가 이 세션의 프록시 채널인지 봅니다.
+    fn is_proxy_endpoint(&self, host: &str, port: u16) -> bool {
+        let Some(proxy) = self.proxy else {
+            return false;
+        };
+        if port != proxy.port() {
+            return false;
+        }
+        // 중계 층은 sockaddr 에서 읽은 IP 문자열을 넘기므로 표기 차이를 없애려면
+        // 문자열이 아니라 주소로 비교해야 합니다
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| ip == proxy.ip())
+            .unwrap_or(false)
     }
 
     pub fn policy(&self) -> &Policy {
@@ -319,7 +350,21 @@ impl Session {
         port: u16,
         protocol: audit::Protocol,
     ) -> Result<Outcome> {
-        let eval = self.policy.evaluate_egress(host, port);
+        let eval = if self.is_proxy_endpoint(host, port) {
+            Evaluation {
+                action: Action::Allow,
+                rule: Some(MatchedRule {
+                    id: PROXY_RULE_ID.to_string(),
+                    tier: Tier::SelfProtect,
+                    action: Action::Allow,
+                    pattern: format!("{host}:{port}"),
+                    reason: Some("브로커 egress 프록시 채널. 목적지 판정은 프록시가 함".into()),
+                }),
+                path: None,
+            }
+        } else {
+            self.policy.evaluate_egress(host, port)
+        };
         let request = ApprovalRequest::new("아웃바운드 연결 시도")
             .fact("호스트", host.to_string())
             .fact("포트", port.to_string());
@@ -406,6 +451,7 @@ pub fn run(
     mut enforcer: Box<dyn Enforcer>,
     approver: Box<dyn Approver>,
     config: &SessionConfig,
+    proxy: Option<airlock_proxy::ProxyServer>,
 ) -> Result<RunReport> {
     let resolved =
         which(program).ok_or_else(|| BrokerError::ProgramNotFound(program.to_string()))?;
@@ -463,10 +509,38 @@ pub fn run(
     let mut gaps = enforcer.gaps();
     gaps.extend(mediation_gaps(config.mediation));
 
+    /// 자식이 프록시를 거쳐 나가도록 환경을 잡습니다.
+    ///
+    /// `NO_PROXY`를 비우는 것이 핵심입니다. 상속된 값이 남아 있으면 거기 적힌
+    /// 호스트가 프록시를 건너뛰고, 커널 층이 그 연결을 막아 원인을 알기 어려운
+    /// 실패가 됩니다
+    ///
+    /// # Arguments
+    /// `cmd` - 환경을 잡을 명령
+    /// `addr` - 프록시가 듣고 있는 루프백 주소
+    fn inject_proxy_env(cmd: &mut Command, addr: std::net::SocketAddr) {
+        let url = format!("http://{addr}");
+        for key in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            cmd.env(key, &url);
+        }
+        cmd.env("NO_PROXY", "");
+        cmd.env("no_proxy", "");
+    }
+
     let mut cmd = Command::new(&resolved);
     cmd.args(args);
     cmd.current_dir(&config.cwd);
     sanitize_env(&mut cmd);
+    if let Some(p) = &proxy {
+        inject_proxy_env(&mut cmd, p.addr());
+    }
 
     // 중계 훅을 강제 층보다 먼저 겁니다. listener fd를 부모에게 넘기는 sendmsg가
     // 샌드박스 적용 전에 끝나야 합니다
@@ -490,6 +564,9 @@ pub fn run(
     };
 
     let mut session = Session::start(policy, enforcement, approver, config)?;
+    if let Some(p) = &proxy {
+        session.set_proxy_endpoint(p.addr());
+    }
 
     let mut argv = Vec::with_capacity(args.len().saturating_add(1));
     argv.push(program.to_string());
@@ -519,6 +596,18 @@ pub fn run(
 
     let shared = std::sync::Arc::new(std::sync::Mutex::new(session));
 
+    // 프록시도 spawn 전에 띄웁니다. 자식이 첫 연결을 보낼 때 accept 루프가 이미
+    // 돌고 있어야 합니다
+    let proxy_thread = proxy.map(|server| {
+        let gate: std::sync::Arc<dyn airlock_proxy::EgressGate> = std::sync::Arc::new(
+            crate::egress::SessionGate::new(std::sync::Arc::clone(&shared)),
+        );
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || server.serve(gate, flag));
+        (stop, handle)
+    });
+
     // 감독 스레드를 spawn보다 먼저 띄웁니다. spawn은 자식이 exec을 마쳐야 돌아오는데
     // 그 exec 자체가 알림으로 멈추므로, 같은 스레드에서 기다리면 서로를 막습니다
     #[cfg(target_os = "linux")]
@@ -546,6 +635,14 @@ pub fn run(
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = handle.join();
     }
+
+    // accept 루프만 멈춥니다. 살아 있는 릴레이 스레드는 자기 연결이 끝나면
+    // 알아서 돌아오므로, 여기서 join 을 기다리면 자식이 남긴 긴 연결에 세션
+    // 종료가 묶입니다
+    if let Some((stop, _)) = &proxy_thread {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(proxy_thread);
 
     let mut session = match shared.lock() {
         Ok(s) => s,

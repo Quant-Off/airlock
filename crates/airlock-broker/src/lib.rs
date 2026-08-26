@@ -1,4 +1,5 @@
 pub mod approve;
+pub mod egress;
 pub mod enforcer;
 pub mod error;
 pub mod profile;
@@ -18,11 +19,13 @@ pub use airlock_audit::Mediation;
 pub use approve::{
     ApprovalRequest, ApproveAll, Approver, DEFAULT_ASK_TIMEOUT, RefuseAll, TtyApprover,
 };
+pub use egress::SessionGate;
 pub use enforcer::{Enforcer, ObserveEnforcer, default_enforcer};
 pub use error::{BrokerError, Result};
 pub use profile::{GeneratedProfile, ProfileOptions};
 pub use session::{
-    Outcome, RunReport, Session, SessionConfig, effective_mediation, mediation_gaps, run, which,
+    Outcome, PROXY_RULE_ID, RunReport, Session, SessionConfig, effective_mediation, mediation_gaps,
+    run, which,
 };
 
 #[cfg(target_os = "macos")]
