@@ -224,7 +224,8 @@ impl fmt::Display for LoadWarning {
             ),
             Self::HostRuleNeedsProxy { id } => write!(
                 f,
-                "`{id}`는 호스트 단위 egress 규칙임. egress 프록시 층 없이는 강제되지 않음"
+                "`{id}`는 호스트 단위 egress 규칙임. `airlock run --egress-proxy`로 실행할 때만 \
+                 강제되고, 그냥 실행하면 커널이 판정하지 못함"
             ),
             Self::IneffectiveRelaxation {
                 id,
