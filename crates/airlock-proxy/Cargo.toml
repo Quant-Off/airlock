@@ -1,0 +1,13 @@
+[package]
+name = "airlock-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Airlock의 로컬 egress 프록시. 호스트 단위 아웃바운드 정책을 강제하고 감사에 남김"
+
+[dependencies]
+
+[lints]
+workspace = true
