@@ -195,6 +195,10 @@ MVP는 전자를 택합니다. 후자는 IP 기반 정책까지만 표현할 수
 
 현재 Linux 백엔드는 Landlock ABI v4 이상에서 **포트 단위까지** 강제합니다. 정책에 호스트 패턴이나 IP 리터럴이 있으면 그 사실을 경고와 gap 으로 노출합니다. 그와 별개로 seccomp 중계 층이 `connect`의 `sockaddr`을 읽어 IP 와 포트를 감사에 남기므로, 호스트 단위 강제는 아직 없어도 무엇으로 나갔는지는 사후에 증명할 수 있습니다.
 
+전자의 구체 규격은 [`docs/egress-proxy.md`](./egress-proxy.md)입니다. 요지는 프록시 자체가 강제 장치가 아니라는 것입니다. 커널 층이 루프백 외 아웃바운드를 통째로 막아 프록시를 유일한 출구로 만들고, 프록시는 그 위에서 호스트를 판정합니다. macOS는 Seatbelt를 `(allow network-outbound (remote ip "localhost:<포트>"))`로 좁혀 이 경계가 성립하며, 프록시 설정을 무시하는 클라이언트는 우회하지 못하고 연결에 실패합니다.
+
+**Linux는 아직 그 경계가 없습니다.** Landlock 포트 목록을 프록시 포트 하나로 줄이는 데까지만 구현되어 있어, 자식이 같은 포트로 외부 호스트에 직접 연결하면 프록시를 건너뜁니다. 자식을 새 netns에 넣는 후속 단계가 들어와야 Linux도 같은 결론을 냅니다. 그때까지 이 차이는 enforcer gap 으로 배너에 노출합니다.
+
 ### 10.2 seccomp user notification은 순수 Rust로 완결되지 않는다
 
 `seccompiler` 0.5.0은 `SECCOMP_RET_USER_NOTIF` 액션을 제공하지 않습니다(Allow/Errno/Kill/Log/Trace/Trap만 제공). user notification이 있는 성숙한 crate는 `libseccomp` 0.4.0뿐이고, 이는 C `libseccomp >= 2.5.0` FFI를 끌어옵니다.
@@ -244,4 +248,4 @@ systemd journald의 Forward Secure Sealing이 gcrypt deprecation과 함께 배�
 
 - 감사 로그 하드웨어 서명 키 보관 (TPM 2.0 vs Secure Enclave vs 소프트웨어 키링)
 - 정책 프리셋 배포와 갱신 채널 (서명된 번들 형태)
-- egress 프록시의 TLS 처리 (SNI 관측만 vs MITM 종단). MITM은 DLP를 가능하게 하지만 로컬 CA 주입이 필요하고 그 자체가 공격 표면입니다.
+- egress 프록시의 TLS 처리 (SNI 관측만 vs MITM 종단). MITM은 DLP를 가능하게 하지만 로컬 CA 주입이 필요하고 그 자체가 공격 표면입니다. **v1은 어느 쪽도 하지 않습니다.** CONNECT 요청 라인의 호스트명까지만 보고 터널 내용은 해석하지 않습니다([`egress-proxy.md`](./egress-proxy.md) 3.1). 이 결정은 DLP 층을 설계할 때 다시 엽니다.
