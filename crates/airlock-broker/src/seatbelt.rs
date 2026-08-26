@@ -181,8 +181,17 @@ impl Enforcer for SeatbeltEnforcer {
     }
 
     fn gaps(&self) -> Vec<String> {
+        let egress_note = if self.options.proxy.is_some() {
+            // 프록시가 붙어도 남는 구멍입니다. macOS 의 이름 해석은
+            // network-outbound 가 아니라 mDNSResponder 를 거치므로 이 경계 밖입니다
+            "아웃바운드는 egress 프록시로 좁혀졌으나 DNS 질의는 프록시를 거치지 않음. \
+             자식이 이름 질의 자체를 반출 채널로 쓸 수 있음"
+                .to_string()
+        } else {
+            "호스트 단위 egress 정책은 Seatbelt로 강제되지 않음. 프록시 층이 필요함".to_string()
+        };
         let mut gaps = vec![
-            "호스트 단위 egress 정책은 Seatbelt로 강제되지 않음. 프록시 층이 필요함".to_string(),
+            egress_note,
             profile::ask_rules_are_denied_note().to_string(),
             "커널이 거부한 개별 파일·네트워크 접근은 감사 로그에 남지 않음. \
              체인에는 세션 단위 기록만 있음"

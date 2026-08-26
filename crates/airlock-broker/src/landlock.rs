@@ -549,6 +549,21 @@ fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
         return;
     }
 
+    if let Some(proxy) = opts.proxy {
+        // 나갈 수 있는 포트를 프록시 하나로 줄입니다. 정책의 포트 목록은 이제
+        // 프록시가 대신 나가므로 자식에게 열어 줄 이유가 없습니다
+        plan.tcp_connect.insert(proxy.port());
+        // Landlock 은 포트까지만 봅니다. 자식이 아는 프록시 포트로 다른 호스트에
+        // 연결하는 것을 막지 못하므로, 이 백엔드만으로는 프록시가 유일한 출구가
+        // 되지 않습니다. netns 로 자식의 경로 자체를 끊는 것이 다음 단계입니다
+        plan.gaps.push(
+            "egress 프록시가 켜졌으나 Landlock 은 포트까지만 강제함. 자식이 같은 포트로 \
+             다른 호스트에 직접 연결하면 프록시를 건너뜀. network namespace 격리가 필요함"
+                .to_string(),
+        );
+        return;
+    }
+
     let mut host_scoped = Vec::new();
     for rule in policy.user_rules() {
         let Matcher::Egress { host, port } = &rule.matcher else {

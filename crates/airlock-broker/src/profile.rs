@@ -51,6 +51,11 @@ pub struct ProfileOptions {
     pub allow_network: bool,
     pub workspace: Option<std::path::PathBuf>,
     pub temp_dirs: Vec<std::path::PathBuf>,
+    /// egress 프록시가 듣고 있는 루프백 주소.
+    ///
+    /// 값이 있으면 아웃바운드를 이 주소 하나로 좁힙니다. 그래야 프록시가 유일한
+    /// 출구가 되고 호스트 단위 정책이 처음으로 강제됩니다
+    pub proxy: Option<std::net::SocketAddr>,
 }
 
 impl Default for ProfileOptions {
@@ -59,6 +64,7 @@ impl Default for ProfileOptions {
             allow_network: true,
             workspace: None,
             temp_dirs: default_temp_dirs(),
+            proxy: None,
         }
     }
 }
@@ -87,6 +93,11 @@ impl ProfileOptions {
 
     pub fn with_temp_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.temp_dirs.push(path.into());
+        self
+    }
+
+    pub fn with_proxy(mut self, addr: std::net::SocketAddr) -> Self {
+        self.proxy = Some(addr);
         self
     }
 }
@@ -197,7 +208,18 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     }
 
     out.push_str(";; --- 네트워크 ---\n");
-    if network_allowed(policy, opts) {
+    if let Some(proxy) = opts.proxy.filter(|_| opts.allow_network) {
+        // 아웃바운드가 프록시 하나로 좁혀지므로 호스트 규칙은 여기서 처음으로
+        // 실제 경계를 갖습니다. 판정은 프록시가 하고 커널은 우회를 막습니다
+        out.push_str(";; 아웃바운드를 egress 프록시 하나로 좁힘\n");
+        out.push_str(";; 호스트 판정은 프록시가 하고 커널은 다른 출구를 막음\n");
+        out.push_str(&format!(
+            "(allow network-outbound (remote ip {}))\n",
+            sbpl::quote(&format!("localhost:{}", proxy.port()))
+        ));
+        // 유닉스 소켓까지 막으면 시스템 라이브러리가 대부분 동작하지 않습니다
+        out.push_str("(allow network-outbound (remote unix))\n\n");
+    } else if network_allowed(policy, opts) {
         out.push_str(";; 주의 호스트 단위 제어는 Seatbelt로 표현할 수 없음\n");
         out.push_str(";; egress 정책은 프록시 층에서 강제함\n");
         out.push_str("(allow network-outbound)\n");
@@ -547,6 +569,75 @@ egress = "deny"
             p.text.contains("아웃바운드를 통째로 차단함"),
             "차단했다는 사실을 프로파일이 밝혀야 함"
         );
+    }
+
+    fn proxy_addr(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn a_proxy_narrows_outbound_to_the_proxy_port() {
+        let policy = with_egress(
+            r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+"#,
+        );
+        let opts = ProfileOptions::default().with_proxy(proxy_addr(18899));
+        let p = generate(&policy, &opts);
+        // 전면 허용이 남아 있으면 프록시를 무시한 연결이 그대로 나갑니다
+        assert!(!p.text.contains("(allow network-outbound)\n"), "{}", p.text);
+        assert!(
+            p.text
+                .contains("(allow network-outbound (remote ip \"localhost:18899\"))"),
+            "{}",
+            p.text
+        );
+    }
+
+    #[test]
+    fn a_proxy_stops_declaring_host_rules_as_untranslatable() {
+        let policy = with_egress(
+            r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+"#,
+        );
+        let opts = ProfileOptions::default().with_proxy(proxy_addr(18899));
+        let p = generate(&policy, &opts);
+        // 프록시가 붙으면 이 규칙은 실제로 판정되므로 옮기지 못한 규칙이 아닙니다
+        assert!(
+            !p.untranslatable.iter().any(|u| u.contains("anthropic")),
+            "{:?}",
+            p.untranslatable
+        );
+    }
+
+    #[test]
+    fn no_network_beats_the_proxy() {
+        let policy = with_egress(
+            r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+"#,
+        );
+        let opts = ProfileOptions::default()
+            .with_proxy(proxy_addr(18899))
+            .with_network(false);
+        let p = generate(&policy, &opts);
+        assert!(!p.text.contains("network-outbound"), "{}", p.text);
     }
 
     #[test]
