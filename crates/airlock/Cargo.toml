@@ -13,6 +13,7 @@ airlock-canonical.workspace = true
 airlock-broker.workspace = true
 airlock-policy.workspace = true
 airlock-proxy.workspace = true
+airlock-setup.workspace = true
 clap.workspace = true
 
 [lints]

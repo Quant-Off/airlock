@@ -1,6 +1,7 @@
 mod cmd_audit;
 mod cmd_policy;
 mod cmd_run;
+mod cmd_setup;
 mod paths;
 
 use std::path::PathBuf;
@@ -38,6 +39,9 @@ enum Command {
 
     #[command(subcommand, about = "정책을 검사 및 설명")]
     Policy(cmd_policy::PolicyCommand),
+
+    #[command(about = "대화형으로 정책 파일 생성")]
+    Setup(cmd_setup::SetupArgs),
 }
 
 fn main() {
@@ -46,6 +50,7 @@ fn main() {
         Command::Run(args) => cmd_run::exec(args, cli.audit_root),
         Command::Audit(cmd) => cmd_audit::exec(cmd, cli.audit_root),
         Command::Policy(cmd) => cmd_policy::exec(cmd, cli.audit_root),
+        Command::Setup(args) => cmd_setup::exec(args, cli.audit_root),
     };
     std::process::exit(code);
 }
