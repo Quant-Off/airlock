@@ -1,0 +1,46 @@
+# 개발 편의 우선형입니다. 시크릿(secret)만 막고 나머지는 통과시킵니다.
+# 내장 베이스라인이 시크릿과 지속성 확보 경로를 계속 잡습니다.
+#
+# 아래 defaults.file = "allow"는 정책 계층의 판정입니다. 커널 강제 프로파일은
+# deny 기본이라 작업 공간과 시스템 경로 밖은 규칙에 명시하지 않는 한 열리지
+# 않습니다. 곧 작업 공간 밖의 평범한 파일은 airlock run에서 막히고
+# --observe에서만 정책 판정대로 읽힙니다. 커널이 정책보다 좁은 쪽이므로
+# 안전한 방향이지만, 실제로 읽어야 하는 경로는 allow 규칙으로 적어야 합니다.
+
+version = 1
+name = "developer"
+
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+
+# 시스템 경로는 읽기 전용으로 내림
+[[rules]]
+id = "system-readonly"
+kind = "file"
+path = ["/usr/**", "/System/**", "/bin/**", "/sbin/**", "/Library/**"]
+mode = ["read", "metadata", "exec"]
+action = "allow"
+
+[[rules]]
+id = "system-write-guard"
+kind = "file"
+path = ["/usr/**", "/System/**", "/bin/**", "/sbin/**", "/Library/**"]
+mode = ["write", "create", "delete"]
+action = "ask"
+
+# 강제 푸시(push)는 되돌리기 어려움
+[[rules]]
+id = "git-force-push"
+kind = "exec"
+program = "git"
+argv_contains = ["push", "--force"]
+action = "ask"
+
+[[rules]]
+id = "llm-api"
+kind = "egress"
+host = "api.foollm.com"
+port = 443
+action = "allow"
