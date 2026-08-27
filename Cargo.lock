@@ -13,6 +13,7 @@ dependencies = [
  "airlock-proxy",
  "airlock-setup",
  "clap",
+ "serde_json",
 ]
 
 [[package]]
