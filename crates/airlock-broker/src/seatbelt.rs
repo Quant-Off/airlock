@@ -1,6 +1,7 @@
 #![cfg(target_os = "macos")]
 
 use std::ffi::{CString, c_char, c_int};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use airlock_audit::Enforcement;
@@ -46,6 +47,13 @@ pub struct SeatbeltEnforcer {
     untranslatable: Vec<String>,
     ask_exec: Vec<String>,
     denied_overrides: Vec<String>,
+    /// exec 화이트리스트 모드인지
+    exec_whitelist: bool,
+    /// `wrap` 시점에 최상위 프로그램을 넣어 프로파일을 다시 만들기 위해 들고 있습니다.
+    ///
+    /// 허용 목록에 실제로 spawn 될 프로그램이 없으면 커널이 첫 `execve` 를 거부합니다.
+    /// 그 경로는 `prepare` 가 아니라 `wrap` 에서만 확실히 알 수 있습니다
+    policy: Option<Policy>,
 }
 
 impl Default for SeatbeltEnforcer {
@@ -63,6 +71,8 @@ impl SeatbeltEnforcer {
             untranslatable: Vec::new(),
             ask_exec: Vec::new(),
             denied_overrides: Vec::new(),
+            exec_whitelist: false,
+            policy: None,
         }
     }
 
@@ -78,6 +88,51 @@ impl SeatbeltEnforcer {
 
     pub fn profile_text(&self) -> Option<&str> {
         self.compiled.as_ref().and_then(|c| c.to_str().ok())
+    }
+
+    /// 실제로 spawn 될 프로그램까지 반영한 프로파일.
+    ///
+    /// 화이트리스트 모드가 아니면 `prepare` 가 만든 것을 그대로 씁니다. 화이트리스트
+    /// 모드에서는 최상위 프로그램을 허용 목록에 넣어 다시 만듭니다.
+    ///
+    /// # Arguments
+    /// `program` - 해소된 최상위 프로그램 경로
+    ///
+    /// # Errors
+    /// 허용 목록이 비면 프로세스가 어차피 뜨지 못하므로 조용히 넓히지 않고 실패합니다
+    fn profile_for(&self, program: Option<&Path>) -> Result<CString> {
+        let compiled = || {
+            self.compiled
+                .clone()
+                .ok_or_else(|| BrokerError::EnforcerUnavailable {
+                    name: "seatbelt",
+                    why: "prepare가 먼저 호출되지 않음".to_string(),
+                })
+        };
+        if !self.exec_whitelist {
+            return compiled();
+        }
+        let Some(policy) = &self.policy else {
+            return compiled();
+        };
+        let mut options = self.options.clone();
+        if let Some(p) = program {
+            options.program = Some(p.to_path_buf());
+        }
+        let generated = profile::generate(policy, &options);
+        if generated.exec_allow.is_empty() {
+            return Err(BrokerError::EnforcerUnavailable {
+                name: "seatbelt",
+                why: "[defaults].exec 이 allow 가 아니어서 exec 을 화이트리스트로 거는데 \
+                      허용 목록이 비었음. 최상위 프로그램 경로를 해소하지 못했거나 \
+                      정책에 exec allow 규칙이 하나도 없음. 이대로 걸면 프로세스가 뜨지 못함"
+                    .to_string(),
+            });
+        }
+        CString::new(generated.text).map_err(|_| BrokerError::EnforcerUnavailable {
+            name: "seatbelt",
+            why: "프로파일에 null 바이트 존재".to_string(),
+        })
     }
 }
 
@@ -115,8 +170,14 @@ impl Enforcer for SeatbeltEnforcer {
         }
     }
 
+    fn set_program(&mut self, program: &Path) {
+        self.options.program = Some(program.to_path_buf());
+    }
+
     fn prepare(&mut self, policy: &Policy) -> Result<()> {
         let generated = profile::generate(policy, &self.options);
+        self.exec_whitelist = generated.exec_whitelist;
+        self.policy = Some(policy.clone());
         self.untranslatable = generated.untranslatable;
         self.ask_exec = generated.ask_exec;
         self.denied_overrides = policy
@@ -136,12 +197,11 @@ impl Enforcer for SeatbeltEnforcer {
     }
 
     fn wrap(&self, cmd: &mut Command) -> Result<()> {
-        let Some(profile) = self.compiled.clone() else {
-            return Err(BrokerError::EnforcerUnavailable {
-                name: "seatbelt",
-                why: "prepare가 먼저 호출되지 않음".to_string(),
-            });
-        };
+        // 프로파일을 다시 만들기 전에 원래 프로그램을 잡아 둡니다. SandboxExec 전략은
+        // 아래에서 명령을 sandbox-exec 으로 갈아치우므로 순서가 뒤집히면 허용 목록에
+        // 엉뚱한 경로가 들어갑니다
+        let program: Option<PathBuf> = profile::resolve_program(cmd.get_program());
+        let profile = self.profile_for(program.as_deref())?;
 
         match self.strategy {
             Strategy::SandboxInit => {
@@ -207,11 +267,12 @@ impl Enforcer for SeatbeltEnforcer {
             ));
         }
         if !self.ask_exec.is_empty() {
-            gaps.push(format!(
-                "{}: {}",
-                profile::exec_ask_note(),
-                self.ask_exec.join(", ")
-            ));
+            let note = if self.exec_whitelist {
+                profile::exec_ask_whitelist_note()
+            } else {
+                profile::exec_ask_note()
+            };
+            gaps.push(format!("{note}: {}", self.ask_exec.join(", ")));
         }
         if !self.denied_overrides.is_empty() {
             gaps.push(format!(

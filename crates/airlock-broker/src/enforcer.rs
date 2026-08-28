@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::Path;
 use std::process::Command;
 
 use airlock_audit::Enforcement;
@@ -11,6 +12,19 @@ pub trait Enforcer: fmt::Debug {
     fn describe(&self) -> String;
     fn prepare(&mut self, policy: &Policy) -> Result<()>;
     fn wrap(&self, cmd: &mut Command) -> Result<()>;
+
+    /// 최상위로 실행할 프로그램을 알려 줍니다.
+    ///
+    /// exec 화이트리스트 모드에서 이 경로는 반드시 허용 목록에 들어가야 합니다. 강제 층은
+    /// `wrap` 시점에도 같은 보정을 하지만 그때는 배너가 이미 나간 뒤라, `prepare` 전에
+    /// 넣어야 배너의 규칙 수와 gap 이 실제로 걸릴 프로파일과 같아집니다. 강제 결과는
+    /// 어느 쪽이든 같습니다
+    ///
+    /// # Arguments
+    /// `program` - 해소된 절대 경로
+    fn set_program(&mut self, program: &Path) {
+        let _ = program;
+    }
 
     fn enforces(&self) -> bool {
         self.kind().enforces()

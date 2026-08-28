@@ -393,3 +393,202 @@ action = "allow"
 
     drop(accepting);
 }
+
+// ---------- exec 화이트리스트 ----------
+
+fn whitelist_policy(scratch: &Path, rules: &str) -> Policy {
+    let src = format!(
+        r#"
+version = 1
+name = "enforce-exec"
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+{rules}
+"#
+    );
+    let ctx = LoadContext::new(scratch, scratch.join("audit"));
+    Policy::load_str(&src, &ctx).unwrap()
+}
+
+/// 대조군 쉘.
+///
+/// `/bin/sh`는 쓰지 않습니다. macOS 의 `/bin/sh`는 dyld variant 기구로 `/bin/bash`를
+/// 다시 exec 하므로, 화이트리스트에 `/bin/bash`가 함께 없으면 최상위 프로그램인데도
+/// 뜨지 못합니다. 그 성질은 [`a_variant_binary_needs_its_variant_allowed`]가 따로 고정합니다
+const SHELL: &str = "/bin/zsh";
+
+/// 허용 목록 밖의 프로그램은 커널이 막아야 합니다.
+///
+/// 최상위 쉘은 언제나 허용되므로 쉘은 뜨고 그 안의 exec 만 실패합니다
+#[test]
+fn exec_outside_the_whitelist_is_denied() {
+    let s = Scratch::new("exec-white");
+    let policy = whitelist_policy(s.path(), "");
+
+    assert!(
+        run_under_sandbox(&policy, s.path(), &[SHELL, "-c", "exit 0"]),
+        "최상위 프로그램이 뜨지 못하면 이 테스트의 대조군이 무의미함"
+    );
+    assert!(
+        !run_under_sandbox(&policy, s.path(), &[SHELL, "-c", "exec /usr/bin/true"]),
+        "허용 목록에 없는 프로그램이 실행됨. (allow process-exec*) 무조건 개방이 남아 있음"
+    );
+}
+
+#[test]
+fn an_exec_allow_rule_lets_the_program_run() {
+    let s = Scratch::new("exec-allow-rule");
+    let policy = whitelist_policy(
+        s.path(),
+        r#"
+[[rules]]
+id = "probe"
+kind = "exec"
+program = "/usr/bin/true"
+action = "allow"
+"#,
+    );
+    assert!(
+        run_under_sandbox(&policy, s.path(), &[SHELL, "-c", "exec /usr/bin/true"]),
+        "정책이 허용한 프로그램이 막힘. 화이트리스트가 과도하게 좁음"
+    );
+}
+
+/// 최상위 프로그램에 실행 허용이 없으면 프로세스가 아예 뜨지 못합니다
+#[test]
+fn the_top_level_program_always_runs() {
+    let s = Scratch::new("exec-top");
+    let policy = whitelist_policy(s.path(), "");
+    assert!(
+        run_under_sandbox(&policy, s.path(), &["/usr/bin/true"]),
+        "허용 규칙이 하나도 없어도 최상위 프로그램은 실행되어야 함"
+    );
+    assert!(
+        run_under_sandbox(&policy, s.path(), &[SHELL, "-c", "exit 0"]),
+        "쉘도 최상위면 떠야 함"
+    );
+}
+
+/// SBPL 은 마지막 규칙이 이깁니다. 화이트리스트를 deny 뒤에 두면 deny 가 무력화됩니다
+#[test]
+fn an_exec_deny_still_wins_over_the_whitelist() {
+    let s = Scratch::new("exec-order");
+    let policy = whitelist_policy(
+        s.path(),
+        r#"
+[[rules]]
+id = "no-true"
+kind = "exec"
+program = "/usr/bin/true"
+action = "deny"
+
+[[rules]]
+id = "tools"
+kind = "file"
+path = "/usr/**"
+mode = ["read", "exec"]
+action = "allow"
+"#,
+    );
+
+    // 대조군. 같은 트리 허용으로 다른 프로그램은 실제로 실행됩니다
+    assert!(
+        run_under_sandbox(&policy, s.path(), &[SHELL, "-c", "exec /usr/bin/uname"]),
+        "허용 트리 안의 다른 프로그램까지 막히면 이 테스트의 대조군이 무의미함"
+    );
+    assert!(
+        !run_under_sandbox(&policy, s.path(), &[SHELL, "-c", "exec /usr/bin/true"]),
+        "허용 트리 뒤의 exec deny 가 무력화됨. 방출 순서가 뒤집혔음"
+    );
+}
+
+/// `[defaults].exec = "allow"` 정책은 이전과 똑같이 동작해야 합니다
+#[test]
+fn the_exec_allow_default_does_not_regress() {
+    let s = Scratch::new("exec-legacy");
+    let permissive = policy_with(s.path(), "");
+    assert!(
+        run_under_sandbox(
+            &permissive,
+            s.path(),
+            &["/bin/sh", "-c", "exec /usr/bin/true"]
+        ),
+        "exec = \"allow\" 정책에서 실행이 막히면 회귀임"
+    );
+}
+
+/// 작업 공간에 써 넣은 스크립트로 인터프리터를 부르는 우회를 막아야 합니다
+#[test]
+fn a_script_dropped_into_the_workspace_cannot_summon_an_interpreter() {
+    let s = Scratch::new("exec-drop");
+    let script = s.path().join("payload.sh");
+    fs::write(&script, format!("#!{SHELL}\nexit 0\n").as_bytes()).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = script.to_string_lossy().into_owned();
+    let argv = [SHELL, "-c", path.as_str()];
+
+    let permissive = policy_with(s.path(), "");
+    assert!(
+        run_under_sandbox(&permissive, s.path(), &argv),
+        "exec = \"allow\" 에서 실행되지 않으면 이 테스트의 대조군이 무의미함"
+    );
+
+    let policy = whitelist_policy(s.path(), "");
+    assert!(
+        !run_under_sandbox(&policy, s.path(), &argv),
+        "작업 공간의 스크립트가 인터프리터를 불러 실행됨"
+    );
+}
+
+/// macOS 의 dyld variant 기구는 최상위 프로그램 허용만으로 덮이지 않습니다.
+///
+/// `/bin/sh` 는 자기 자신을 `/bin/bash` 로 다시 exec 합니다. 화이트리스트에 그 대상이
+/// 없으면 최상위 프로그램인데도 커널이 막습니다. 정책에서 variant 를 함께 허용하면
+/// 풀립니다. 이 성질을 고정해 두지 않으면 나중에 조용히 바뀝니다
+#[test]
+fn a_variant_binary_needs_its_variant_allowed() {
+    let s = Scratch::new("exec-variant");
+
+    let bare = whitelist_policy(s.path(), "");
+    assert!(
+        !run_under_sandbox(&bare, s.path(), &["/bin/sh", "-c", "exit 0"]),
+        "/bin/sh 가 variant 허용 없이 떴음. 이 한계가 사라졌다면 문서를 고쳐야 함"
+    );
+
+    let with_variant = whitelist_policy(
+        s.path(),
+        r#"
+[[rules]]
+id = "bash-variant"
+kind = "exec"
+program = "/bin/bash"
+action = "allow"
+"#,
+    );
+    assert!(
+        run_under_sandbox(&with_variant, s.path(), &["/bin/sh", "-c", "exit 0"]),
+        "variant 대상을 허용해도 /bin/sh 가 뜨지 못함"
+    );
+}
+
+/// 화이트리스트 모드에서 `ask` exec 규칙은 허용 목록에 넣지 않아 커널이 거부합니다.
+/// 그 사실을 배너가 말해야 합니다
+#[test]
+fn the_whitelist_declares_what_it_does_to_ask_rules() {
+    let s = Scratch::new("exec-ask-gap");
+    let policy = whitelist_policy(s.path(), "");
+    let mut e =
+        SeatbeltEnforcer::new().with_options(ProfileOptions::default().with_workspace(s.path()));
+    e.prepare(&policy).unwrap();
+
+    let gaps = e.gaps();
+    assert!(
+        gaps.iter()
+            .any(|g| g.contains("화이트리스트에 넣지 않으므로")),
+        "ask exec 규칙이 커널에서 어떻게 되는지 밝혀야 함: {gaps:?}"
+    );
+}

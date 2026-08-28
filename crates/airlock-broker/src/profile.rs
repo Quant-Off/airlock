@@ -6,6 +6,14 @@
 //! 전체 차단까지는 커널에서 강제되지만 호스트·포트 단위 egress와 argv 조건은 SBPL로
 //! 표현할 수 없습니다. 옮기지 못한 규칙은 조용히 버리지 않고 `untranslatable`로
 //! 돌려주어 배너의 한계 목록에 그대로 나오게 합니다
+//!
+//! `[defaults].exec` 가 `allow` 가 아니면 `(allow process-exec*)` 무조건 개방을 걷어내고
+//! 정책이 허용한 경로에만 `process-exec*` 를 엽니다. 곧 exec 이 블랙리스트에서
+//! 화이트리스트로 뒤집힙니다. 최상위 프로그램은 언제나 허용 목록에 들어갑니다.
+//! 그것이 빠지면 프로세스가 아예 뜨지 못하기 때문입니다
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use airlock_policy::rule::{Matcher, ProgramMatch};
 use airlock_policy::{Action, FileMode, ModeSet, Policy};
@@ -51,6 +59,12 @@ pub struct ProfileOptions {
     pub allow_network: bool,
     pub workspace: Option<std::path::PathBuf>,
     pub temp_dirs: Vec<std::path::PathBuf>,
+    /// 최상위로 실행할 프로그램의 절대 경로.
+    ///
+    /// exec 화이트리스트 모드에서 이 경로가 허용 목록에 빠지면 커널이 첫 `execve` 를
+    /// 거부해 프로세스가 아예 뜨지 못합니다. 강제 층은 `wrap` 시점에 실제로 spawn 될
+    /// 명령에서 이 값을 다시 채우므로 호출자가 비워 두어도 됩니다
+    pub program: Option<std::path::PathBuf>,
     /// egress 프록시가 듣고 있는 루프백 주소.
     ///
     /// 값이 있으면 아웃바운드를 이 주소 하나로 좁힙니다. 그래야 프록시가 유일한
@@ -64,6 +78,7 @@ impl Default for ProfileOptions {
             allow_network: true,
             workspace: None,
             temp_dirs: default_temp_dirs(),
+            program: None,
             proxy: None,
         }
     }
@@ -100,6 +115,11 @@ impl ProfileOptions {
         self.proxy = Some(addr);
         self
     }
+
+    pub fn with_program(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.program = Some(path.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,6 +129,10 @@ pub struct GeneratedProfile {
     pub untranslatable: Vec<String>,
     /// 일부러 방출하지 않은 `ask` exec 규칙의 id. 사유는 [`exec_ask_note`]
     pub ask_exec: Vec<String>,
+    /// exec 화이트리스트 모드인지. `[defaults].exec != "allow"` 이면 참
+    pub exec_whitelist: bool,
+    /// 화이트리스트 모드에서 `process-exec*` 가 열린 대상. 렌더된 SBPL 필터 문자열
+    pub exec_allow: Vec<String>,
 }
 
 fn mode_reads(modes: ModeSet) -> bool {
@@ -121,6 +145,63 @@ fn mode_writes(modes: ModeSet) -> bool {
     modes.contains(FileMode::Write)
         || modes.contains(FileMode::Create)
         || modes.contains(FileMode::Delete)
+}
+
+/// exec 을 커널 화이트리스트로 걸어야 하는지.
+///
+/// `[defaults].exec = "allow"` 인 정책은 이전 동작을 그대로 둡니다. 그 설정은 "실행은
+/// 기본 허용"이라고 말하고 있으므로, 화이트리스트로 뒤집으면 같은 정책 파일의 뜻이
+/// 바뀝니다. `ask`/`deny`/`forbid` 일 때만 뒤집습니다
+///
+/// # Arguments
+/// `policy` - 판단할 정책
+pub fn exec_whitelist_mode(policy: &Policy) -> bool {
+    policy.defaults().exec != Action::Allow
+}
+
+/// `PATH` 안에서 같은 이름의 실행 파일을 전부 찾습니다.
+///
+/// `program = "cargo"` 처럼 이름만 적은 규칙은 경로를 말하지 않습니다. 허용 방향에서는
+/// "이름이 cargo 인 아무 경로"로 넓히면 에이전트가 작업 공간에 써 넣은 `cargo` 까지
+/// 실행 대상이 되므로, 지금 `PATH` 에서 실제로 해소되는 경로만 허용 목록에 넣습니다.
+/// 제한 방향(`deny`)은 반대로 이름 정규식을 그대로 써서 넓게 잡습니다
+///
+/// # Arguments
+/// `name` - 찾을 파일 이름
+pub fn resolve_in_path(name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if name.is_empty() || name.contains('/') {
+        return out;
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return out;
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let full = dir.join(name);
+        if full.is_file() && !out.contains(&full) {
+            out.push(full);
+        }
+    }
+    out
+}
+
+/// 실제로 spawn 될 프로그램의 절대 경로를 구합니다.
+///
+/// `Command` 는 이름만 받으면 `PATH` 로 해소하므로 강제 층도 같은 해소를 해야 커널
+/// 허용 목록과 실제 `execve` 대상이 어긋나지 않습니다
+///
+/// # Arguments
+/// `raw` - `Command::get_program()` 이 돌려준 값
+pub fn resolve_program(raw: &OsStr) -> Option<PathBuf> {
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() || candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    let name = candidate.to_str()?;
+    resolve_in_path(name).into_iter().next()
 }
 
 /// 프로파일 주석에 넣을 문자열에서 줄을 깨는 문자를 지웁니다.
@@ -138,6 +219,8 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     let mut out = String::new();
     let mut untranslatable = Vec::new();
     let mut ask_exec = Vec::new();
+    let mut exec_allow = Vec::new();
+    let exec_whitelist = exec_whitelist_mode(policy);
 
     out.push_str("(version 1)\n");
     out.push_str(";; airlock 생성 프로파일. deny-default이며 마지막 규칙이 이김\n");
@@ -146,7 +229,13 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
 
     out.push_str(";; --- 프로세스 기본 동작 ---\n");
     out.push_str("(allow process-fork)\n");
-    out.push_str("(allow process-exec*)\n");
+    if exec_whitelist {
+        // 무조건 개방을 걷어내면 exec 이 블랙리스트에서 화이트리스트로 뒤집힙니다.
+        // 허용은 아래 정책 allow 절에서 경로마다 하나씩 나갑니다
+        out.push_str(";; exec 은 정책 allow 절에서 경로별로만 열림. 무조건 개방 없음\n");
+    } else {
+        out.push_str("(allow process-exec*)\n");
+    }
     out.push_str("(allow signal (target self))\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow ipc-posix-shm)\n");
@@ -237,6 +326,9 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     emit_file_rules(policy, &mut out, &mut untranslatable, |a| {
         a == Action::Allow
     });
+    if exec_whitelist {
+        emit_exec_allow(policy, opts, &mut out, &mut untranslatable, &mut exec_allow);
+    }
 
     out.push_str("\n;; --- 정책 차단 규칙. 마지막에 두어 어떤 allow도 덮지 못하게 함 ---\n");
     emit_file_rules(policy, &mut out, &mut untranslatable, |a| {
@@ -248,6 +340,8 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
         text: out,
         untranslatable,
         ask_exec,
+        exec_whitelist,
+        exec_allow,
     }
 }
 
@@ -283,6 +377,124 @@ fn tiers(policy: &Policy) -> [&[airlock_policy::Rule]; 3] {
     ]
 }
 
+/// 정책이 허용한 실행 대상만 `process-exec*` 로 엽니다.
+///
+/// 화이트리스트 모드에서만 부릅니다. 방출 위치는 정책 allow 절이며, 뒤에 오는
+/// [`emit_exec_rules`] 의 deny 가 여전히 이깁니다. SBPL 은 마지막 규칙이 이기므로
+/// 이 순서를 바꾸면 deny 가 무력화됩니다.
+///
+/// 최상위 프로그램을 항상 먼저 넣습니다. 그것이 빠지면 커널이 첫 `execve` 를 거부해
+/// 프로세스가 뜨지 못하고, 사용자는 정책 문제인지 환경 문제인지 알 수 없습니다.
+///
+/// # Arguments
+/// `policy` - 옮길 정책
+/// `opts` - 최상위 프로그램이 들어 있는 프로파일 옵션
+/// `out` - 프로파일 문자열
+/// `untranslatable` - 옮기지 못한 규칙을 쌓을 곳
+/// `emitted` - 실제로 열린 대상을 쌓을 곳
+fn emit_exec_allow(
+    policy: &Policy,
+    opts: &ProfileOptions,
+    out: &mut String,
+    untranslatable: &mut Vec<String>,
+    emitted: &mut Vec<String>,
+) {
+    out.push_str(";; --- exec 화이트리스트. 여기 없는 프로그램은 커널이 거부함 ---\n");
+
+    let mut emit = |target: &sbpl::Target, id: &str, out: &mut String| {
+        let rendered = target.render();
+        out.push_str(&format!(
+            "(allow process-exec* {rendered}) ;; {}\n",
+            comment(id)
+        ));
+        emitted.push(rendered);
+    };
+
+    if let Some(program) = &opts.program {
+        match sbpl::literal(program) {
+            Some(t) => emit(&t, "airlock:top-level", out),
+            None => untranslatable.push(format!(
+                "최상위 프로그램 {} (경로가 UTF-8이 아니라 SBPL 대상으로 옮길 수 없음)",
+                program.display()
+            )),
+        }
+    }
+
+    for tier in tiers(policy) {
+        for rule in tier {
+            if rule.action != Action::Allow {
+                continue;
+            }
+            for target in exec_allow_targets(&rule.matcher, &rule.id, untranslatable) {
+                emit(&target, &rule.id, out);
+            }
+        }
+    }
+}
+
+/// allow 규칙 하나가 여는 실행 대상.
+///
+/// 이름만 적은 규칙은 지금 `PATH` 에서 해소되는 경로만 냅니다. 해소되지 않으면 조용히
+/// 넘기지 않고 옮기지 못한 규칙으로 보고합니다. 그 프로그램은 커널에서 실행되지 않습니다
+///
+/// # Arguments
+/// `matcher` - 규칙의 매처
+/// `id` - 규칙 id. 보고 문자열에만 씁니다
+/// `untranslatable` - 옮기지 못한 규칙을 쌓을 곳
+fn exec_allow_targets(
+    matcher: &Matcher,
+    id: &str,
+    untranslatable: &mut Vec<String>,
+) -> Vec<sbpl::Target> {
+    match matcher {
+        Matcher::Exec { program, .. } => match program {
+            Some(ProgramMatch::Path(pattern)) => {
+                let targets = sbpl::target_for(pattern).into_iter().collect::<Vec<_>>();
+                if targets.is_empty() {
+                    untranslatable.push(format!(
+                        "{} (exec allow 경로 패턴을 SBPL 대상으로 옮길 수 없음)",
+                        comment(id)
+                    ));
+                }
+                targets
+            }
+            Some(ProgramMatch::Basename(name)) => {
+                let found = resolve_in_path(name);
+                if found.is_empty() {
+                    untranslatable.push(format!(
+                        "{} (program = \"{}\" 을 PATH 에서 찾지 못해 exec 허용에 넣지 않았음)",
+                        comment(id),
+                        comment(name)
+                    ));
+                }
+                found.iter().filter_map(|p| sbpl::literal(p)).collect()
+            }
+            None => {
+                untranslatable.push(format!(
+                    "{} (프로그램 조건이 없는 exec allow 는 대상을 특정할 수 없음)",
+                    comment(id)
+                ));
+                Vec::new()
+            }
+        },
+        Matcher::File { paths, modes } if modes.contains(FileMode::Exec) => {
+            let mut out = Vec::new();
+            for pattern in paths {
+                match sbpl::target_for(pattern) {
+                    Some(t) => out.push(t),
+                    None => untranslatable.push(format!(
+                        "{} {} (exec 허용 경로를 SBPL 대상으로 옮길 수 없음)",
+                        comment(id),
+                        comment(pattern.raw())
+                    )),
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// exec 제한 규칙을 `process-exec*` 차단으로 옮깁니다.
 ///
 /// `ask`는 일부러 방출하지 않습니다. macOS에서 답을 받을 수 있는 ask는 브로커가 spawn
@@ -301,7 +513,8 @@ fn emit_exec_rules(
                 continue;
             };
             if rule.action == Action::Allow {
-                // 위에서 process-exec*를 통째로 열어 두었으므로 더 넓힐 것이 없습니다
+                // 허용은 이 함수의 몫이 아닙니다. 블랙리스트 모드에서는 위에서 통째로
+                // 열려 있고, 화이트리스트 모드에서는 emit_exec_allow 가 앞서 방출합니다
                 continue;
             }
             if rule.action == Action::Ask {
@@ -412,6 +625,15 @@ fn emit_file_rules(
 
 pub fn ask_rules_are_denied_note() -> &'static str {
     "Seatbelt는 사람 승인을 표현할 수 없으므로 ask 파일 규칙은 프로파일에서 deny로 내려감"
+}
+
+/// 화이트리스트 모드에서 `ask` exec 규칙이 어떻게 되는지.
+///
+/// 허용 목록에 넣지 않으므로 커널이 실행을 거부합니다. 방출하지 않는다는 기구는 같지만
+/// 결과가 반대이므로 배너 문구도 달라야 합니다
+pub fn exec_ask_whitelist_note() -> &'static str {
+    "ask exec 규칙은 화이트리스트에 넣지 않으므로 커널이 실행을 거부함. macOS 에는 중계 층이 \
+     없어 사람에게 물을 방법이 없으며, 최상위 exec 하나만 브로커가 spawn 전에 물음"
 }
 
 pub fn exec_ask_note() -> &'static str {
@@ -691,6 +913,8 @@ action = "deny"
     fn exec_deny_reaches_the_profile() {
         let src = r#"
 version = 1
+[defaults]
+exec = "allow"
 [[rules]]
 id = "no-curl"
 kind = "exec"
@@ -714,6 +938,204 @@ action = "deny"
             allow_idx < deny_idx,
             "SBPL은 마지막 규칙이 이기므로 exec deny 가 기본 허용 뒤에 와야 함"
         );
+    }
+
+    // ---------- exec 화이트리스트 ----------
+
+    fn whitelist(extra: &str) -> Policy {
+        let src = format!(
+            r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+{extra}
+"#
+        );
+        Policy::load_str(&src, &ctx()).unwrap()
+    }
+
+    /// `[defaults].exec` 가 `allow` 가 아니면 무조건 개방이 남아 있으면 안 됩니다.
+    /// 한 줄이 남으면 exec 정책 전체가 커널에서 무의미해집니다
+    #[test]
+    fn the_whitelist_removes_the_unconditional_exec_opening() {
+        let p = generate(&whitelist(""), &ProfileOptions::default());
+        assert!(p.exec_whitelist);
+        assert!(
+            !p.text.contains("(allow process-exec*)\n"),
+            "무조건 개방이 남아 있음: {}",
+            p.text
+        );
+        assert!(
+            !p.text.contains("(allow process-exec*)"),
+            "필터 없는 process-exec* 허용이 남아 있음: {}",
+            p.text
+        );
+    }
+
+    #[test]
+    fn the_exec_allow_default_keeps_the_previous_behaviour() {
+        let src = r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+"#;
+        let policy = Policy::load_str(src, &ctx()).unwrap();
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(!p.exec_whitelist);
+        assert!(
+            p.text.contains("(allow process-exec*)\n"),
+            "exec = \"allow\" 정책의 동작이 바뀌면 회귀임: {}",
+            p.text
+        );
+        assert!(p.exec_allow.is_empty());
+    }
+
+    /// 최상위 프로그램이 빠지면 프로세스가 아예 뜨지 못합니다
+    #[test]
+    fn the_top_level_program_is_always_allowed() {
+        let opts = ProfileOptions::default().with_program("/bin/zsh");
+        let p = generate(&whitelist(""), &opts);
+        assert!(
+            p.text
+                .contains(r#"(allow process-exec* (literal "/bin/zsh")) ;; airlock:top-level"#),
+            "{}",
+            p.text
+        );
+        assert!(!p.exec_allow.is_empty());
+    }
+
+    #[test]
+    fn exec_allow_rules_open_exactly_their_paths() {
+        let policy = whitelist(
+            r#"
+[[rules]]
+id = "tool"
+kind = "exec"
+program = "/usr/bin/git"
+action = "allow"
+
+[[rules]]
+id = "toolchain"
+kind = "file"
+path = "/opt/homebrew/**"
+mode = ["read", "exec"]
+action = "allow"
+"#,
+        );
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(
+            p.text
+                .contains(r#"(allow process-exec* (literal "/usr/bin/git")) ;; tool"#),
+            "{}",
+            p.text
+        );
+        assert!(
+            p.text
+                .contains(r#"(allow process-exec* (subpath "/opt/homebrew")) ;; toolchain"#),
+            "{}",
+            p.text
+        );
+    }
+
+    /// SBPL 은 마지막 규칙이 이깁니다. 허용을 차단 뒤에 두면 deny 가 무력화됩니다
+    #[test]
+    fn exec_denies_still_come_after_the_whitelist() {
+        let policy = whitelist(
+            r#"
+[[rules]]
+id = "no-nc"
+kind = "exec"
+program = "/usr/bin/nc"
+action = "deny"
+
+[[rules]]
+id = "tools"
+kind = "file"
+path = "/usr/**"
+mode = ["read", "exec"]
+action = "allow"
+"#,
+        );
+        let p = generate(&policy, &ProfileOptions::default());
+        let allow_idx = p.text.find(";; tools").expect("화이트리스트 없음");
+        let deny_idx = p.text.find(";; no-nc").expect("차단 규칙 없음");
+        assert!(
+            allow_idx < deny_idx,
+            "exec deny 가 화이트리스트 앞으로 오면 무력화됨: {}",
+            p.text
+        );
+    }
+
+    /// 이름만 적은 allow 는 지금 PATH 에서 해소되는 경로만 엽니다.
+    ///
+    /// `^.*/name$` 정규식으로 넓히면 에이전트가 작업 공간에 써 넣은 동명 바이너리까지
+    /// 실행 대상이 되어 화이트리스트가 통째로 무너집니다
+    #[test]
+    fn a_basename_allow_resolves_through_path_instead_of_widening() {
+        let policy = whitelist(
+            r#"
+[[rules]]
+id = "shell"
+kind = "exec"
+program = "sh"
+action = "allow"
+"#,
+        );
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(
+            !p.text.contains(r##"(regex #"^.*/sh$")"##),
+            "이름 정규식으로 넓히면 동명 바이너리가 전부 열림: {}",
+            p.text
+        );
+        let resolved = resolve_in_path("sh");
+        if resolved.is_empty() {
+            assert!(
+                p.untranslatable.iter().any(|u| u.contains("shell")),
+                "해소되지 않은 allow 를 조용히 버리면 안 됨: {:?}",
+                p.untranslatable
+            );
+        } else {
+            assert!(p.text.contains(";; shell"), "{}", p.text);
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_basename_allow_is_declared() {
+        let policy = whitelist(
+            r#"
+[[rules]]
+id = "ghost"
+kind = "exec"
+program = "airlock-no-such-program-xyz"
+action = "allow"
+"#,
+        );
+        let p = generate(&policy, &ProfileOptions::default());
+        assert!(
+            p.untranslatable
+                .iter()
+                .any(|u| u.contains("ghost") && u.contains("PATH")),
+            "{:?}",
+            p.untranslatable
+        );
+    }
+
+    #[test]
+    fn resolve_program_follows_path_like_command_does() {
+        assert_eq!(
+            resolve_program(std::ffi::OsStr::new("/bin/sh")),
+            Some(PathBuf::from("/bin/sh"))
+        );
+        assert_eq!(
+            resolve_program(std::ffi::OsStr::new("/no/such/binary")),
+            None
+        );
+        let by_name = resolve_program(std::ffi::OsStr::new("sh"));
+        assert!(by_name.is_some_and(|p| p.is_absolute()), "PATH 해소 실패");
     }
 
     #[test]

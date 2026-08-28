@@ -465,3 +465,173 @@ fn a_directory_that_cannot_be_listed_is_not_granted_wholesale() {
         "나열할 수 없는 디렉토리의 하위가 검사 없이 통째로 허용됨"
     );
 }
+
+// ---------- exec 화이트리스트 ----------
+
+fn whitelist_policy(scratch: &Path, rules: &str) -> Policy {
+    let src = format!(
+        r#"
+version = 1
+name = "landlock-exec"
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+{rules}
+"#
+    );
+    let ctx = LoadContext::new(scratch, scratch.join("audit"));
+    Policy::load_str(&src, &ctx).unwrap()
+}
+
+/// 실행 대조군으로 쓸 수 있는 시스템 바이너리.
+fn probe_binary() -> Option<&'static str> {
+    ["/bin/true", "/usr/bin/true"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+}
+
+fn shell() -> Option<&'static str> {
+    ["/bin/sh", "/usr/bin/sh"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+}
+
+/// 허용 목록 밖의 프로그램은 커널이 EACCES 로 막아야 합니다.
+///
+/// 최상위 쉘은 언제나 허용되므로 쉘 자체는 뜨고, 그 안에서 부르는 exec 만 실패합니다
+#[test]
+fn exec_outside_the_whitelist_is_denied() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let (Some(sh), Some(probe)) = (shell(), probe_binary()) else {
+        eprintln!("쉘이나 대조군 바이너리가 없어 건너뜀");
+        return;
+    };
+
+    let s = Scratch::new("exec-white");
+    let policy = whitelist_policy(s.path(), "");
+
+    assert!(
+        run_under_sandbox(&policy, s.path(), &[sh, "-c", "exit 0"]),
+        "최상위 프로그램이 뜨지 못하면 이 테스트의 대조군이 무의미함"
+    );
+    assert!(
+        !run_under_sandbox(&policy, s.path(), &[sh, "-c", &format!("exec {probe}")]),
+        "허용 목록에 없는 프로그램이 실행됨. Execute 가 읽기 권한에서 분리되지 않았음"
+    );
+}
+
+#[test]
+fn an_exec_allow_rule_lets_the_program_run() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let (Some(sh), Some(probe)) = (shell(), probe_binary()) else {
+        eprintln!("쉘이나 대조군 바이너리가 없어 건너뜀");
+        return;
+    };
+
+    let s = Scratch::new("exec-allow");
+    let policy = whitelist_policy(
+        s.path(),
+        &format!(
+            r#"
+[[rules]]
+id = "probe"
+kind = "exec"
+program = "{probe}"
+action = "allow"
+"#
+        ),
+    );
+
+    assert!(
+        run_under_sandbox(&policy, s.path(), &[sh, "-c", &format!("exec {probe}")]),
+        "정책이 허용한 프로그램이 막힘. 화이트리스트가 과도하게 좁음"
+    );
+}
+
+/// 최상위 프로그램에 Execute 가 걸리지 않으면 프로세스가 아예 뜨지 못합니다
+#[test]
+fn the_top_level_program_always_runs() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let Some(probe) = probe_binary() else {
+        eprintln!("대조군 바이너리가 없어 건너뜀");
+        return;
+    };
+
+    let s = Scratch::new("exec-top");
+    let policy = whitelist_policy(s.path(), "");
+    assert!(
+        run_under_sandbox(&policy, s.path(), &[probe]),
+        "허용 규칙이 하나도 없어도 최상위 프로그램은 실행되어야 함"
+    );
+}
+
+/// 에이전트가 작업 공간에 써 넣은 바이너리를 실행하는 우회를 막아야 합니다.
+///
+/// `AccessFs::from_all` 은 `Execute` 를 포함하므로, 쓰기 권한에서 떼어 내지 않으면
+/// 쓸 수 있는 곳이 곧 실행할 수 있는 곳이 됩니다
+#[test]
+fn a_binary_written_into_the_workspace_cannot_be_executed() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let (Some(sh), Some(probe)) = (shell(), probe_binary()) else {
+        eprintln!("쉘이나 대조군 바이너리가 없어 건너뜀");
+        return;
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("exec-ws");
+    let ws = s.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let dropped = ws.join("dropped");
+    fs::copy(probe, &dropped).unwrap();
+    fs::set_permissions(&dropped, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = format!("exec {}", dropped.display());
+
+    let permissive = permissive_policy(&ws);
+    assert!(
+        run_under_sandbox(&permissive, &ws, &[sh, "-c", &script]),
+        "exec = \"allow\" 정책에서 실행이 막히면 회귀임"
+    );
+
+    let policy = whitelist_policy(&ws, "");
+    assert!(
+        !run_under_sandbox(&policy, &ws, &[sh, "-c", &script]),
+        "작업 공간에 써 넣은 바이너리가 실행됨. 쓰기 권한이 곧 실행 권한이 되고 있음"
+    );
+}
+
+/// 강제되지 않는 것은 반드시 배너에 나와야 합니다
+#[test]
+fn the_whitelist_declares_what_it_cannot_reach() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let s = Scratch::new("exec-gaps");
+    let policy = whitelist_policy(s.path(), "");
+    let mut e =
+        LandlockEnforcer::new().with_options(ProfileOptions::default().with_workspace(s.path()));
+    e.prepare(&policy).unwrap();
+
+    let gaps = e.gaps();
+    assert!(
+        gaps.iter().any(|g| g.contains("mmap(PROT_EXEC)")),
+        "실행 가능 매핑이 경계 밖이라는 사실을 밝혀야 함: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().any(|g| g.contains("동적 링커")),
+        "링커 때문에 넓어진 범위를 밝혀야 함: {gaps:?}"
+    );
+    assert!(
+        !gaps.iter().any(|g| g.contains("전부 실행할 수 있으며")),
+        "화이트리스트가 걸린 상태에서 미강제라고 보고함: {gaps:?}"
+    );
+}

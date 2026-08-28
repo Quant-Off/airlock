@@ -11,6 +11,11 @@
 //! 시크릿 경로의 깊이에 비례하게 유지합니다.
 //!
 //! 경로가 아니라 inode에 걸리므로 `docs/policy-dsl.md` 4.2절의 TOCTOU를 겪지 않습니다.
+//!
+//! `AccessFs::from_read` 는 `Execute` 를 포함합니다. 곧 읽기 권한을 그대로 주면 읽을 수
+//! 있는 모든 파일이 실행 가능해집니다. `[defaults].exec` 가 `allow` 가 아니면 `Execute`
+//! 를 읽기에서 떼어 내 허용 목록에만 부여하고, 그러면 커널이 강제하는 exec 화이트리스트가
+//! 성립합니다. `allow` 인 정책은 이전 동작을 그대로 둡니다
 
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr};
@@ -20,7 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use airlock_audit::Enforcement;
-use airlock_policy::rule::Matcher;
+use airlock_policy::glob::Pattern;
+use airlock_policy::rule::{Matcher, ProgramMatch};
 use airlock_policy::{Action, FileMode, Policy};
 use landlock::{
     ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr,
@@ -29,7 +35,7 @@ use landlock::{
 
 use crate::enforcer::Enforcer;
 use crate::error::{BrokerError, Result};
-use crate::profile::ProfileOptions;
+use crate::profile::{self, ProfileOptions};
 
 /// 루트 하나를 걸어 내려가며 검사할 최대 디렉토리 항목 수.
 ///
@@ -53,6 +59,19 @@ const SYSTEM_READ_PATHS: &[&str] = &[
     "/proc/self",
 ];
 
+/// exec 화이트리스트 모드에서 실행 권한을 함께 여는 런타임 루트.
+///
+/// 동적 링커(`ld-linux-*.so`, `ld-musl-*.so`)는 `execve` 대상 바이너리와 마찬가지로
+/// `open_exec()` 로 열립니다. 그 경로는 `__FMODE_EXEC` 를 세우므로 커널의 `file_open`
+/// 훅이 `LANDLOCK_ACCESS_FS_EXECUTE` 를 요구합니다. 곧 링커에 실행 권한이 없으면
+/// 동적 링크된 프로그램은 하나도 뜨지 못합니다.
+///
+/// 여기서 링커를 실제로 실행해 확인할 수단이 없으므로 추측으로 좁히지 않고 링커가 사는
+/// 루트를 통째로 엽니다. 그만큼 화이트리스트가 넓어지며 그 사실은 gap 으로 냅니다.
+/// PT_INTERP 를 읽어 링커 하나로 좁히는 것은 Linux 에서 실제 실행 검증이 가능해진
+/// 뒤에 할 일입니다
+const EXEC_RUNTIME_PATHS: &[&str] = &["/lib", "/lib64", "/usr/lib", "/usr/lib64"];
+
 /// 자식에게 열어 주는 장치 노드.
 ///
 /// `/dev/tty`는 일부러 뺐습니다. 그것은 제어 터미널이며 승인 프롬프트가 나가는 통로입니다.
@@ -66,12 +85,27 @@ const DEV_RW_PATHS: &[&str] = &[
     "/dev/urandom",
 ];
 
+/// 읽기 권한. `Execute` 를 뺍니다.
+///
+/// `AccessFs::from_read` 는 `Execute | ReadFile | ReadDir` 입니다. 그대로 주면 읽을 수
+/// 있는 모든 파일이 실행 가능해져 exec 정책이 커널에서 아무 의미도 갖지 못합니다
 fn read_access(abi: ABI) -> landlock::BitFlags<AccessFs> {
-    AccessFs::from_read(abi)
+    AccessFs::from_read(abi) & !AccessFs::Execute
 }
 
+/// 실행 권한만.
+fn exec_access(abi: ABI) -> landlock::BitFlags<AccessFs> {
+    if abi == ABI::Unsupported {
+        return landlock::BitFlags::EMPTY;
+    }
+    AccessFs::Execute.into()
+}
+
+/// 읽기 쓰기 권한. `from_all` 도 `Execute` 를 포함하므로 함께 뺍니다.
+///
+/// 이것을 빼지 않으면 에이전트가 작업 공간에 써 넣은 바이너리가 그대로 실행됩니다
 fn full_access(abi: ABI) -> landlock::BitFlags<AccessFs> {
-    AccessFs::from_all(abi)
+    AccessFs::from_all(abi) & !AccessFs::Execute
 }
 
 /// 상위 디렉토리를 나열만 할 수 있게 하는 권한.
@@ -144,9 +178,55 @@ struct Plan {
     read_only: Vec<PlanPath>,
     read_write: Vec<PlanPath>,
     list_only: Vec<PlanPath>,
+    /// 실행 권한을 줄 경로
+    exec_paths: Vec<PlanPath>,
+    /// exec 을 화이트리스트로 걸었는지.
+    ///
+    /// 거짓이면 `[defaults].exec = "allow"` 인 정책이므로 읽기 권한에 `Execute` 를 함께
+    /// 실어 이전 동작을 유지합니다
+    exec_whitelist: bool,
     tcp_connect: BTreeSet<u16>,
     unrestricted_net: bool,
     gaps: Vec<String>,
+}
+
+/// 지금 무엇을 위한 계획을 세우고 있는지.
+///
+/// 순회는 같은 코드를 쓰지만 평가할 모드와 결과를 쌓을 곳이 다릅니다. 실행 계획에서
+/// 읽기 모드를 검사하면 읽기만 막힌 파일까지 실행 목록에서 빠지고, 반대로 읽기 계획에서
+/// 실행 모드를 검사하면 실행만 막힌 파일이 읽히지도 않습니다
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanKind {
+    Read,
+    Write,
+    Exec,
+}
+
+impl PlanKind {
+    fn modes(self) -> &'static [FileMode] {
+        match self {
+            Self::Read => &[FileMode::Read],
+            Self::Write => &[FileMode::Read, FileMode::Write],
+            Self::Exec => &[FileMode::Exec],
+        }
+    }
+
+    fn push(self, plan: &mut Plan, target: PlanPath) {
+        match self {
+            Self::Read => plan.read_only.push(target),
+            Self::Write => plan.read_write.push(target),
+            Self::Exec => plan.exec_paths.push(target),
+        }
+    }
+
+    /// 통째로 줄 수 없는 상위 디렉토리에 나열 권한을 줄지.
+    ///
+    /// 실행 계획은 주지 않습니다. `ReadDir` 는 읽기 권한이라 실행 계획이 읽기 경계를
+    /// 넓히게 되고, Landlock 은 경로 통과에 어떤 권한도 요구하지 않으므로 실행에는
+    /// 상위 권한이 필요하지도 않습니다
+    fn lists_parents(self) -> bool {
+        self != Self::Exec
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,15 +377,10 @@ impl<'a> Walker<'a> {
     /// 기반이고, Seatbelt 프로파일도 이를 먼저 열어 둔 뒤 정책 deny를 덧씌웁니다.
     /// 기본값까지 여기서 반영하면 `[defaults].file = "ask"`인 베이스라인 정책에서
     /// 아무것도 허용되지 않아 프로세스가 exec조차 하지 못합니다
-    fn blocked(&self, path: &Path, writable: bool) -> bool {
+    fn blocked(&self, path: &Path, modes: &[FileMode]) -> bool {
         if !self.filter.may_match(path) {
             return false;
         }
-        let modes: &[FileMode] = if writable {
-            &[FileMode::Read, FileMode::Write]
-        } else {
-            &[FileMode::Read]
-        };
         modes.iter().any(|m| {
             // 순회 중인 경로는 이미 해소된 루트에 실제 항목 이름을 이어 붙인 것이라
             // 다시 해소할 필요가 없습니다. Landlock은 inode에 규칙을 걸므로 링크로
@@ -320,8 +395,8 @@ impl<'a> Walker<'a> {
     ///
     /// 반환값이 `Whole`이면 호출자가 이 경로 하나만 허용하면 됩니다. `Partial`이면
     /// `plan`에 이미 필요한 하위 규칙이 쌓였고 호출자는 이 경로에 나열 권한만 줍니다
-    fn walk(&mut self, dir: &Path, writable: bool, plan: &mut Plan) -> Grant {
-        if self.blocked(dir, writable) {
+    fn walk(&mut self, dir: &Path, kind: PlanKind, plan: &mut Plan) -> Grant {
+        if self.blocked(dir, kind.modes()) {
             return Grant::Denied;
         }
 
@@ -382,7 +457,7 @@ impl<'a> Walker<'a> {
 
         for (path, is_dir) in &children {
             if *is_dir {
-                match self.walk(path, writable, plan) {
+                match self.walk(path, kind, plan) {
                     Grant::Whole => {}
                     Grant::Partial => {
                         any_partial = true;
@@ -393,7 +468,7 @@ impl<'a> Walker<'a> {
                         skip.push(path.clone());
                     }
                 }
-            } else if self.blocked(path, writable) {
+            } else if self.blocked(path, kind.modes()) {
                 any_denied = true;
             }
         }
@@ -407,46 +482,45 @@ impl<'a> Walker<'a> {
             if skip.iter().any(|p| p == path) {
                 continue;
             }
-            if self.blocked(path, writable) {
+            if self.blocked(path, kind.modes()) {
                 continue;
             }
-            if writable {
-                plan.read_write.push(PlanPath::child(path, *is_dir));
-            } else {
-                plan.read_only.push(PlanPath::child(path, *is_dir));
-            }
+            kind.push(plan, PlanPath::child(path, *is_dir));
         }
         // 상위는 나열만 허용합니다. 이름은 보이지만 내용은 열리지 않으며,
         // Seatbelt 프로파일이 file-read-metadata를 여는 것과 같은 수준입니다
-        plan.list_only.push(PlanPath::child(dir, true));
+        if kind.lists_parents() {
+            plan.list_only.push(PlanPath::child(dir, true));
+        }
         Grant::Partial
     }
 }
 
-fn add_root(walker: &mut Walker<'_>, root: &Path, writable: bool, plan: &mut Plan) {
+fn add_root(walker: &mut Walker<'_>, root: &Path, kind: PlanKind, plan: &mut Plan) {
     if !root.exists() {
         return;
     }
     walker.begin_root();
-    match walker.walk(root, writable, plan) {
-        Grant::Whole => {
-            if writable {
-                plan.read_write.push(PlanPath::root(root));
-            } else {
-                plan.read_only.push(PlanPath::root(root));
+    match walker.walk(root, kind, plan) {
+        Grant::Whole => kind.push(plan, PlanPath::root(root)),
+        Grant::Partial => {
+            if kind.lists_parents() {
+                plan.list_only.push(PlanPath::root(root));
             }
         }
-        Grant::Partial => plan.list_only.push(PlanPath::root(root)),
         Grant::Denied => {}
     }
 }
 
 fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        exec_whitelist: profile::exec_whitelist_mode(policy),
+        ..Plan::default()
+    };
     let mut walker = Walker::new(policy);
 
     for p in SYSTEM_READ_PATHS {
-        add_root(&mut walker, Path::new(p), false, &mut plan);
+        add_root(&mut walker, Path::new(p), PlanKind::Read, &mut plan);
     }
     for p in DEV_RW_PATHS {
         let path = Path::new(p);
@@ -455,10 +529,10 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
         }
     }
     for dir in &opts.temp_dirs {
-        add_root(&mut walker, dir, true, &mut plan);
+        add_root(&mut walker, dir, PlanKind::Write, &mut plan);
     }
     if let Some(ws) = &opts.workspace {
-        add_root(&mut walker, ws, true, &mut plan);
+        add_root(&mut walker, ws, PlanKind::Write, &mut plan);
     }
 
     // 정책이 명시적으로 allow 한 파일 경로 중 구체 경로를 추가로 엽니다.
@@ -481,10 +555,17 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
             }
             let candidate = pattern.witness();
             if candidate.exists() {
-                add_root(&mut walker, &candidate, writable, &mut plan);
+                let kind = if writable {
+                    PlanKind::Write
+                } else {
+                    PlanKind::Read
+                };
+                add_root(&mut walker, &candidate, kind, &mut plan);
             }
         }
     }
+
+    let exec_trees = plan_exec_allow(policy, opts, &mut walker, &mut plan);
 
     for dir in walker.exhausted.iter().take(5) {
         plan.gaps.push(format!(
@@ -506,42 +587,273 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
         ));
     }
 
-    plan_exec_gap(policy, &mut plan);
+    plan_exec_gap(policy, &exec_trees, &mut plan);
     plan_network(policy, opts, &mut plan);
     plan
 }
 
-/// exec 제한이 커널에 걸리지 않는다는 사실을 gap 으로 남깁니다.
+/// glob 을 inode 규칙으로 옮길 수 있는 구체 경로.
 ///
-/// Landlock 은 허용 목록 방식이라 "이 디렉토리는 열되 그 안의 이 바이너리만 실행 금지"를
-/// 표현할 수 없습니다. macOS 는 `(deny process-exec* ...)` 로 같은 규칙을 커널에 내리므로,
-/// 선언하지 않으면 같은 정책 파일이 플랫폼마다 다르게 걸리는데 사용자는 그것을 알 수
-/// 없습니다.
-fn plan_exec_gap(policy: &Policy, plan: &mut Plan) {
-    let mut ids: Vec<&str> = Vec::new();
-    for rule in policy.user_rules().iter().chain(policy.baseline_rules()) {
-        if !rule.action.is_restrictive() {
-            continue;
-        }
-        let names_exec = match &rule.matcher {
-            Matcher::Exec { .. } => true,
-            Matcher::File { modes, .. } => modes.contains(FileMode::Exec),
-            Matcher::Egress { .. } => false,
-        };
-        if names_exec {
-            ids.push(&rule.id);
+/// `~/tools/**` 는 트리 루트로, `/usr/bin/nc` 는 그 파일 자체로 내려갑니다. 중간에
+/// 와일드카드가 있는 패턴은 열 대상이 하나로 정해지지 않아 옮길 수 없습니다
+///
+/// # Arguments
+/// `pattern` - 정책이 적은 경로 패턴
+fn concrete_target(pattern: &Pattern) -> Option<PathBuf> {
+    pattern
+        .subtree_root()
+        .or_else(|| pattern.as_absolute_path())
+}
+
+/// exec 허용 목록이 가리키는 경로를 모읍니다.
+///
+/// 옮기지 못한 규칙은 조용히 넘기지 않고 gap 으로 남깁니다. 허용 방향에서 조용히 빠지면
+/// 그 프로그램이 커널에서 실행되지 않는데 사용자는 이유를 알 수 없습니다
+///
+/// # Arguments
+/// `policy` - 허용 목록을 뽑을 정책
+/// `gaps` - 옮기지 못한 규칙을 쌓을 곳
+fn exec_allow_targets(policy: &Policy, gaps: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let tiers: [&[airlock_policy::Rule]; 3] = [
+        policy.self_protect_rules(),
+        policy.user_rules(),
+        policy.baseline_rules(),
+    ];
+    for tier in tiers {
+        for rule in tier {
+            if rule.action != Action::Allow {
+                continue;
+            }
+            match &rule.matcher {
+                Matcher::Exec { program, .. } => match program {
+                    Some(ProgramMatch::Path(pattern)) => match concrete_target(pattern) {
+                        Some(p) => out.push(p),
+                        None => gaps.push(format!(
+                            "exec allow 규칙 {} 의 경로 패턴 {} 은 inode 규칙으로 옮길 수 없어 \
+                             실행 허용에 넣지 않았음. 이 규칙이 가리키는 프로그램은 커널이 거부함",
+                            rule.id,
+                            pattern.raw()
+                        )),
+                    },
+                    Some(ProgramMatch::Basename(name)) => {
+                        let found = profile::resolve_in_path(name);
+                        if found.is_empty() {
+                            gaps.push(format!(
+                                "exec allow 규칙 {} 의 program = \"{name}\" 을 PATH 에서 찾지 \
+                                 못해 실행 허용에 넣지 않았음. 이 프로그램은 커널이 거부함",
+                                rule.id
+                            ));
+                        }
+                        out.extend(found);
+                    }
+                    None => gaps.push(format!(
+                        "exec allow 규칙 {} 에 프로그램 조건이 없어 실행 대상을 특정할 수 없음. \
+                         실행 허용에 넣지 않았음",
+                        rule.id
+                    )),
+                },
+                Matcher::File { paths, modes } if modes.contains(FileMode::Exec) => {
+                    for pattern in paths {
+                        match concrete_target(pattern) {
+                            Some(p) => out.push(p),
+                            None => gaps.push(format!(
+                                "규칙 {} 의 경로 {} 는 exec 모드를 허용하지만 inode 규칙으로 \
+                                 옮길 수 없어 실행 허용에 넣지 않았음",
+                                rule.id,
+                                pattern.raw()
+                            )),
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    if ids.is_empty() {
+    out
+}
+
+/// 실행 허용 계획을 세우고 트리로 걸린 루트를 돌려줍니다.
+///
+/// 화이트리스트 모드가 아니면 아무것도 하지 않습니다. 그때는 읽기 권한에 `Execute` 가
+/// 함께 실려 나가므로 별도 계획이 필요 없습니다.
+///
+/// # Arguments
+/// `policy` - 허용 목록을 뽑을 정책
+/// `opts` - 최상위 프로그램이 들어 있는 프로파일 옵션
+/// `walker` - 트리를 걸어 내려갈 순회기
+/// `plan` - 결과를 쌓을 계획
+fn plan_exec_allow(
+    policy: &Policy,
+    opts: &ProfileOptions,
+    walker: &mut Walker<'_>,
+    plan: &mut Plan,
+) -> Vec<PathBuf> {
+    if !plan.exec_whitelist {
+        return Vec::new();
+    }
+
+    let mut roots: Vec<PathBuf> = EXEC_RUNTIME_PATHS.iter().map(PathBuf::from).collect();
+    roots.extend(exec_allow_targets(policy, &mut plan.gaps));
+    if let Some(program) = &opts.program {
+        roots.push(program.clone());
+    }
+    // 계획은 결정적이어야 합니다. 같은 정책이 호출 순서 때문에 다른 규칙 집합을 내면
+    // 강제 범위가 머신마다 달라집니다
+    roots.sort();
+    roots.dedup();
+
+    let mut trees = Vec::new();
+    for root in &roots {
+        if root.is_dir() {
+            trees.push(root.clone());
+        }
+        add_root(walker, root, PlanKind::Exec, plan);
+    }
+
+    let runtime: Vec<&str> = EXEC_RUNTIME_PATHS
+        .iter()
+        .copied()
+        .filter(|p| Path::new(p).exists())
+        .collect();
+    if !runtime.is_empty() {
+        plan.gaps.push(format!(
+            "동적 링커에 Execute 가 필요해 {} 를 실행 허용에 함께 넣었음. 그 아래의 실행 \
+             파일은 정책이 따로 허용하지 않아도 실행됨",
+            runtime.join(", ")
+        ));
+    }
+    plan.gaps.push(
+        "mmap(PROT_EXEC) 은 Landlock 이 매개하지 않음. 읽을 수 있는 파일을 실행 가능하게 \
+         매핑해 그 안으로 뛰는 경로는 화이트리스트 밖임"
+            .to_string(),
+    );
+
+    trees
+}
+
+/// exec 제한 중 커널이 판정하지 못하는 것만 gap 으로 남깁니다.
+///
+/// 화이트리스트 모드에서는 허용 목록 밖의 프로그램이 커널에서 실제로 거부됩니다.
+/// 그것을 gap 으로 적으면 강제되는 것을 강제되지 않는다고 말하는 셈이라 반대 방향의
+/// 거짓말이 됩니다. 남는 것은 두 가지뿐입니다.
+///
+/// - argv 조건. 어떤 커널 인터페이스로도 표현할 수 없습니다.
+/// - 실행 허용이 디렉토리 트리로 걸린 경우 그 트리 안의 제한 규칙. Landlock 은 허용한
+///   트리 안에서 일부만 빼는 것을 표현할 수 없습니다.
+///
+/// `[defaults].exec = "allow"` 인 정책은 화이트리스트 자체가 없으므로 exec 제한이
+/// 통째로 커널 밖입니다.
+///
+/// # Arguments
+/// `policy` - 검사할 정책
+/// `trees` - 실행 허용이 트리로 걸린 루트
+/// `plan` - gap 을 쌓을 계획
+fn plan_exec_gap(policy: &Policy, trees: &[PathBuf], plan: &mut Plan) {
+    let tiers: [&[airlock_policy::Rule]; 3] = [
+        policy.self_protect_rules(),
+        policy.user_rules(),
+        policy.baseline_rules(),
+    ];
+
+    let mut restrictive: Vec<&airlock_policy::Rule> = Vec::new();
+    let mut argv_ids: Vec<&str> = Vec::new();
+    for tier in tiers {
+        for rule in tier {
+            let names_exec = match &rule.matcher {
+                Matcher::Exec {
+                    argv_contains,
+                    argv_pattern,
+                    ..
+                } => {
+                    if !argv_contains.is_empty() || argv_pattern.is_some() {
+                        argv_ids.push(&rule.id);
+                    }
+                    true
+                }
+                Matcher::File { modes, .. } => modes.contains(FileMode::Exec),
+                Matcher::Egress { .. } => false,
+            };
+            if names_exec && rule.action.is_restrictive() {
+                restrictive.push(rule);
+            }
+        }
+    }
+
+    if !plan.exec_whitelist {
+        let mut ids: Vec<&str> = restrictive.iter().map(|r| r.id.as_str()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        plan.gaps.push(format!(
+            "[defaults].exec = \"allow\" 라 exec 화이트리스트를 걸지 않았음. 읽을 수 있는 \
+             파일은 전부 실행할 수 있으며 아래 규칙은 중계 층이 관측할 뿐임: {}",
+            ids.join(", ")
+        ));
         return;
     }
-    ids.sort_unstable();
-    ids.dedup();
+
+    argv_ids.sort_unstable();
+    argv_ids.dedup();
+    if !argv_ids.is_empty() {
+        plan.gaps.push(format!(
+            "argv 조건은 커널이 볼 수 없어 프로그램 경로 단위로만 강제됨. 아래 규칙의 \
+             argv 판정은 중계 층에만 있음: {}",
+            argv_ids.join(", ")
+        ));
+    }
+
+    if trees.is_empty() {
+        return;
+    }
+    let mut inside: Vec<&str> = restrictive
+        .iter()
+        .filter(|r| rule_touches_trees(r, trees))
+        .map(|r| r.id.as_str())
+        .collect();
+    if inside.is_empty() {
+        return;
+    }
+    inside.sort_unstable();
+    inside.dedup();
+    let listed: Vec<String> = trees.iter().map(|t| t.display().to_string()).collect();
     plan.gaps.push(format!(
-        "exec 제한은 Landlock 이 표현할 수 없어 커널에서 강제되지 않음. \
-         중계 층이 관측할 뿐이며 --mediate off 면 아무것도 남지 않음: {}",
-        ids.join(", ")
+        "실행 허용이 트리로 걸린 곳({}) 안의 exec 제한 규칙은 커널에서 걸러지지 않음. \
+         Landlock 은 허용한 트리에서 일부만 빼는 것을 표현할 수 없음: {}",
+        listed.join(", "),
+        inside.join(", ")
     ));
+}
+
+/// 이 제한 규칙이 실행 허용 트리 안을 가리키는지.
+///
+/// 프로그램 조건이 없는 규칙은 무엇이든 가리킬 수 있으므로 참으로 봅니다
+///
+/// # Arguments
+/// `rule` - 검사할 제한 규칙
+/// `trees` - 실행 허용이 트리로 걸린 루트
+fn rule_touches_trees(rule: &airlock_policy::Rule, trees: &[PathBuf]) -> bool {
+    let under = |p: &Path| trees.iter().any(|t| p.starts_with(t));
+    match &rule.matcher {
+        Matcher::Exec { program, .. } => match program {
+            Some(ProgramMatch::Path(pattern)) => {
+                concrete_target(pattern).is_some_and(|p| under(&p))
+            }
+            Some(ProgramMatch::Basename(name)) => {
+                profile::resolve_in_path(name).iter().any(|p| under(p))
+            }
+            None => true,
+        },
+        Matcher::File { paths, modes } => {
+            modes.contains(FileMode::Exec)
+                && paths
+                    .iter()
+                    .any(|p| concrete_target(p).is_some_and(|c| under(&c)))
+        }
+        Matcher::Egress { .. } => false,
+    }
 }
 
 fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
@@ -565,8 +877,16 @@ fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
     }
 
     let mut host_scoped = Vec::new();
+    let mut protocol_scoped = Vec::new();
+    let mut quota_scoped = Vec::new();
     for rule in policy.user_rules() {
-        let Matcher::Egress { host, port } = &rule.matcher else {
+        let Matcher::Egress {
+            host,
+            port,
+            protocol,
+            max_bytes_out,
+        } = &rule.matcher
+        else {
             continue;
         };
         if rule.action != Action::Allow {
@@ -583,6 +903,16 @@ fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
         }
         if !matches!(host, airlock_policy::host::HostPattern::Any) {
             host_scoped.push(rule.id.clone());
+        }
+        // 프로토콜 조건은 커널이 볼 수 없습니다. 포트만 열리므로 규칙이 말하는 것보다
+        // 커널이 넓어집니다. 호스트 조건과 같은 이유이며 같은 방식으로 노출합니다
+        if protocol.is_some() {
+            protocol_scoped.push(rule.id.clone());
+        }
+        // 총량 한도도 커널 밖입니다. 반출 바이트는 프록시 층만 세며, 커널은 포트를 열거나
+        // 닫을 뿐 얼마나 나갔는지 알지 못합니다
+        if max_bytes_out.is_some() {
+            quota_scoped.push(rule.id.clone());
         }
     }
 
@@ -606,6 +936,22 @@ fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
             "호스트 단위 egress 규칙은 Landlock으로 강제되지 않음. 포트까지만 강제하며 \
              호스트 판정은 프록시 층이 필요함: {}",
             host_scoped.join(", ")
+        ));
+    }
+
+    if !protocol_scoped.is_empty() {
+        plan.gaps.push(format!(
+            "protocol 조건이 붙은 egress allow 규칙의 포트가 커널에서는 조건 없이 열림. \
+             Landlock 은 프로토콜을 보지 못하므로 규칙보다 넓게 걸림: {}",
+            protocol_scoped.join(", ")
+        ));
+    }
+
+    if !quota_scoped.is_empty() {
+        plan.gaps.push(format!(
+            "max_bytes_out 은 커널이 강제하지 않음. 반출 바이트는 프록시 층만 세고, 한도를 \
+             넘긴 그 연결 자체는 막지 못하며 다음 연결부터 막힘: {}",
+            quota_scoped.join(", ")
         ));
     }
 }
@@ -653,6 +999,7 @@ impl LandlockEnforcer {
                 .len()
                 .saturating_add(p.read_write.len())
                 .saturating_add(p.list_only.len())
+                .saturating_add(p.exec_paths.len())
         })
     }
 }
@@ -752,10 +1099,19 @@ fn apply(plan: &Plan, abi: ABI) -> std::io::Result<RulesetStatus> {
 
     let mut created = ruleset.create().map_err(std::io::Error::other)?;
 
+    // 화이트리스트 모드가 아니면 읽기 권한에 Execute 를 도로 실어 이전 동작을 유지합니다.
+    // `[defaults].exec = "allow"` 인 정책이 이 변경으로 실행을 잃으면 회귀입니다
+    let ride_along = if plan.exec_whitelist {
+        landlock::BitFlags::EMPTY
+    } else {
+        exec_access(abi)
+    };
+
     for (paths, access) in [
-        (&plan.read_only, read_access(abi)),
-        (&plan.read_write, full_access(abi)),
+        (&plan.read_only, read_access(abi) | ride_along),
+        (&plan.read_write, full_access(abi) | ride_along),
         (&plan.list_only, list_access()),
+        (&plan.exec_paths, exec_access(abi)),
     ] {
         for target in paths {
             let granted = rule_access(target, access, abi);
@@ -799,6 +1155,10 @@ impl Enforcer for LandlockEnforcer {
         }
     }
 
+    fn set_program(&mut self, program: &Path) {
+        self.options.program = Some(program.to_path_buf());
+    }
+
     fn prepare(&mut self, policy: &Policy) -> Result<()> {
         if self.abi == ABI::Unsupported {
             return Err(BrokerError::EnforcerUnavailable {
@@ -813,12 +1173,31 @@ impl Enforcer for LandlockEnforcer {
     }
 
     fn wrap(&self, cmd: &mut Command) -> Result<()> {
-        let Some(plan) = self.plan.clone() else {
+        let Some(mut plan) = self.plan.clone() else {
             return Err(BrokerError::EnforcerUnavailable {
                 name: "landlock",
                 why: "prepare가 먼저 호출되지 않았음".to_string(),
             });
         };
+        // 최상위 프로그램은 언제나 실행 허용에 들어가야 합니다. 빠지면 커널이 첫
+        // execve 를 거부해 프로세스가 아예 뜨지 못합니다. 그 경로는 prepare 가 아니라
+        // 실제로 spawn 할 명령을 받는 여기에서만 확실히 알 수 있습니다
+        if plan.exec_whitelist {
+            if let Some(program) = profile::resolve_program(cmd.get_program())
+                && !plan.exec_paths.iter().any(|t| t.path == program)
+            {
+                plan.exec_paths.push(PlanPath::root(program));
+            }
+            if plan.exec_paths.is_empty() {
+                return Err(BrokerError::EnforcerUnavailable {
+                    name: "landlock",
+                    why: "[defaults].exec 이 allow 가 아니어서 exec 을 화이트리스트로 거는데 \
+                          실행 허용 경로가 하나도 없음. 최상위 프로그램을 해소하지 못했거나 \
+                          정책에 exec allow 규칙이 없음. 이대로 걸면 프로세스가 뜨지 못함"
+                        .to_string(),
+                });
+            }
+        }
         let abi = self.abi;
 
         use std::os::unix::process::CommandExt;
@@ -919,13 +1298,13 @@ mod tests {
         walker.budget_per_root = 4;
         let mut plan = Plan::default();
 
-        add_root(&mut walker, &big, false, &mut plan);
+        add_root(&mut walker, &big, PlanKind::Read, &mut plan);
         assert!(
             !walker.exhausted.is_empty(),
             "첫 루트에서 예산이 소진되어야 함"
         );
 
-        add_root(&mut walker, &small, false, &mut plan);
+        add_root(&mut walker, &small, PlanKind::Read, &mut plan);
         assert!(
             plan.read_only.iter().any(|p| p.path == small),
             "예산이 루트마다 새로 주어져 두 번째 루트가 통째로 허용되어야 함"
@@ -946,7 +1325,7 @@ mod tests {
         let mut walker = Walker::new(&policy);
         walker.budget_per_root = 3;
         let mut plan = Plan::default();
-        add_root(&mut walker, &root, false, &mut plan);
+        add_root(&mut walker, &root, PlanKind::Read, &mut plan);
 
         assert_eq!(
             plan.read_only.len(),
@@ -975,7 +1354,7 @@ mod tests {
         let mut walker = Walker::new(&policy);
         walker.budget_per_root = 6;
         let mut plan = Plan::default();
-        add_root(&mut walker, &root, false, &mut plan);
+        add_root(&mut walker, &root, PlanKind::Read, &mut plan);
 
         let seen: Vec<String> = plan
             .read_only
@@ -1033,7 +1412,7 @@ mod tests {
         let policy = baseline(&s.0);
         let mut walker = Walker::new(&policy);
         let mut plan = Plan::default();
-        add_root(&mut walker, &root, true, &mut plan);
+        add_root(&mut walker, &root, PlanKind::Write, &mut plan);
 
         let _ = fs::set_permissions(&closed, fs::Permissions::from_mode(0o755));
 
@@ -1051,5 +1430,300 @@ mod tests {
     fn dev_nodes_are_planned_as_non_directories() {
         let p = PlanPath::root("/dev/null");
         assert!(!p.dir, "문자 장치는 디렉토리가 아님");
+    }
+
+    // ---------- exec 화이트리스트 ----------
+
+    fn policy_with(home: &Path, src: &str) -> Policy {
+        Policy::load_str(src, &LoadContext::new(home, home.join("audit"))).unwrap()
+    }
+
+    /// `AccessFs::from_read` 는 `Execute` 를 포함합니다. 그대로 두면 읽을 수 있는 모든
+    /// 파일이 실행 가능해져 exec 화이트리스트가 성립하지 않습니다
+    #[test]
+    fn read_and_write_access_no_longer_carry_execute() {
+        for abi in [ABI::V1, ABI::V5, ABI::V8] {
+            assert!(
+                !read_access(abi).contains(AccessFs::Execute),
+                "읽기 권한에 Execute 가 남아 있으면 exec 정책이 커널에서 무의미해짐"
+            );
+            assert!(
+                !full_access(abi).contains(AccessFs::Execute),
+                "쓰기 권한에 Execute 가 남으면 작업 공간에 써 넣은 바이너리가 실행됨"
+            );
+            assert!(exec_access(abi).contains(AccessFs::Execute));
+            // 읽기 자체는 그대로여야 합니다
+            assert!(read_access(abi).contains(AccessFs::ReadFile));
+            assert!(read_access(abi).contains(AccessFs::ReadDir));
+            assert!(full_access(abi).contains(AccessFs::WriteFile));
+        }
+        assert!(exec_access(ABI::Unsupported).is_empty());
+    }
+
+    #[test]
+    fn the_exec_default_decides_whether_the_whitelist_is_built() {
+        let s = Scratch::new("mode");
+        let asking = baseline(&s.0);
+        assert!(
+            profile::exec_whitelist_mode(&asking),
+            "[defaults].exec 기본값은 ask 이므로 화이트리스트여야 함"
+        );
+
+        let permissive = policy_with(
+            &s.0,
+            r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+"#,
+        );
+        assert!(
+            !profile::exec_whitelist_mode(&permissive),
+            "exec = \"allow\" 정책은 이전 동작을 그대로 유지해야 함"
+        );
+    }
+
+    #[test]
+    fn exec_allow_rules_become_concrete_targets() {
+        let s = Scratch::new("targets");
+        let tool = s.0.join("tools/mytool");
+        fs::create_dir_all(s.0.join("tools")).unwrap();
+        fs::write(&tool, b"x").unwrap();
+
+        let policy = policy_with(
+            &s.0,
+            &format!(
+                r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+[[rules]]
+id = "tool"
+kind = "exec"
+program = "{}"
+action = "allow"
+[[rules]]
+id = "tree"
+kind = "file"
+path = "{}/tools/**"
+mode = ["read", "exec"]
+action = "allow"
+"#,
+                tool.display(),
+                s.0.display()
+            ),
+        );
+
+        let mut gaps = Vec::new();
+        let targets = exec_allow_targets(&policy, &mut gaps);
+        assert!(targets.contains(&tool), "{targets:?}");
+        assert!(targets.contains(&s.0.join("tools")), "{targets:?}");
+        assert!(gaps.is_empty(), "{gaps:?}");
+    }
+
+    /// 이름만 적은 규칙이 PATH 에서 해소되지 않으면 그 프로그램은 커널에서 실행되지
+    /// 않습니다. 조용히 넘어가면 사용자가 이유를 알 수 없습니다
+    #[test]
+    fn an_unresolvable_basename_allow_is_reported_not_dropped() {
+        let s = Scratch::new("basename");
+        let policy = policy_with(
+            &s.0,
+            r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+[[rules]]
+id = "ghost"
+kind = "exec"
+program = "airlock-no-such-program-xyz"
+action = "allow"
+"#,
+        );
+        let mut gaps = Vec::new();
+        let targets = exec_allow_targets(&policy, &mut gaps);
+        assert!(targets.is_empty(), "{targets:?}");
+        assert!(
+            gaps.iter()
+                .any(|g| g.contains("ghost") && g.contains("PATH")),
+            "{gaps:?}"
+        );
+    }
+
+    /// 화이트리스트가 실제로 강제하는 것을 gap 이라고 적으면 반대 방향의 거짓말입니다
+    #[test]
+    fn the_whitelist_does_not_declare_itself_unenforced() {
+        let s = Scratch::new("gap");
+        let policy = policy_with(
+            &s.0,
+            r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+[[rules]]
+id = "no-nc"
+kind = "exec"
+program = "/usr/bin/nc"
+action = "deny"
+"#,
+        );
+
+        let mut plan = Plan {
+            exec_whitelist: true,
+            ..Plan::default()
+        };
+        plan_exec_gap(&policy, &[], &mut plan);
+        assert!(
+            !plan
+                .gaps
+                .iter()
+                .any(|g| g.contains("전부 실행할 수 있으며")),
+            "화이트리스트가 걸린 상태에서 미강제라고 보고함: {:?}",
+            plan.gaps
+        );
+
+        let mut legacy = Plan::default();
+        plan_exec_gap(&policy, &[], &mut legacy);
+        assert!(
+            legacy.gaps.iter().any(|g| g.contains("no-nc")),
+            "exec = \"allow\" 에서는 exec 제한이 커널 밖이라는 사실을 밝혀야 함: {:?}",
+            legacy.gaps
+        );
+    }
+
+    #[test]
+    fn argv_conditions_stay_declared_as_a_gap() {
+        let s = Scratch::new("argv");
+        let policy = policy_with(
+            &s.0,
+            r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+[[rules]]
+id = "no-force-push"
+kind = "exec"
+program = "git"
+argv_contains = ["--force"]
+action = "deny"
+"#,
+        );
+        let mut plan = Plan {
+            exec_whitelist: true,
+            ..Plan::default()
+        };
+        plan_exec_gap(&policy, &[], &mut plan);
+        assert!(
+            plan.gaps
+                .iter()
+                .any(|g| g.contains("argv") && g.contains("no-force-push")),
+            "{:?}",
+            plan.gaps
+        );
+    }
+
+    /// 허용 트리 안의 제한은 Landlock 이 표현할 수 없습니다. 그것은 여전히 gap 입니다
+    #[test]
+    fn a_restriction_inside_a_granted_tree_is_declared() {
+        let s = Scratch::new("tree-gap");
+        let policy = policy_with(
+            &s.0,
+            r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+[[rules]]
+id = "no-nc"
+kind = "exec"
+program = "/usr/bin/nc"
+action = "deny"
+"#,
+        );
+        let mut plan = Plan {
+            exec_whitelist: true,
+            ..Plan::default()
+        };
+        plan_exec_gap(&policy, &[PathBuf::from("/usr")], &mut plan);
+        assert!(
+            plan.gaps
+                .iter()
+                .any(|g| g.contains("트리") && g.contains("no-nc")),
+            "{:?}",
+            plan.gaps
+        );
+    }
+
+    /// 실행 계획은 읽기 경계를 넓히면 안 되고, 읽기 계획은 exec deny 때문에 좁아지면
+    /// 안 됩니다. 두 계획이 같은 모드를 보면 어느 한쪽이 반드시 틀립니다
+    #[test]
+    fn the_exec_plan_and_the_read_plan_use_different_modes() {
+        let s = Scratch::new("modes");
+        let bin = s.0.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ok = bin.join("ok");
+        let blocked = bin.join("blocked");
+        fs::write(&ok, b"x").unwrap();
+        fs::write(&blocked, b"x").unwrap();
+
+        let policy = policy_with(
+            &s.0,
+            &format!(
+                r#"
+version = 1
+[defaults]
+file = "allow"
+exec = "ask"
+egress = "deny"
+[[rules]]
+id = "no-exec-here"
+kind = "file"
+path = "{}"
+mode = ["exec"]
+action = "deny"
+"#,
+                blocked.display()
+            ),
+        );
+
+        let mut walker = Walker::new(&policy);
+        let mut plan = Plan {
+            exec_whitelist: true,
+            ..Plan::default()
+        };
+        add_root(&mut walker, &bin, PlanKind::Exec, &mut plan);
+
+        assert!(
+            plan.exec_paths.iter().any(|p| p.path == ok),
+            "실행이 막히지 않은 파일은 허용되어야 함: {:?}",
+            plan.exec_paths
+        );
+        assert!(
+            !plan.exec_paths.iter().any(|p| p.path == blocked),
+            "exec deny 가 걸린 파일이 실행 허용에 남음"
+        );
+        assert!(
+            plan.list_only.is_empty(),
+            "실행 계획이 읽기 권한(ReadDir)을 넓힘: {:?}",
+            plan.list_only
+        );
+
+        // 같은 트리를 읽기로 계획하면 exec deny 는 아무것도 빼지 않아야 합니다
+        let mut read_plan = Plan::default();
+        add_root(&mut walker, &bin, PlanKind::Read, &mut read_plan);
+        assert!(
+            read_plan.read_only.iter().any(|p| p.path == bin),
+            "exec deny 하나가 읽기 계획까지 좁힘: {read_plan:?}"
+        );
     }
 }
