@@ -15,8 +15,8 @@ pub const CHAIN_FILE: &str = "chain.jsonl";
 pub const HEAD_FILE: &str = "head.json";
 pub const BROKER_ACTOR: &str = "airlock";
 
-const DIR_MODE: u32 = 0o700;
-const FILE_MODE: u32 = 0o600;
+pub(crate) const DIR_MODE: u32 = 0o700;
+pub(crate) const FILE_MODE: u32 = 0o600;
 
 /// 감사 루트와 그 상위를 0700으로 만듭니다.
 ///
@@ -26,7 +26,7 @@ const FILE_MODE: u32 = 0o600;
 ///
 /// # Errors
 /// 중간 구성 요소를 만들지 못하면 실패합니다.
-fn create_dir_all_private(dir: &Path) -> Result<()> {
+pub(crate) fn create_dir_all_private(dir: &Path) -> Result<()> {
     if dir.exists() {
         return Ok(());
     }
@@ -39,6 +39,18 @@ fn create_dir_all_private(dir: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(Error::io(dir, e)),
     }
+}
+
+/// 현재 프로세스의 uid 와 euid 를 읽습니다.
+///
+/// 호출자에게서 받지 않는 이유는 감사 로그가 주장이 아니라 관측을 담아야 하기 때문입니다.
+/// 인자로 받으면 자기 자신을 다른 계정으로 기록하는 세션을 막을 방법이 없습니다
+///
+/// # Safety
+/// `getuid(2)` 와 `geteuid(2)` 는 인자가 없고 메모리를 건드리지 않으며 POSIX 가 항상
+/// 성공을 보장합니다. 실패 경로가 없으므로 반환값 검사도 필요 없습니다
+pub(crate) fn process_uids() -> (u32, u32) {
+    unsafe { (libc::getuid(), libc::geteuid()) }
 }
 
 pub const HEAD_VERSION: u32 = 1;
@@ -60,6 +72,8 @@ pub struct GenesisInfo {
     pub policy_digest: Hash,
     pub policy_source: Option<String>,
     pub mediation: Mediation,
+    pub operator: Option<String>,
+    pub policy_signer: Option<String>,
 }
 
 #[derive(Debug)]
@@ -111,6 +125,7 @@ impl AuditLog {
             fsync_per_entry,
         };
 
+        let (uid, euid) = process_uids();
         let genesis_event = Event::SessionStart {
             airlock_version: genesis.airlock_version,
             argv: genesis.argv,
@@ -119,6 +134,10 @@ impl AuditLog {
             policy_source: genesis.policy_source,
             fsync_per_entry,
             mediation: genesis.mediation,
+            uid,
+            euid,
+            operator: genesis.operator,
+            policy_signer: genesis.policy_signer,
         };
         log.append(Record::new(BROKER_ACTOR, genesis_event, Decision::Allow))?;
         Ok(log)
@@ -275,6 +294,8 @@ mod tests {
             policy_digest: Hash::from_bytes([0x11; 32]),
             policy_source: Some("policy.toml".into()),
             mediation: Mediation::ExecNet,
+            operator: None,
+            policy_signer: None,
         }
     }
 

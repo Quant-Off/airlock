@@ -13,6 +13,10 @@ use crate::types::{Decision, Enforcement, Hash, SessionId};
 #[derive(Debug)]
 pub enum Failure {
     ChainEmpty,
+    FormatVersionUnsupported {
+        seq: u64,
+        got: u32,
+    },
     MalformedLine {
         line: u64,
         detail: String,
@@ -79,6 +83,11 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ChainEmpty => write!(f, "체인이 비어 있음"),
+            Self::FormatVersionUnsupported { seq, got } => write!(
+                f,
+                "seq {seq}의 포맷이 v{got}. 이 검증자는 v{}만 안다. 변조가 아니라 옛 포맷일 수 있으니 그 버전의 airlock으로 검증할 것",
+                crate::FORMAT_VERSION
+            ),
             Self::MalformedLine { line, detail } => {
                 write!(f, "{line}번째 줄 파싱 실패: {detail}")
             }
@@ -276,6 +285,15 @@ pub fn verify_stream<R: BufRead>(
             line: line_no,
             detail: e.to_string(),
         })?;
+
+        // 해시 검사보다 먼저 봅니다. 순서를 바꾸면 v1 체인이 HashMismatch, 곧 내용 변조
+        // 의심으로 보고되어 옛 포맷과 위조가 구분되지 않습니다 (docs/audit-format.md 7.1)
+        if entry.v != crate::FORMAT_VERSION {
+            return Err(Failure::FormatVersionUnsupported {
+                seq: entry.seq,
+                got: entry.v,
+            });
+        }
 
         if entry.seq != expected_seq {
             return Err(Failure::SeqGap {

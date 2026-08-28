@@ -6,7 +6,11 @@ use crate::event::Event;
 use crate::time::format_rfc3339_nanos;
 use crate::types::{CanonicalTag, Decision, Enforcement, Hash, SessionId};
 
-pub const DOMAIN: &[u8] = b"airlock.audit.v1\x00";
+pub const DOMAIN: &[u8] = b"airlock.audit.v2\x00";
+
+fn legacy_format_version() -> u32 {
+    1
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -35,6 +39,8 @@ impl Record {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    #[serde(default = "legacy_format_version")]
+    pub v: u32,
     pub seq: u64,
     pub ts: u64,
     pub ts_rfc3339: String,
@@ -63,7 +69,9 @@ impl Entry {
             decision,
             rule,
         } = record;
+        let v = crate::FORMAT_VERSION;
         let hash = compute_hash(
+            v,
             seq,
             &prev,
             ts,
@@ -75,6 +83,7 @@ impl Entry {
             rule.as_deref(),
         );
         Self {
+            v,
             seq,
             ts,
             ts_rfc3339: format_rfc3339_nanos(ts),
@@ -91,6 +100,7 @@ impl Entry {
 
     pub fn recompute_hash(&self) -> Hash {
         compute_hash(
+            self.v,
             self.seq,
             &self.prev,
             self.ts,
@@ -110,6 +120,7 @@ impl Entry {
 
 #[allow(clippy::too_many_arguments)]
 pub fn compute_hash(
+    v: u32,
     seq: u64,
     prev: &Hash,
     ts: u64,
@@ -121,7 +132,8 @@ pub fn compute_hash(
     rule: Option<&str>,
 ) -> Hash {
     let mut enc = Encoder::with_domain(DOMAIN);
-    enc.u64(seq)
+    enc.u32(v)
+        .u64(seq)
         .bytes(prev.as_bytes())
         .u64(ts)
         .bytes(session.as_bytes())
@@ -217,6 +229,37 @@ mod tests {
     }
 
     #[test]
+    fn sealed_entries_carry_the_current_format_version() {
+        assert_eq!(sample(0, Hash::ZERO).v, crate::FORMAT_VERSION);
+        assert_eq!(crate::FORMAT_VERSION, 2);
+    }
+
+    #[test]
+    fn format_version_is_hashed() {
+        let base = sample(0, Hash::ZERO);
+        let mut downgraded = base.clone();
+        downgraded.v = 1;
+        assert_ne!(
+            downgraded.recompute_hash(),
+            base.hash,
+            "버전이 해시 밖에 있으면 위조자가 옛 검증 규칙을 끌어올 수 있음"
+        );
+    }
+
+    #[test]
+    fn line_without_v_parses_as_version_one() {
+        let e = sample(0, Hash::ZERO);
+        let mut value: serde_json::Value = serde_json::to_value(&e).unwrap();
+        value.as_object_mut().unwrap().remove("v");
+        let back: Entry = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            back.v, 1,
+            "v 없는 줄이 파싱조차 실패하면 검증자가 옛 포맷과 위조를 구분할 수 없음"
+        );
+        assert!(!back.hash_is_valid());
+    }
+
+    #[test]
     fn rfc3339_is_not_hashed() {
         let mut tampered = sample(0, Hash::ZERO);
         tampered.ts_rfc3339 = "1999-01-01T00:00:00.000000000Z".into();
@@ -270,6 +313,7 @@ mod tests {
         let e = sample(0, Hash::ZERO);
         let mut without_domain = Encoder::new();
         without_domain
+            .u32(e.v)
             .u64(e.seq)
             .bytes(e.prev.as_bytes())
             .u64(e.ts)
@@ -282,6 +326,34 @@ mod tests {
             .opt_str(e.rule.as_deref());
         let naive = Sha256::digest(without_domain.as_slice());
         assert_ne!(naive.as_slice(), e.hash.as_bytes().as_slice());
+    }
+
+    #[test]
+    fn v1_verifier_bytes_never_match_a_v2_entry() {
+        let e = sample(0, Hash::ZERO);
+
+        // 진짜 v1 검증자가 계산하던 바이트열 전체. 도메인이 v1 이고 u32(v) 가 없다
+        let mut v1 = Encoder::with_domain(b"airlock.audit.v1\x00");
+        v1.u64(e.seq)
+            .bytes(e.prev.as_bytes())
+            .u64(e.ts)
+            .bytes(e.session.as_bytes())
+            .str(&e.actor)
+            .tag(e.enforcement.tag());
+        e.event.encode(&mut v1);
+        v1.tag(e.decision.tag()).opt_str(e.rule.as_deref());
+        let legacy = Sha256::digest(v1.as_slice());
+
+        assert_ne!(legacy.as_slice(), e.hash.as_bytes().as_slice());
+
+        // v 만 1 로 낮춰 다시 계산해도 v2 도메인 위에서 계산되므로 v1 과 같아지지 않는다
+        let mut downgraded = e.clone();
+        downgraded.v = 1;
+        assert_ne!(
+            legacy.as_slice(),
+            downgraded.recompute_hash().as_bytes().as_slice(),
+            "버전을 낮춰 옛 검증자 바이트를 재현할 수 있으면 안 됨"
+        );
     }
 
     #[test]

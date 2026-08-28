@@ -71,6 +71,22 @@ impl SessionId {
     }
 }
 
+/// 정규 인코딩된 바이트열의 SHA-256 다이제스트 생성 함수입니다.
+///
+/// 체인 밖에서 같은 해시 함수를 써야 하는 곳(점검 리포트 본문)이 `sha2`를 직접 의존하지
+/// 않게 합니다. 검증자가 여럿이 되면 해시 함수가 갈라질 수 있고, 갈라지는 순간 한쪽이
+/// 계산한 값을 다른 쪽이 확인하지 못합니다.
+///
+/// # Arguments
+/// `bytes` - 다이제스트를 쓸 바이트열
+pub fn sha256(bytes: &[u8]) -> Hash {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; Hash::LEN];
+    out.copy_from_slice(&digest);
+    Hash::from_bytes(out)
+}
+
 pub trait CanonicalTag {
     fn tag(&self) -> u8;
 }

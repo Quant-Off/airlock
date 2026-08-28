@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use airlock_canonical::Encoder;
+
 use airlock_audit::{
     AuditLog, CHAIN_FILE, Decision, Enforcement, Entry, Event, FileMode, GenesisInfo, Granted,
     HEAD_FILE, Hash, Head, Mediation, Record, SessionId, Warning, now_unix_nanos, verify_dir,
@@ -38,6 +40,8 @@ fn genesis() -> GenesisInfo {
         policy_digest: Hash::from_bytes([0x42; 32]),
         policy_source: Some("airlock.toml".into()),
         mediation: Mediation::ExecNet,
+        operator: None,
+        policy_signer: None,
     }
 }
 
@@ -90,6 +94,8 @@ fn build_chain(dir: &Path, enforcement: Enforcement) -> Vec<Entry> {
                 for_seq: ask.seq,
                 granted: Granted::Approved,
                 note: Some("사용자 승인".into()),
+                approver_uid: Some(501),
+                approver_tty: Some("/dev/ttys004".into()),
             },
             Decision::Allow,
         ))
@@ -601,6 +607,8 @@ fn self_referencing_approval_is_fatal() {
                 for_seq: target.seq.saturating_add(1),
                 granted: Granted::Approved,
                 note: None,
+                approver_uid: None,
+                approver_tty: None,
             },
             Decision::Ask,
         ),
@@ -727,4 +735,314 @@ fn whitespace_only_final_line_is_a_partial_write() {
         matches!(err, airlock_audit::Failure::TruncatedFinalLine { .. }),
         "{err}"
     );
+}
+
+// ---------- 포맷 버전 (v1 -> v2) ----------
+
+#[test]
+fn downgraded_version_is_reported_as_old_format_not_tampering() {
+    let s = Scratch::new("v-downgrade");
+    build_chain(s.path(), Enforcement::Landlock);
+
+    let mut entries = read_entries(s.path());
+    entries[2].v = 1;
+    write_entries(s.path(), &entries);
+
+    let err = verify_dir(s.path()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            airlock_audit::Failure::FormatVersionUnsupported { seq: 2, got: 1 }
+        ),
+        "옛 포맷과 위조가 같은 사유로 보고되면 진짜 변조가 소음에 묻힘: {err}"
+    );
+    assert!(
+        !matches!(err, airlock_audit::Failure::HashMismatch { .. }),
+        "버전 검사가 해시 검사보다 먼저 오지 않았음: {err}"
+    );
+}
+
+#[test]
+fn self_consistent_v1_line_is_still_rejected() {
+    let s = Scratch::new("v-resealed");
+    build_chain(s.path(), Enforcement::Landlock);
+
+    let mut entries = read_entries(s.path());
+    // 버전을 낮추고 해시까지 다시 계산한 줄. 자체적으로는 정합적이다
+    entries[2].v = 1;
+    entries[2].hash = entries[2].recompute_hash();
+    entries[3].prev = entries[2].hash;
+    entries[3].hash = entries[3].recompute_hash();
+    entries[4].prev = entries[3].hash;
+    entries[4].hash = entries[4].recompute_hash();
+    write_entries(s.path(), &entries);
+    reanchor(s.path(), &entries);
+
+    let err = verify_dir(s.path()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            airlock_audit::Failure::FormatVersionUnsupported { seq: 2, got: 1 }
+        ),
+        "버전을 낮춰 옛 검증 규칙을 끌어오는 것이 통과하면 안 됨: {err}"
+    );
+}
+
+#[test]
+fn version_is_bound_into_the_hash() {
+    let s = Scratch::new("v-hashed");
+    build_chain(s.path(), Enforcement::Landlock);
+
+    let entries = read_entries(s.path());
+    let mut downgraded = entries[2].clone();
+    downgraded.v = 1;
+    assert_ne!(
+        downgraded.recompute_hash(),
+        entries[2].hash,
+        "v가 해시 밖에 있으면 위조자가 버전만 바꿔 끼울 수 있음"
+    );
+}
+
+#[test]
+fn v1_shaped_line_without_the_field_is_rejected_not_migrated() {
+    let s = Scratch::new("v-missing");
+    build_chain(s.path(), Enforcement::Landlock);
+
+    // v 필드가 아예 없는 v1 형태 줄. 파싱은 성공해야 하고(그래야 사유가 정확해진다)
+    // 검증은 포맷 불일치로 거부해야 한다
+    let raw = fs::read_to_string(s.path().join(CHAIN_FILE)).unwrap();
+    let mut body = String::new();
+    for line in raw.lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        value.as_object_mut().unwrap().remove("v");
+        body.push_str(&serde_json::to_string(&value).unwrap());
+        body.push('\n');
+    }
+    fs::write(s.path().join(CHAIN_FILE), body).unwrap();
+
+    let err = verify_dir(s.path()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            airlock_audit::Failure::FormatVersionUnsupported { seq: 0, got: 1 }
+        ),
+        "v1 줄은 MalformedLine이 아니라 포맷 불일치로 보고되어야 함: {err}"
+    );
+    assert!(
+        !matches!(err, airlock_audit::Failure::MalformedLine { .. }),
+        "사유가 '필드 누락'으로 뭉개지면 7.9가 닫히지 않음: {err}"
+    );
+}
+
+#[test]
+fn v1_domain_bytes_never_match_a_v2_entry() {
+    let s = Scratch::new("v-domain");
+    build_chain(s.path(), Enforcement::Landlock);
+
+    let entries = read_entries(s.path());
+    let e = &entries[1];
+
+    // 진짜 v1 검증자가 계산하던 바이트열의 앞부분. 도메인이 다르고 u32(v)가 없다
+    let mut v1 = Encoder::with_domain(b"airlock.audit.v1\x00");
+    v1.u64(e.seq)
+        .bytes(e.prev.as_bytes())
+        .u64(e.ts)
+        .bytes(e.session.as_bytes())
+        .str(&e.actor);
+    let mut v2 = Encoder::with_domain(airlock_audit::DOMAIN);
+    v2.u32(e.v)
+        .u64(e.seq)
+        .bytes(e.prev.as_bytes())
+        .u64(e.ts)
+        .bytes(e.session.as_bytes())
+        .str(&e.actor);
+    assert_ne!(
+        v1.finish(),
+        v2.finish(),
+        "도메인까지 올리지 않으면 버전 신호가 단일 실패 지점이 됨"
+    );
+
+    // v만 1로 낮춰 다시 봉인해도 v2 도메인 위에서 계산되므로 v1 바이트와 무관하다
+    let mut downgraded = e.clone();
+    downgraded.v = 1;
+    assert_ne!(downgraded.recompute_hash(), e.hash);
+}
+
+// ---------- v2에서 늘어난 필드가 실제로 해시에 들어가는가 ----------
+
+fn sealed(event: Event) -> Entry {
+    Entry::seal(
+        0,
+        1_700_000_000_000_000_000,
+        SessionId::from_bytes([0xAB; 16]),
+        Enforcement::Landlock,
+        Hash::ZERO,
+        Record::new("airlock", event, Decision::Allow),
+    )
+}
+
+fn session_start(
+    uid: u32,
+    euid: u32,
+    operator: Option<&str>,
+    policy_signer: Option<&str>,
+) -> Event {
+    Event::SessionStart {
+        airlock_version: "0.1.0".into(),
+        argv: vec!["airlock".into(), "run".into()],
+        cwd: "/Users/me/work".into(),
+        policy_digest: Hash::from_bytes([0x42; 32]),
+        policy_source: Some("airlock.toml".into()),
+        fsync_per_entry: true,
+        mediation: Mediation::ExecNet,
+        uid,
+        euid,
+        operator: operator.map(str::to_string),
+        policy_signer: policy_signer.map(str::to_string),
+    }
+}
+
+#[test]
+fn genesis_identity_fields_are_hashed() {
+    let base = sealed(session_start(501, 501, None, None)).hash;
+
+    assert_ne!(base, sealed(session_start(0, 501, None, None)).hash, "uid");
+    assert_ne!(base, sealed(session_start(501, 0, None, None)).hash, "euid");
+    assert_ne!(
+        base,
+        sealed(session_start(501, 501, Some("felix"), None)).hash,
+        "operator"
+    );
+    assert_ne!(
+        base,
+        sealed(session_start(501, 501, None, Some("secops"))).hash,
+        "policy_signer"
+    );
+    assert_ne!(
+        sealed(session_start(501, 0, None, None)).hash,
+        sealed(session_start(0, 501, None, None)).hash,
+        "uid와 euid가 뒤바뀐 두 세션이 같은 해시를 가지면 안 됨"
+    );
+}
+
+#[test]
+fn approver_identity_is_hashed() {
+    let approval = |uid: Option<u32>, tty: Option<&str>| {
+        sealed(Event::Approval {
+            for_seq: 0,
+            granted: Granted::Approved,
+            note: Some("사용자 승인".into()),
+            approver_uid: uid,
+            approver_tty: tty.map(str::to_string),
+        })
+        .hash
+    };
+
+    let base = approval(None, None);
+    assert_ne!(base, approval(Some(501), None), "approver_uid");
+    assert_ne!(base, approval(None, Some("/dev/ttys004")), "approver_tty");
+    assert_ne!(
+        approval(Some(0), None),
+        approval(Some(501), None),
+        "승인자 uid를 바꿔치기해도 해시가 그대로면 책임 확인이 무의미함"
+    );
+}
+
+#[test]
+fn egress_summary_fields_are_hashed() {
+    let summary = |bytes_out: u64, bytes_in: u64, duration_ms: u64| {
+        sealed(Event::EgressSummary {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            protocol: airlock_audit::Protocol::Tls,
+            bytes_out,
+            bytes_in,
+            duration_ms,
+        })
+        .hash
+    };
+
+    let base = summary(1_024, 4_096, 250);
+    assert_ne!(base, summary(1_025, 4_096, 250), "bytes_out");
+    assert_ne!(base, summary(1_024, 4_097, 250), "bytes_in");
+    assert_ne!(base, summary(1_024, 4_096, 251), "duration_ms");
+    assert_ne!(
+        base,
+        summary(4_096, 1_024, 250),
+        "송신량과 수신량이 뒤바뀐 기록이 같은 해시를 가지면 반출량을 위조할 수 있음"
+    );
+}
+
+#[test]
+fn egress_summary_survives_a_full_chain_roundtrip() {
+    let s = Scratch::new("egress-summary");
+    let mut log = AuditLog::create(
+        s.path(),
+        SessionId::from_bytes([0xAB; 16]),
+        Enforcement::Landlock,
+        true,
+        genesis(),
+    )
+    .unwrap();
+    log.append(Record::new(
+        "pid:100 claude",
+        Event::Egress {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            protocol: airlock_audit::Protocol::Tls,
+        },
+        Decision::Allow,
+    ))
+    .unwrap();
+    let summary = log
+        .append(Record::new(
+            "airlock",
+            Event::EgressSummary {
+                host: "api.anthropic.com".into(),
+                port: 443,
+                protocol: airlock_audit::Protocol::Tls,
+                bytes_out: 12_345,
+                bytes_in: 67_890,
+                duration_ms: 1_200,
+            },
+            Decision::Allow,
+        ))
+        .unwrap();
+
+    let report = verify_dir(s.path()).unwrap();
+    assert_eq!(report.entries, 3);
+    assert_eq!(report.head_hash, summary.hash);
+
+    let entries = read_entries(s.path());
+    assert_eq!(entries[2].event.kind(), "egress_summary");
+    assert_eq!(entries[2].event.tag(), 0x13);
+    assert!(entries.iter().all(|e| e.v == 2));
+}
+
+#[test]
+fn genesis_records_the_observed_uid() {
+    let s = Scratch::new("genesis-uid");
+    build_chain(s.path(), Enforcement::Landlock);
+
+    let entries = read_entries(s.path());
+    match &entries[0].event {
+        Event::SessionStart {
+            uid,
+            euid,
+            operator,
+            policy_signer,
+            ..
+        } => {
+            // 감사 층이 직접 읽은 값이어야 한다. 호출자는 넘길 수 없다
+            //
+            // # Safety
+            // getuid(2)와 geteuid(2)는 인자가 없고 메모리를 건드리지 않으며 실패하지 않는다
+            let (real_uid, real_euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+            assert_eq!(*uid, real_uid);
+            assert_eq!(*euid, real_euid);
+            assert!(operator.is_none());
+            assert!(policy_signer.is_none());
+        }
+        other => panic!("제네시스가 session_start가 아님: {other:?}"),
+    }
 }

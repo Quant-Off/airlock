@@ -10,6 +10,14 @@ pub enum Error {
     Json(serde_json::Error),
     SessionDirExists(PathBuf),
     ChainMissing(PathBuf),
+    AnchorChainBroken {
+        path: PathBuf,
+        detail: String,
+    },
+    ReviewChainBroken {
+        path: PathBuf,
+        detail: String,
+    },
     SeqOverflow,
 }
 
@@ -33,6 +41,16 @@ impl fmt::Display for Error {
                 p.display()
             ),
             Self::ChainMissing(p) => write!(f, "{}에 chain.jsonl이 없음", p.display()),
+            Self::AnchorChainBroken { path, detail } => write!(
+                f,
+                "{} 앵커 체인이 이미 깨져 있음: {detail}. 깨진 체인 위에 이어 붙이면 그 뒤쪽이 정당해 보임",
+                path.display()
+            ),
+            Self::ReviewChainBroken { path, detail } => write!(
+                f,
+                "{} 확인 체인이 이미 깨져 있음: {detail}. 깨진 체인 위에 이어 붙이면 그 뒤쪽이 정당해 보임",
+                path.display()
+            ),
             Self::SeqOverflow => write!(f, "seq가 u64 범위를 넘음"),
         }
     }
