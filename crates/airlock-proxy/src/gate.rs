@@ -65,6 +65,28 @@ impl fmt::Display for Target {
     }
 }
 
+/// 중계되는 바이트 한 조각의 방향.
+///
+/// 지금은 바이트를 세는 데만 쓰이지만, 내용 검사기가 붙을 자리의 타입 경계이기도 합니다.
+/// TLS 종단과 시크릿 패턴 차단이 여기 걸리며, 같은 축이 `--mediate full` 의 파일 open
+/// 경로에도 그대로 나타납니다 (`docs/egress-proxy.md` 5절)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// 자식 -> 목적지. 반출 방향
+    Outbound,
+    /// 목적지 -> 자식. 수신 방향
+    Inbound,
+}
+
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Outbound => "outbound",
+            Self::Inbound => "inbound",
+        }
+    }
+}
+
 /// 목적지 하나를 판정하는 경계.
 ///
 /// 구현은 여러 스레드에서 동시에 불립니다. 승인 대기로 오래 막힐 수 있으며 그동안
@@ -76,6 +98,37 @@ pub trait EgressGate: Send + Sync + fmt::Debug {
     /// `port` - 목적지 포트
     /// `protocol` - 관측된 프로토콜 태그
     fn check(&self, host: &str, port: u16, protocol: Protocol) -> Decision;
+
+    /// 연결 하나가 끝났음을 알립니다.
+    ///
+    /// **판정이 아니라 사실 기록입니다.** 여기서 정책을 다시 평가하지 않습니다. 프록시는
+    /// 실제로 중계한 페이로드 바이트만 알며 TLS 레코드 오버헤드를 빼지 않습니다.
+    ///
+    /// 방향별 바이트를 세지 못한 연결에서는 이 훅을 **부르지 않습니다.** 0 은 "아무것도 나가지
+    /// 않았다" 는 사실 주장이라, 모르는 것을 0 으로 기록하면 감사 로그가 거짓 보증을 합니다
+    /// (`docs/egress-proxy.md` 4절).
+    ///
+    /// 기본 구현이 no-op 인 것은 의도된 것입니다. 결과를 기록할 곳이 없는 게이트가 이
+    /// 메서드 때문에 깨지면 안 됩니다.
+    ///
+    /// # Arguments
+    /// `host` - 요청 라인에서 읽은 호스트 문자열
+    /// `port` - 목적지 포트
+    /// `protocol` - 관측된 프로토콜 태그
+    /// `bytes_out` - 목적지로 실제로 써 넣은 바이트
+    /// `bytes_in` - 목적지에서 실제로 받은 바이트
+    /// `duration_ms` - 판정 직후부터 연결이 끝날 때까지의 밀리초
+    fn finished(
+        &self,
+        host: &str,
+        port: u16,
+        protocol: Protocol,
+        bytes_out: u64,
+        bytes_in: u64,
+        duration_ms: u64,
+    ) {
+        let _ = (host, port, protocol, bytes_out, bytes_in, duration_ms);
+    }
 }
 
 /// 전부 거부하는 게이트.
@@ -115,6 +168,20 @@ mod tests {
     fn allow_all_permits() {
         let g = AllowAll;
         assert!(g.check("example.com", 443, Protocol::Tls).permitted());
+    }
+
+    #[test]
+    fn the_default_finished_hook_is_a_no_op() {
+        // 결과를 기록할 곳이 없는 게이트가 이 메서드 때문에 깨지면 안 됩니다
+        let g = DenyAll;
+        g.finished("example.com", 443, Protocol::Tls, 1, 2, 3);
+    }
+
+    #[test]
+    fn directions_are_distinguishable() {
+        assert_ne!(Direction::Outbound, Direction::Inbound);
+        assert_eq!(Direction::Outbound.as_str(), "outbound");
+        assert_eq!(Direction::Inbound.as_str(), "inbound");
     }
 
     #[test]

@@ -16,6 +16,6 @@ pub mod gate;
 pub mod http;
 pub mod server;
 
-pub use gate::{Decision, EgressGate, Protocol, Target};
+pub use gate::{Decision, Direction, EgressGate, Protocol, Target};
 pub use http::{MAX_HEADERS, MAX_REQUEST_LINE, Reject, Request};
 pub use server::{ProxyServer, ServerOptions};

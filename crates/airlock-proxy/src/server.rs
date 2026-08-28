@@ -13,13 +13,16 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::gate::{EgressGate, Protocol, Target};
+use crate::gate::{Direction, EgressGate, Protocol, Target};
 use crate::http::{MAX_HEADERS, Reject, Request, parse_head};
 
 /// accept 루프가 정지 신호를 확인하는 간격
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// 릴레이 한 번에 옮기는 최대 바이트
+const RELAY_CHUNK: usize = 16 * 1024;
 
 /// 서버 동작 한도.
 #[derive(Debug, Clone)]
@@ -51,6 +54,7 @@ pub struct ProxyServer {
     listener: TcpListener,
     addr: SocketAddr,
     opts: ServerOptions,
+    live: Arc<AtomicUsize>,
 }
 
 impl ProxyServer {
@@ -70,6 +74,7 @@ impl ProxyServer {
             listener,
             addr,
             opts,
+            live: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -77,9 +82,18 @@ impl ProxyServer {
         self.addr
     }
 
+    /// 지금 살아 있는 중계 연결 수.
+    ///
+    /// 세션을 닫기 전에 결과 기록이 끝났는지 보려면 이 값이 0 이 되기를 기다려야 합니다.
+    /// 완료 훅은 연결 처리가 끝나기 직전에 불리므로, 0 이면 남은 결과가 없습니다.
+    /// `serve` 가 소유권을 가져가므로 그 전에 받아 두어야 합니다
+    pub fn live_connections(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.live)
+    }
+
     /// accept 루프를 돕니다. `stop`이 서면 돌아옵니다.
     pub fn serve(self, gate: Arc<dyn EgressGate>, stop: Arc<AtomicBool>) {
-        let live = Arc::new(AtomicUsize::new(0));
+        let live = Arc::clone(&self.live);
         while !stop.load(Ordering::Relaxed) {
             let client = match self.listener.accept() {
                 Ok((s, _)) => s,
@@ -151,6 +165,9 @@ fn handle(mut client: TcpStream, gate: &dyn EgressGate, own: SocketAddr, opts: &
         return;
     }
 
+    // 판정 직후부터 잽니다. 이름 해석과 목적지 연결도 그 연결이 붙잡고 있던 시간입니다
+    let started = Instant::now();
+
     let Some(addrs) = resolve(&target, own) else {
         respond(&mut client, "HTTP/1.1 502 Bad Gateway");
         return;
@@ -160,6 +177,9 @@ fn handle(mut client: TcpStream, gate: &dyn EgressGate, own: SocketAddr, opts: &
         return;
     };
 
+    // 헤드와 그 뒤에 딸려 온 바이트도 목적지로 나가는 바이트입니다. 빼고 세면 반출량이
+    // 실제보다 작게 보고됩니다
+    let mut preface: u64 = 0;
     match request {
         Request::Connect(_) => {
             if client
@@ -173,15 +193,32 @@ fn handle(mut client: TcpStream, gate: &dyn EgressGate, own: SocketAddr, opts: &
             if origin.write_all(&head).is_err() {
                 return;
             }
+            preface = preface.saturating_add(head.len() as u64);
         }
     }
     // 헤드 뒤에 딸려 온 바이트는 CONNECT면 터널 내용이고 평문이면 본문입니다.
     // 버리면 첫 요청이 조용히 잘립니다
-    if !rest.is_empty() && origin.write_all(&rest).is_err() {
-        return;
+    if !rest.is_empty() {
+        if origin.write_all(&rest).is_err() {
+            return;
+        }
+        preface = preface.saturating_add(rest.len() as u64);
     }
 
-    relay(client, origin);
+    // 세지 못한 연결에서는 훅을 부르지 않습니다. 0은 "아무것도 나가지 않았다" 는 사실
+    // 주장이라, 모르는 것을 0으로 남기면 감사 로그가 거짓 보증을 합니다
+    let Some((up, down)) = relay(client, origin) else {
+        return;
+    };
+    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    gate.finished(
+        &target.host,
+        target.port,
+        protocol,
+        preface.saturating_add(up),
+        down,
+        elapsed,
+    );
 }
 
 /// 헤드 끝까지만 읽고 그 뒤에 딸려 온 바이트를 함께 돌려줍니다.
@@ -241,8 +278,17 @@ fn respond(stream: &mut TcpStream, status_line: &str) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-/// 양방향 바이트 릴레이. 여기서부터는 내용을 해석하지 않습니다
-fn relay(client: TcpStream, origin: TcpStream) {
+/// 양방향 바이트 릴레이. v1 은 여기서부터 내용을 해석하지 않습니다.
+///
+/// 방향별로 실제 옮긴 바이트를 `(반출, 수신)` 으로 돌려줍니다. 어느 한 방향이라도 세지
+/// 못하면 `None` 입니다. 모르는 값을 0 으로 내면 호출부가 그것을 사실로 기록합니다.
+///
+/// # 다음 단계가 붙을 자리
+/// 내용 검사기는 [`pump`] 안의 읽기와 쓰기 사이에 들어갑니다. [`Direction`] 이 그 경계의
+/// 타입이며, TLS 종단과 시크릿 패턴 차단이 거기서 조각 하나를 보고 통과·차단을 정합니다.
+/// v1 에는 구현이 없습니다. CONNECT 터널을 열어 두는 한 조각은 암호문이고, 그것을 읽으려면
+/// 프록시가 인증서를 발급해 자식에게 신뢰시켜야 하며 그 결정은 이 층 밖입니다.
+fn relay(client: TcpStream, origin: TcpStream) -> Option<(u64, u64)> {
     // 릴레이 구간은 오래 조용할 수 있어 헤드용 타임아웃을 걷어 냅니다
     let _ = client.set_read_timeout(None);
     let _ = client.set_write_timeout(None);
@@ -250,7 +296,7 @@ fn relay(client: TcpStream, origin: TcpStream) {
     let _ = origin.set_write_timeout(None);
 
     let (Ok(mut client_w), Ok(mut origin_w)) = (client.try_clone(), origin.try_clone()) else {
-        return;
+        return None;
     };
     let mut client_r = client;
     let mut origin_r = origin;
@@ -258,14 +304,55 @@ fn relay(client: TcpStream, origin: TcpStream) {
     let up = thread::Builder::new()
         .name("airlock-proxy-up".into())
         .spawn(move || {
-            let _ = io::copy(&mut client_r, &mut origin_w);
+            let n = pump(&mut client_r, &mut origin_w, Direction::Outbound);
             let _ = origin_w.shutdown(Shutdown::Write);
-        });
-    let _ = io::copy(&mut origin_r, &mut client_w);
+            n
+        })
+        .ok();
+    let down = pump(&mut origin_r, &mut client_w, Direction::Inbound);
     let _ = client_w.shutdown(Shutdown::Write);
-    if let Ok(h) = up {
-        let _ = h.join();
+    // 스레드를 띄우지 못했거나 join 이 실패하면 반출량을 모릅니다. 수신 방향만 아는 채로
+    // 반출을 0으로 보고하지 않습니다
+    let up = up.and_then(|h| h.join().ok())?;
+    Some((up, down))
+}
+
+/// 한 방향으로 바이트를 옮기고 실제로 옮긴 양을 셉니다.
+///
+/// `io::copy` 를 쓰지 않는 이유는 실패로 끝난 복사가 바이트 수를 통째로 버리기 때문입니다.
+/// RST 로 끊긴 연결이 "0 바이트 반출" 로 보고되면 그것이 정확히 반출 탐지의 구멍이 됩니다.
+///
+/// 목적지에 **완전히 써 넣은** 조각만 셉니다. `write_all` 이 도중에 실패하면 몇 바이트가
+/// 나갔는지 알 방법이 없으므로 그 조각은 세지 않습니다. 곧 이 값은 하한이며, 오차는 조각
+/// 하나(`RELAY_CHUNK`)를 넘지 않습니다.
+///
+/// # Arguments
+/// `src` - 읽을 쪽
+/// `dst` - 쓸 쪽
+/// `direction` - 이 조각의 방향. 내용 검사기가 붙을 자리의 타입 경계
+fn pump(src: &mut TcpStream, dst: &mut TcpStream, direction: Direction) -> u64 {
+    let mut buf = [0u8; RELAY_CHUNK];
+    let mut total: u64 = 0;
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let Some(chunk) = buf.get(..n) else { break };
+
+        // 내용 검사기(ContentInspector)가 붙을 자리입니다. `direction` 과 `chunk` 를 받아
+        // 통과·차단을 정하며, 차단이면 여기서 루프를 끊고 연결을 닫습니다. v1 에는 구현이
+        // 없고 조각은 손대지 않은 채 그대로 나갑니다
+        let _ = direction;
+
+        if dst.write_all(chunk).is_err() {
+            break;
+        }
+        total = total.saturating_add(n as u64);
     }
+    total
 }
 
 #[cfg(test)]
@@ -275,10 +362,21 @@ mod tests {
     use std::io::BufRead;
     use std::sync::Mutex;
 
+    /// 완료 훅이 남긴 사실
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Finished {
+        host: String,
+        port: u16,
+        protocol: Protocol,
+        bytes_out: u64,
+        bytes_in: u64,
+    }
+
     #[derive(Debug, Default)]
     struct Recorder {
         allow: bool,
         seen: Mutex<Vec<(String, u16, Protocol)>>,
+        done: Mutex<Vec<Finished>>,
     }
 
     impl Recorder {
@@ -286,10 +384,25 @@ mod tests {
             Arc::new(Self {
                 allow,
                 seen: Mutex::new(Vec::new()),
+                done: Mutex::new(Vec::new()),
             })
         }
         fn calls(&self) -> Vec<(String, u16, Protocol)> {
             self.seen.lock().map(|g| g.clone()).unwrap_or_default()
+        }
+        fn finished_calls(&self) -> Vec<Finished> {
+            self.done.lock().map(|g| g.clone()).unwrap_or_default()
+        }
+        /// 완료 훅은 릴레이 스레드에서 오므로 잠시 기다립니다
+        fn wait_finished(&self) -> Vec<Finished> {
+            for _ in 0..200 {
+                let got = self.finished_calls();
+                if !got.is_empty() {
+                    return got;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            self.finished_calls()
         }
     }
 
@@ -302,6 +415,26 @@ mod tests {
                 Decision::Allow
             } else {
                 Decision::Deny
+            }
+        }
+
+        fn finished(
+            &self,
+            host: &str,
+            port: u16,
+            protocol: Protocol,
+            bytes_out: u64,
+            bytes_in: u64,
+            _duration_ms: u64,
+        ) {
+            if let Ok(mut g) = self.done.lock() {
+                g.push(Finished {
+                    host: host.to_string(),
+                    port,
+                    protocol,
+                    bytes_out,
+                    bytes_in,
+                });
             }
         }
     }
@@ -485,6 +618,114 @@ mod tests {
         );
         assert_eq!(status(&resp), "HTTP/1.1 400 Bad Request");
         assert!(gate.calls().is_empty());
+    }
+
+    #[test]
+    fn a_tunnel_reports_the_bytes_it_actually_moved() {
+        // 루프백 에코 목적지로 실측합니다. 세는 값이 실제 전송량과 어긋나면 사후 모니터링이
+        // 있는 것처럼 보이기만 하고 아무것도 보증하지 않습니다
+        let payload = "x".repeat(40_000);
+        let reply = "y".repeat(9_000);
+        let l = TcpListener::bind(("127.0.0.1", 0)).expect("바인드");
+        let origin = l.local_addr().expect("주소");
+        let want_out = payload.len() as u64;
+        let want_in = reply.len() as u64;
+        let body = reply.clone();
+        let origin_h = thread::spawn(move || -> usize {
+            let Ok((mut s, _)) = l.accept() else { return 0 };
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            let _ = s.write_all(body.as_bytes());
+            let _ = s.shutdown(Shutdown::Write);
+            got.len()
+        });
+
+        let gate = Recorder::new(true);
+        let run = start(gate.clone());
+        let mut s = TcpStream::connect(run.addr).expect("프록시 연결");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        s.write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", origin.port()).as_bytes())
+            .expect("요청");
+
+        let mut r = io::BufReader::new(s.try_clone().expect("clone"));
+        let mut line = String::new();
+        r.read_line(&mut line).expect("상태 라인");
+        assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+        let mut blank = String::new();
+        r.read_line(&mut blank).expect("빈 줄");
+
+        s.write_all(payload.as_bytes()).expect("터널 쓰기");
+        s.shutdown(Shutdown::Write).expect("절반 닫기");
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).expect("터널 읽기");
+        assert_eq!(got.len(), reply.len());
+        let seen = origin_h.join().expect("origin 스레드");
+        assert_eq!(seen, payload.len(), "목적지가 받은 양");
+
+        let done = gate.wait_finished();
+        assert_eq!(done.len(), 1, "완료 훅이 한 번 와야 함: {done:?}");
+        let f = done.first().expect("완료 훅");
+        assert_eq!(f.host, "127.0.0.1");
+        assert_eq!(f.port, origin.port());
+        assert_eq!(f.protocol, Protocol::Tls);
+        assert_eq!(f.bytes_out, want_out, "반출 바이트가 실제와 다름");
+        assert_eq!(f.bytes_in, want_in, "수신 바이트가 실제와 다름");
+    }
+
+    #[test]
+    fn a_plaintext_request_counts_its_head_as_outbound() {
+        // 요청 헤드도 목적지로 나간 바이트입니다. 빼고 세면 반출량이 실제보다 작아집니다
+        let (origin, origin_h) = echo_origin("HTTP/1.1 204 No Content\r\n\r\n");
+        let gate = Recorder::new(true);
+        let run = start(gate.clone());
+        let req = format!(
+            "GET http://127.0.0.1:{}/a HTTP/1.1\nHost: h\n\n",
+            origin.port()
+        );
+        send(run.addr, &req);
+
+        let raw = origin_h
+            .join()
+            .expect("origin 스레드")
+            .expect("origin 수신");
+        let done = gate.wait_finished();
+        let f = done.first().expect("완료 훅");
+        assert_eq!(
+            f.bytes_out,
+            raw.len() as u64,
+            "목적지가 받은 헤드 길이와 반출 바이트가 같아야 함"
+        );
+        assert_eq!(f.protocol, Protocol::Http);
+    }
+
+    #[test]
+    fn a_denied_target_never_reports_a_result() {
+        // 나가지 않은 연결에 0 바이트 결과를 남기면 "시도했으나 아무것도 안 나갔다" 는
+        // 없는 사실이 로그에 생깁니다
+        let gate = Recorder::new(false);
+        let run = start(gate.clone());
+        send(run.addr, "CONNECT api.anthropic.com:443 HTTP/1.1\n\n");
+        thread::sleep(Duration::from_millis(50));
+        assert!(gate.finished_calls().is_empty());
+    }
+
+    #[test]
+    fn an_unreachable_origin_never_reports_a_result() {
+        let gate = Recorder::new(true);
+        let run = start(gate.clone());
+        let dead = TcpListener::bind(("127.0.0.1", 0)).expect("바인드");
+        let port = dead.local_addr().expect("주소").port();
+        drop(dead);
+        send(run.addr, &format!("CONNECT 127.0.0.1:{port} HTTP/1.1\n\n"));
+        thread::sleep(Duration::from_millis(50));
+        assert!(gate.finished_calls().is_empty());
     }
 
     #[test]
