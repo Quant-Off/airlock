@@ -13,8 +13,8 @@
 
 구현의 정본입니다. 코드와 어긋나면 규격이 옳습니다.
 
-- [audit-format.md](audit-format.md) 해시체인 감사 로그 포맷 `airlock.audit.v1`
-- [policy-dsl.md](policy-dsl.md) capability 정책 DSL과 평가 의미론 `airlock.policy.v1`
+- [audit-format.md](audit-format.md) 해시체인 감사 로그 포맷 `airlock.audit.v2`, 세션 상위 앵커 체인 `airlock.anchor.v1`, 매일 이상여부 점검과 책임자 확인 체인 `airlock.review.v1`
+- [policy-dsl.md](policy-dsl.md) capability 정책 DSL과 평가 의미론 `airlock.policy.v2`
 - [egress-proxy.md](egress-proxy.md) 호스트 단위 egress 강제와 프록시 프로토콜 `airlock.proxy.v1`
 
 ## 저장소 루트
