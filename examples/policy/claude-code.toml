@@ -21,10 +21,14 @@ name = "claude-code"
 file = "deny"
 exec = "allow"
 egress = "deny" # allow는 문법 수준에서 금지됨
+# 기본값과 같지만 명시합니다. 프리셋은 규격을 사람에게 보여 주는 문서입니다.
+# 아래 egress allow 는 전부 443 이고 protocol 을 적지 않았습니다. 프로토콜 조건은
+# egress 프록시 층이 붙어야 의미가 생기고, 없는 세션에서는 규칙이 통째로 죽습니다.
+egress_plaintext = "deny"
 
 # exec 기본값이 allow여도 베이스라인의 위험 exec ask는 그대로 살아 있습니다.
 # 사용자 규칙(2티어)이 아니라 [defaults](4티어)로 여는 것이라 sudo, rm -rf,
-# curl 파이프 셸 같은 3티어 ask가 먼저 매칭됩니다.
+# curl 파이프 쉘 같은 3티어 ask가 먼저 매칭됩니다.
 
 #
 # 작업 공간
@@ -64,7 +68,7 @@ action = "allow"
 #
 # Claude Code 상태
 #
-# 세션, 히스토리, 설정, 셸 스냅샷이 전부 여기 있어 쓰기가 필요합니다.
+# 세션, 히스토리, 설정, 쉘 스냅샷이 전부 여기 있어 쓰기가 필요합니다.
 # ~/.claude.json은 MCP 서버 목록과 프로젝트 상태를 담습니다.
 [[rules]]
 id = "claude-state"
