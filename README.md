@@ -30,6 +30,10 @@ $ airlock run -- claude
 # Verify and inspect what happened
 $ airlock audit verify
 $ airlock audit show --decisions-only
+
+# Run the day's check, then stamp it as reviewed
+$ airlock audit report --json
+$ airlock audit ack --note "daily check"
 ```
 
 If there is no policy file, only the built-in baseline applies. Airlock looks for `airlock.toml` or `.airlock.toml` in the current directory, and falls back to `~/.config/airlock/policy.toml`, in that order. It does not walk up to parent directories. Examples live in `examples/policy/`. Editing an example to fit your setup is the recommended way to start.
@@ -65,16 +69,18 @@ Airlock does not leave what it fails to enforce to the documentation alone. When
 
 The big ones to know about right now are these.
 
-- **macOS cannot record the actions of child processes.**
-  - With no mediation mechanism, only the single process that `airlock run` launches directly ends up in the audit log. The `--mediate` value is accepted but not applied, and that fact is recorded in the banner and in the audit log.
+- **macOS records only the outbound connections of child processes.**
+  - With no mediation mechanism, what children execute and which files they open never reaches the audit log. Outbound is the exception: under `--egress-proxy` the proxy is itself the gate, so a child's connection is decided and recorded no matter what the mediation level says. The `--mediate` value is accepted but not applied, and that fact is recorded in the banner and in the audit log.
 - **Host level egress on Linux is still bypassable.**
   - `--egress-proxy` narrows the Landlock ports down to the proxy alone, but a child that connects out directly on the same port skips the proxy. Network namespace isolation has to land before this becomes the same boundary as on macOS.
 - **Tunnel contents are not inspected.**
-  - The proxy does not terminate TLS, so what you send to an allowed host is not examined. DLP is not implemented.
-- **exec rules are not a security boundary.**
-  - argv matching is bypassable in principle, and it exists as a tripwire that shows dangerous intent to a human early. The real defense comes from the file rules and the egress rules.
-- **The audit log does not detect an attacker who can recompute the entire chain.**
-  - The real defense comes from combining it with the enforcement layer denying the agent write access to the audit directory.
+  - The proxy does not terminate TLS, so what you send to an allowed host is not examined. DLP is not implemented. What is recorded is metadata: bytes out, bytes in, and duration per destination. `max_bytes_out` can cap the cumulative total for a destination, but since the byte count is only known once a connection closes, it takes effect from the next connection onward.
+- **Plaintext outbound is blocked only under `--egress-proxy`.**
+  - `[defaults].egress_plaintext` defaults to `deny`, and a rule that names only a host no longer opens plaintext. To allow it you have to write `protocol = "http"` yourself. But the mediation layer only sees `connect(2)` and reports every connection as `tcp`, so without the proxy the plaintext floor never fires at all.
+- **exec argv conditions are not a security boundary.**
+  - The program path now is one. When `[defaults].exec` is not `allow`, both platforms grant execute permission only to the whitelist, so a binary the agent writes into the workspace cannot be run. What stays outside the kernel is argv matching (`rm -rf`, ...), which exists as a tripwire that shows dangerous intent to a human early. On Linux the dynamic linker itself needs execute permission, so `/lib` and `/usr/lib` are opened as whole trees, and `mmap(PROT_EXEC)` is not mediated by Landlock at all.
+- **The audit log detects chain recomputation only when the anchor is kept elsewhere.**
+  - Each session's final head is appended to a separate anchor chain. Point `--anchor-dir` at another volume and deleting a whole session or recomputing a chain is detected. Leave it inside the audit root and whoever can recompute the chain recomputes the anchor at the same cost.
 
 The full list, with rationale and code locations, is in [limitations.md](docs/limitations.md). For the per-platform comparison of enforcement scope, see INTRODUCTION.md.
 

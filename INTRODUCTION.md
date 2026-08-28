@@ -19,7 +19,13 @@ The table below is both the current implementation status and the list of what r
 | Runtime mediation (seccomp user notification)     | **Implemented** | **Linux only.** Records the exec, connect, and file opens of child processes |
 | Host level egress enforcement (macOS)             | **Implemented** | `--egress-proxy`. Narrows outbound down to a single local proxy              |
 | Host level egress enforcement (Linux)             |     Partial     | Port narrowing only. Bypassable until network namespace isolation lands      |
-| Egress DLP (blocking secret patterns)             | Not implemented | The proxy does not terminate TLS                                             |
+| exec whitelist (kernel enforced)                  | **Implemented** | Both platforms. Applies only when `[defaults].exec` is not `allow`           |
+| Plaintext outbound blocking                       | **Implemented** | Only under `--egress-proxy`. The mediation layer cannot see the protocol     |
+| Session level anchor chain                        | **Implemented** | Only gains detection power once `--anchor-dir` points elsewhere              |
+| Daily check report and reviewer sign off          | **Implemented** | `audit report`, `audit ack`. Never reports "cannot detect" as a pass         |
+| Per destination egress volume and a byte cap      | **Implemented** | Proxy only. The cap takes effect from the next connection onward             |
+| Egress DLP (content based secret patterns)        | Not implemented | The proxy does not terminate TLS. Only metadata is recorded                  |
+| Encryption of the audit log at rest               | Not implemented | Plaintext at 0600. Only the "envelope outside the chain" path is reserved    |
 | MCP proxy layer                                   | Not implemented |                                                                              |
 
 ## Enforcement scope per platform
@@ -29,14 +35,18 @@ Enforcement scope differs from platform to platform, and the same policy file do
 | Policy kind                          | Linux (Landlock + seccomp)                                   | macOS (Seatbelt)                                  |
 |--------------------------------------|--------------------------------------------------------------|---------------------------------------------------|
 | File paths                           | Kernel enforced (per inode)                                  | Kernel enforced (per canonical path)              |
-| exec path and file name              | Not kernel enforced. The mediation layer records it and asks | **Kernel enforced** (`deny` only, not `ask`)      |
+| exec path and file name              | **Kernel enforced** (whitelist)                              | **Kernel enforced** (whitelist)                   |
 | exec argv conditions (`rm -rf`, ...) | The mediation layer records it and asks                      | Neither enforced nor recorded                     |
 | Blocking outbound as a whole         | Kernel enforced                                              | Kernel enforced                                   |
 | Port level egress                    | Kernel enforced (ABI v4 or later)                            | Not enforced                                      |
 | Host level egress                    | Observed with `--egress-proxy`. Bypassable                   | **Kernel enforced** with `--egress-proxy`         |
-| Recording child process behavior     | Turned on with `--mediate` (exec and connect by default)     | **Not recorded.** There is no mediation mechanism |
+| Plaintext outbound blocking          | Only under `--egress-proxy`                                  | Only under `--egress-proxy`                       |
+| Per destination egress volume        | `--egress-proxy` only                                        | `--egress-proxy` only                             |
+| Recording child process exec         | Turned on with `--mediate` (on by default)                   | **Not recorded.** There is no mediation mechanism |
+| Recording child process outbound     | Turned on with `--mediate`, or via `--egress-proxy`          | Recorded under `--egress-proxy`, not otherwise    |
+| Recording child process file opens   | Turned on with `--mediate full`                              | **Not recorded.** There is no mediation mechanism |
 
-In other words, on macOS only the single process that `airlock run` launches directly ends up in the audit log, and what the children underneath it execute and where they connect does not. The `--mediate` value is not applied on macOS, and that fact is recorded both in the banner and in the genesis entry of the audit log.
+In other words, on macOS what the children underneath execute and which files they open does not end up in the audit log. Where they connect is the exception: the egress proxy is a gate inside the broker rather than a kernel mediation mechanism, so under `--egress-proxy` a child's outbound connection is decided and recorded even though the mediation level is `off`. The `--mediate` value is not applied on macOS, and that fact is recorded both in the banner and in the genesis entry of the audit log.
 
 Airlock does not leave what it has not implemented to the documentation alone. When `airlock run` starts, it prints for itself what is not enforced in that session.
 
@@ -61,7 +71,9 @@ The CLI itself prints in Korean. The banner above, and the command output shown 
 
 ### What the audit log detects
 
-The audit log detects modified entry contents, reordering, deletion from the middle, insertion with the hash resealed, truncation of the tail, and entries transplanted from another session. It does **not** detect an attacker who can recompute the entire chain from the beginning.
+The audit log detects modified entry contents, reordering, deletion from the middle, insertion with the hash resealed, truncation of the tail, and entries transplanted from another session. The format version is bound into the hash, so **an old format chain is distinguishable from a forged one**, and there is no way to downgrade the version to pull in older verification rules.
+
+An attacker who can recompute the entire chain from the beginning is **not** detected by a session log alone. That is why each session's final head is appended to a higher level anchor chain (`anchors.jsonl`). Point `--anchor-dir` at **another volume or a remote mount** and deleting a whole session or recomputing a chain is detected. Leave it inside the audit root and whoever can recompute the chain recomputes the anchor at the same cost, which is why the `airlock run` banner says so every time.
 
 The audit log is not complete on its own. The real defense comes from combining it with the enforcement layer denying the agent write access to the audit directory (tier 0 below). Section 2 of `docs/audit-format.md` is the normative statement of the exact scope.
 

@@ -28,15 +28,21 @@ In other words, the following **are treated as vulnerabilities.**
 - An audit log entry is modified, deleted, or inserted, and `airlock audit verify` still passes
 - An approval prompt presents a string produced by the agent as if it were a fact observed by the broker
 - An unenforced rule is reported as if it were enforced. This includes non-enforcement that does not appear in the banner and the gap list
+- `airlock audit report` exits clean on a tampered chain. Reporting "cannot detect" as a pass counts too
+- An automatic approval (`--yes`) is displayed as a human approval, or lands in the review record as one
 
 ## What is not a vulnerability
 
 The following are known limitations, and they are the scope Airlock itself declares in its banner and its documentation. You are entirely welcome to report them, but they behave that way by design.
 
-- An attacker with write access to the audit directory recomputes the entire chain from the beginning. Section 2 of `docs/audit-format.md` defines this boundary
+- An attacker with write access to **both** the audit directory and the anchor directory recomputes the chain and the anchor together. Unless `--anchor-dir` points elsewhere, that condition holds by default. Section 2 of `docs/audit-format.md` defines this boundary
 - Host level egress policy is not enforced. With no proxy layer, enforcement reaches only the port (Linux), or only allowing or blocking outbound traffic as a whole (macOS)
+- Plaintext outbound is not blocked in a session running without the proxy. The mediation layer only sees `connect(2)` and reports every connection as `tcp`, so the plaintext floor never fires
+- In exec whitelist mode the `/lib` and `/usr/lib` trees are opened for execution as a whole, because the dynamic linker needs `Execute`. `mmap(PROT_EXEC)` is not mediated by Landlock at all
+- The connection that crosses a `max_bytes_out` cap is not itself blocked. The byte count is only known once a connection closes, so the cap applies from the next connection onward
+- The `reviewer_uid` in the review record (`reviews.jsonl`) names an account, not a person. Nothing at this layer stops a cron job from calling `audit ack` every day
 - On macOS, `ask` rules are lowered to deny in the kernel profile. Seatbelt cannot express human approval
-- On macOS, individual exec, connect, and file access by child processes are not recorded in the audit log. There is no runtime mediation mechanism
+- On macOS, the individual exec and file access of child processes are not recorded in the audit log. There is no runtime mediation mechanism. Outbound connections are the exception: under `--egress-proxy` the proxy itself decides and records them
 - The path read by the mediation layer (seccomp user notification) may differ from the target the kernel actually opens (TOCTOU). The real boundary for file access is Landlock
 - An access that Landlock denies in the kernel is not itself recorded in the audit log
 - An attacker who already holds root, kernel vulnerabilities, and physical access
