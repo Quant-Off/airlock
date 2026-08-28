@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::glob::{Pattern, TextPattern};
 use crate::host::HostPattern;
-use crate::model::{Action, FileMode, Kind, ModeSet, Tier};
+use crate::model::{Action, FileMode, Kind, ModeSet, Protocol, Tier};
 
 pub const ARGV_JOIN: char = '\u{0}';
 
@@ -52,6 +52,18 @@ pub enum Matcher {
     Egress {
         host: HostPattern,
         port: Option<u16>,
+        /// `None`은 모든 프로토콜에 매칭한다는 뜻입니다.
+        ///
+        /// 평문 바닥은 이 값이 `None`인지 아닌지를 보고 발동합니다. 호스트만 적은
+        /// 규칙이 평문까지 암묵적으로 열지 않게 하는 축입니다 (`docs/policy-dsl.md` 8.2절)
+        protocol: Option<Protocol>,
+        /// 이 세션에서 이 목적지로 누적 반출할 수 있는 바이트 상한입니다.
+        ///
+        /// 매칭 조건이 아니라 **한도**입니다. 이 값이 있어도 규칙은 평소대로 매칭되고,
+        /// 누적량이 넘은 뒤의 판정만 `deny`로 내려갑니다. 바이트 수는 연결이 끝나야 알 수
+        /// 있으므로 한도를 넘긴 그 연결 자체는 막지 못하고 **다음 연결부터** 막힙니다
+        /// (`docs/policy-dsl.md` 8.4절)
+        max_bytes_out: Option<u64>,
     },
 }
 
@@ -96,10 +108,25 @@ impl Matcher {
                 }
                 parts.join(" ")
             }
-            Self::Egress { host, port } => match port {
-                Some(p) => format!("{}:{p}", host.raw()),
-                None => host.raw(),
-            },
+            Self::Egress {
+                host,
+                port,
+                protocol,
+                max_bytes_out,
+            } => {
+                let base = match port {
+                    Some(p) => format!("{}:{p}", host.raw()),
+                    None => host.raw(),
+                };
+                let with_protocol = match protocol {
+                    Some(p) => format!("{base} [{}]", p.as_str()),
+                    None => base,
+                };
+                match max_bytes_out {
+                    Some(limit) => format!("{with_protocol} [max_bytes_out={limit}]"),
+                    None => with_protocol,
+                }
+            }
         }
     }
 }
@@ -117,6 +144,7 @@ pub enum Query<'a> {
     Egress {
         host: &'a str,
         port: u16,
+        protocol: Protocol,
     },
 }
 
@@ -206,9 +234,26 @@ impl Rule {
                 }
                 true
             }
-            (Matcher::Egress { host, port }, Query::Egress { host: h, port: p }) => {
+            (
+                Matcher::Egress {
+                    host,
+                    port,
+                    protocol,
+                    ..
+                },
+                Query::Egress {
+                    host: h,
+                    port: p,
+                    protocol: q,
+                },
+            ) => {
                 if let Some(want) = port
                     && want != p
+                {
+                    return false;
+                }
+                if let Some(want) = protocol
+                    && want != q
                 {
                     return false;
                 }
@@ -321,7 +366,8 @@ mod tests {
         }));
         assert!(!r.matches(&Query::Egress {
             host: "example.com",
-            port: 443
+            port: 443,
+            protocol: Protocol::Tls
         }));
     }
 
@@ -381,50 +427,75 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn egress_port_narrows_the_rule() {
-        let with_port = Rule {
+    fn egress_rule(
+        host: &str,
+        port: Option<u16>,
+        protocol: Option<Protocol>,
+        action: Action,
+    ) -> Rule {
+        Rule {
             id: "e".into(),
             tier: Tier::User,
-            action: Action::Allow,
+            action,
             reason: None,
             overrides: None,
             matcher: Matcher::Egress {
-                host: HostPattern::parse("api.anthropic.com").unwrap(),
-                port: Some(443),
+                host: HostPattern::parse(host).unwrap(),
+                port,
+                protocol,
+                max_bytes_out: None,
             },
-        };
-        assert!(with_port.matches(&Query::Egress {
-            host: "api.anthropic.com",
-            port: 443
-        }));
-        assert!(!with_port.matches(&Query::Egress {
-            host: "api.anthropic.com",
-            port: 80
-        }));
+        }
+    }
+
+    fn egress_query(host: &str, port: u16, protocol: Protocol) -> Query<'_> {
+        Query::Egress {
+            host,
+            port,
+            protocol,
+        }
+    }
+
+    #[test]
+    fn egress_port_narrows_the_rule() {
+        let with_port = egress_rule("api.anthropic.com", Some(443), None, Action::Allow);
+        assert!(with_port.matches(&egress_query("api.anthropic.com", 443, Protocol::Tls)));
+        assert!(!with_port.matches(&egress_query("api.anthropic.com", 80, Protocol::Tls)));
     }
 
     #[test]
     fn egress_without_port_matches_any_port() {
-        let r = Rule {
-            id: "e".into(),
-            tier: Tier::User,
-            action: Action::Deny,
-            reason: None,
-            overrides: None,
-            matcher: Matcher::Egress {
-                host: HostPattern::parse("*").unwrap(),
-                port: None,
-            },
-        };
-        assert!(r.matches(&Query::Egress {
-            host: "x.com",
-            port: 1
-        }));
-        assert!(r.matches(&Query::Egress {
-            host: "x.com",
-            port: 65535
-        }));
+        let r = egress_rule("*", None, None, Action::Deny);
+        assert!(r.matches(&egress_query("x.com", 1, Protocol::Tcp)));
+        assert!(r.matches(&egress_query("x.com", 65535, Protocol::Tcp)));
+    }
+
+    #[test]
+    fn egress_without_protocol_matches_every_protocol() {
+        let r = egress_rule("x.com", None, None, Action::Allow);
+        for p in Protocol::ALL {
+            assert!(r.matches(&egress_query("x.com", 443, p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn egress_protocol_narrows_the_rule() {
+        let tls_only = egress_rule("x.com", None, Some(Protocol::Tls), Action::Allow);
+        assert!(tls_only.matches(&egress_query("x.com", 443, Protocol::Tls)));
+        assert!(!tls_only.matches(&egress_query("x.com", 443, Protocol::Http)));
+        assert!(!tls_only.matches(&egress_query("x.com", 443, Protocol::Tcp)));
+    }
+
+    #[test]
+    fn egress_describe_reveals_protocol() {
+        let r = egress_rule("x.com", Some(80), Some(Protocol::Http), Action::Allow);
+        assert_eq!(r.matcher.describe(), "x.com:80 [http]");
+
+        let no_port = egress_rule("x.com", None, Some(Protocol::Tls), Action::Allow);
+        assert_eq!(no_port.matcher.describe(), "x.com [tls]");
+
+        let bare = egress_rule("x.com", Some(443), None, Action::Allow);
+        assert_eq!(bare.matcher.describe(), "x.com:443");
     }
 
     #[test]

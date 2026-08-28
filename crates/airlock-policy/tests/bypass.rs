@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use airlock_policy::error::LoadError;
-use airlock_policy::{Action, FileMode, LoadContext, LoadWarning, Policy, Tier};
+use airlock_policy::{Action, FileMode, LoadContext, LoadWarning, Policy, Protocol, Tier};
 use unicode_normalization::UnicodeNormalization;
 
 struct Home {
@@ -56,6 +56,10 @@ fn read(policy: &Policy, home: &Home, raw: &str) -> Action {
     policy
         .evaluate_file(Path::new(raw), FileMode::Read, home.path())
         .action
+}
+
+fn egress(policy: &Policy, host: &str, port: u16, protocol: Protocol) -> Action {
+    policy.evaluate_egress(host, port, protocol).action
 }
 
 // ---------- 평가 의미론 ----------
@@ -184,7 +188,7 @@ egress = "deny"
     assert_eq!(ev.action, Action::Deny);
     assert!(ev.rule.is_none(), "기본값 적용 시 규칙 귀속이 없어야 함");
 
-    assert_eq!(p.evaluate_egress("example.com", 443).action, Action::Deny);
+    assert_eq!(egress(&p, "example.com", 443, Protocol::Tcp), Action::Deny);
 }
 
 // ---------- 경로 정규화 적대적 시나리오 ----------
@@ -1000,26 +1004,393 @@ action = "allow"
     let p = Policy::load_str(src, &h.ctx()).unwrap();
 
     assert_eq!(
-        p.evaluate_egress("api.anthropic.com", 443).action,
+        egress(&p, "api.anthropic.com", 443, Protocol::Tls),
         Action::Allow
     );
     assert_eq!(
-        p.evaluate_egress("api.anthropic.com", 80).action,
+        egress(&p, "api.anthropic.com", 80, Protocol::Tls),
         Action::Deny
     );
     assert_eq!(
-        p.evaluate_egress("raw.githubusercontent.com", 443).action,
+        egress(&p, "raw.githubusercontent.com", 443, Protocol::Tls),
         Action::Allow
     );
     assert_eq!(
-        p.evaluate_egress("githubusercontent.com", 443).action,
+        egress(&p, "githubusercontent.com", 443, Protocol::Tls),
         Action::Deny
     );
     assert_eq!(
-        p.evaluate_egress("exfiltrate.example.com", 443).action,
+        egress(&p, "exfiltrate.example.com", 443, Protocol::Tls),
         Action::Deny
     );
-    assert_eq!(p.evaluate_egress("93.184.216.34", 443).action, Action::Deny);
+    assert_eq!(
+        egress(&p, "93.184.216.34", 443, Protocol::Tls),
+        Action::Deny
+    );
+}
+
+// ---------- 평문 아웃바운드 바닥 ----------
+
+/// 호스트만 적은 allow 규칙이 평문까지 함께 여는지 봅니다.
+///
+/// 이것이 열리면 제로트러스트 게이트웨이가 평문을 정상 경로로 중계합니다.
+/// docs/policy-dsl.md 8.2절이 규정한 핵심 회귀입니다
+#[test]
+fn host_only_allow_does_not_open_plaintext() {
+    let h = Home::new("plaintext-floor");
+    let src = r#"
+version = 1
+[defaults]
+egress = "deny"
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+
+    assert_eq!(
+        egress(&p, "mirror.example.com", 80, Protocol::Http),
+        Action::Deny,
+        "호스트만 적은 allow가 평문까지 열면 안 됨"
+    );
+    assert_eq!(
+        egress(&p, "mirror.example.com", 443, Protocol::Http),
+        Action::Deny,
+        "포트가 443이어도 관측된 프로토콜이 평문이면 막아야 함"
+    );
+}
+
+#[test]
+fn host_only_allow_still_permits_tls() {
+    let h = Home::new("plaintext-tls-ok");
+    let src = r#"
+version = 1
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+
+    assert_eq!(
+        egress(&p, "mirror.example.com", 443, Protocol::Tls),
+        Action::Allow
+    );
+    assert_eq!(
+        egress(&p, "mirror.example.com", 443, Protocol::Tcp),
+        Action::Allow,
+        "중계 층이 넘기는 tcp는 평문으로 단정하지 않음"
+    );
+}
+
+#[test]
+fn explicit_http_rule_opens_plaintext() {
+    let h = Home::new("plaintext-explicit");
+    let src = r#"
+version = 1
+[defaults]
+egress = "deny"
+[[rules]]
+id = "legacy-mirror"
+kind = "egress"
+host = "mirror.example.com"
+port = 80
+protocol = "http"
+action = "allow"
+reason = "TLS를 지원하지 않는 사내 미러"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    let ev = p.evaluate_egress("mirror.example.com", 80, Protocol::Http);
+
+    assert_eq!(
+        ev.action,
+        Action::Allow,
+        "사람이 protocol = \"http\"를 명시했으면 바닥을 씌우지 않음"
+    );
+    assert_eq!(
+        ev.rule.as_ref().map(|r| r.id.as_str()),
+        Some("legacy-mirror")
+    );
+}
+
+#[test]
+fn tls_only_rule_never_matches_a_plaintext_query() {
+    let h = Home::new("plaintext-tls-rule");
+    let src = r#"
+version = 1
+[defaults]
+egress = "deny"
+[[rules]]
+id = "tls-only"
+kind = "egress"
+host = "mirror.example.com"
+protocol = "tls"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+
+    assert_eq!(
+        egress(&p, "mirror.example.com", 443, Protocol::Tls),
+        Action::Allow
+    );
+    assert_eq!(
+        egress(&p, "mirror.example.com", 80, Protocol::Http),
+        Action::Deny,
+        "protocol = \"tls\" 규칙은 평문 질의에 매칭되면 안 됨"
+    );
+}
+
+#[test]
+fn plaintext_floor_keeps_the_original_rule_visible() {
+    let h = Home::new("plaintext-trace");
+    let src = r#"
+version = 1
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    let ev = p.evaluate_egress("mirror.example.com", 80, Protocol::Http);
+    let rule = ev.rule.expect("바닥이 적용되어도 규칙 귀속이 있어야 함");
+
+    assert_eq!(rule.id, airlock_policy::PLAINTEXT_FLOOR_ID);
+    assert!(
+        rule.pattern.contains("mirror"),
+        "어느 규칙이 평문을 열려다 막혔는지 추적할 수 있어야 함: {}",
+        rule.pattern
+    );
+    assert!(rule.reason.is_some());
+}
+
+#[test]
+fn plaintext_floor_also_applies_when_defaults_answered() {
+    let h = Home::new("plaintext-defaults");
+    let src = r#"
+version = 1
+[defaults]
+egress = "ask"
+egress_plaintext = "deny"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+
+    assert_eq!(
+        egress(&p, "anything.example.com", 443, Protocol::Tls),
+        Action::Ask
+    );
+    assert_eq!(
+        egress(&p, "anything.example.com", 80, Protocol::Http),
+        Action::Deny,
+        "규칙이 없어 [defaults].egress가 답한 경우에도 바닥은 씌워짐"
+    );
+}
+
+#[test]
+fn plaintext_floor_never_loosens_a_decision() {
+    let h = Home::new("plaintext-no-loosen");
+    let src = r#"
+version = 1
+[defaults]
+egress = "deny"
+egress_plaintext = "allow"
+[[rules]]
+id = "blocked"
+kind = "egress"
+host = "evil.example.com"
+action = "deny"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+
+    assert_eq!(
+        egress(&p, "evil.example.com", 80, Protocol::Http),
+        Action::Deny,
+        "바닥은 상한이지 하한이 아님. deny를 allow로 되돌리면 안 됨"
+    );
+}
+
+#[test]
+fn plaintext_egress_allow_warns_but_loads() {
+    let h = Home::new("plaintext-allow");
+    let src = r#"
+version = 1
+[defaults]
+egress = "deny"
+egress_plaintext = "allow"
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+
+    assert!(
+        p.warnings()
+            .iter()
+            .any(|w| matches!(w, LoadWarning::PlaintextEgressAllowed)),
+        "평문 바닥을 없애는 설정은 사람이 눈으로 봐야 함: {:?}",
+        p.warnings()
+    );
+    assert_eq!(
+        egress(&p, "mirror.example.com", 80, Protocol::Http),
+        Action::Allow
+    );
+}
+
+#[test]
+fn plaintext_egress_forbid_is_rejected() {
+    let h = Home::new("plaintext-forbid");
+    let src = r#"
+version = 1
+[defaults]
+egress_plaintext = "forbid"
+"#;
+    assert!(
+        matches!(
+            load_err(&h, src),
+            LoadError::ForbidDefault {
+                kind: "egress_plaintext"
+            }
+        ),
+        "forbid는 내장 베이스라인 전용임"
+    );
+}
+
+#[test]
+fn protocol_rule_warns_that_it_needs_a_proxy() {
+    let h = Home::new("protocol-warn");
+    let src = r#"
+version = 1
+[[rules]]
+id = "legacy"
+kind = "egress"
+host = "mirror.example.com"
+port = 80
+protocol = "http"
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    assert!(
+        p.warnings()
+            .iter()
+            .any(|w| matches!(w, LoadWarning::ProtocolRuleNeedsProxy { id } if id == "legacy")),
+        "중계 층은 connect(2)만 보므로 프로토콜 조건은 프록시가 있어야 의미가 있음: {:?}",
+        p.warnings()
+    );
+}
+
+#[test]
+fn protocol_on_a_file_rule_is_rejected() {
+    let h = Home::new("protocol-file");
+    let src = r#"
+version = 1
+[[rules]]
+id = "x"
+kind = "file"
+path = "/tmp/a"
+protocol = "http"
+action = "allow"
+"#;
+    assert!(
+        matches!(
+            load_err(&h, src),
+            LoadError::UnexpectedField {
+                field: "protocol",
+                ..
+            }
+        ),
+        "kind에 맞지 않는 필드는 거부"
+    );
+}
+
+#[test]
+fn protocol_on_an_exec_rule_is_rejected() {
+    let h = Home::new("protocol-exec");
+    let src = r#"
+version = 1
+[[rules]]
+id = "x"
+kind = "exec"
+program = "curl"
+protocol = "http"
+action = "ask"
+"#;
+    assert!(matches!(
+        load_err(&h, src),
+        LoadError::UnexpectedField {
+            field: "protocol",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unknown_protocol_is_rejected() {
+    let h = Home::new("protocol-unknown");
+    for bad in ["https", "udp", "HTTP", "quic", ""] {
+        let src = format!(
+            "version = 1\n[[rules]]\nid = \"x\"\nkind = \"egress\"\nhost = \"a.example.com\"\nprotocol = \"{bad}\"\naction = \"allow\"\n"
+        );
+        assert!(
+            matches!(load_err(&h, &src), LoadError::UnknownProtocol { .. }),
+            "`{bad}`가 통과하면 안 됨"
+        );
+    }
+}
+
+#[test]
+fn misspelled_plaintext_default_key_is_still_rejected() {
+    let h = Home::new("plaintext-typo");
+    let src = r#"
+version = 1
+[defaults]
+egress_plain_text = "allow"
+"#;
+    assert!(
+        matches!(load_err(&h, src), LoadError::Toml(_)),
+        "deny_unknown_fields가 살아 있어야 함"
+    );
+
+    let rule_typo = r#"
+version = 1
+[[rules]]
+id = "x"
+kind = "egress"
+host = "a.example.com"
+protocols = "http"
+action = "allow"
+"#;
+    assert!(matches!(load_err(&h, rule_typo), LoadError::Toml(_)));
+}
+
+#[test]
+fn plaintext_floor_id_is_reserved() {
+    let h = Home::new("plaintext-reserved");
+    let src = r#"
+version = 1
+[[rules]]
+id = "airlock:egress-plaintext"
+kind = "egress"
+host = "a.example.com"
+action = "allow"
+"#;
+    assert!(
+        matches!(load_err(&h, src), LoadError::ReservedId { .. }),
+        "합성 규칙 id를 사용자가 가져가면 감사 로그가 어느 쪽인지 알 수 없어짐"
+    );
+}
+
+#[test]
+fn policy_protocol_tags_match_the_audit_layer() {
+    // airlock-policy는 airlock-audit에 의존하지 않으므로 태그 일치를 여기서 고정합니다.
+    // 2는 감사 층의 udp 자리라 비어 있습니다
+    assert_eq!(Protocol::Tcp.tag(), 1);
+    assert_eq!(Protocol::Tls.tag(), 3);
+    assert_eq!(Protocol::Http.tag(), 4);
 }
 
 // ---------- 다이제스트 ----------
@@ -1153,6 +1524,74 @@ fn baseline_only_digest_is_stable() {
     let a = Policy::baseline_only(&h.ctx()).unwrap();
     let b = Policy::baseline_only(&h.ctx()).unwrap();
     assert_eq!(a.digest(), b.digest());
+}
+
+#[test]
+fn digest_changes_when_protocol_changes() {
+    let h = Home::new("digest-protocol");
+    let bare = r#"
+version = 1
+[[rules]]
+id = "e"
+kind = "egress"
+host = "a.example.com"
+port = 80
+action = "allow"
+"#;
+    let http = r#"
+version = 1
+[[rules]]
+id = "e"
+kind = "egress"
+host = "a.example.com"
+port = 80
+protocol = "http"
+action = "allow"
+"#;
+    let tls = http.replace(r#"protocol = "http""#, r#"protocol = "tls""#);
+
+    let pa = Policy::load_str(bare, &h.ctx()).unwrap();
+    let pb = Policy::load_str(http, &h.ctx()).unwrap();
+    let pc = Policy::load_str(&tls, &h.ctx()).unwrap();
+
+    assert_ne!(
+        pa.digest(),
+        pb.digest(),
+        "프로토콜 축이 다이제스트를 바꿔야 함"
+    );
+    assert_ne!(pb.digest(), pc.digest(), "프로토콜 값이 다르면 달라야 함");
+}
+
+#[test]
+fn digest_changes_when_plaintext_default_changes() {
+    let h = Home::new("digest-plaintext-default");
+    let deny = r#"
+version = 1
+[defaults]
+egress = "deny"
+egress_plaintext = "deny"
+"#;
+    let ask = r#"
+version = 1
+[defaults]
+egress = "deny"
+egress_plaintext = "ask"
+"#;
+    let implicit = r#"
+version = 1
+[defaults]
+egress = "deny"
+"#;
+    let pa = Policy::load_str(deny, &h.ctx()).unwrap();
+    let pb = Policy::load_str(ask, &h.ctx()).unwrap();
+    let pc = Policy::load_str(implicit, &h.ctx()).unwrap();
+
+    assert_ne!(pa.digest(), pb.digest());
+    assert_eq!(
+        pa.digest(),
+        pc.digest(),
+        "생략한 egress_plaintext는 기본값 deny와 같아야 함"
+    );
 }
 
 // ---------- 겹치는 forbid ----------
@@ -1369,7 +1808,7 @@ fn non_ascii_host_pattern_is_rejected() {
     let punycode = "version = 1\n[[rules]]\nid = \"idn\"\nkind = \"egress\"\nhost = \"xn--3e0b707e.kr\"\naction = \"deny\"\n";
     let p = Policy::load_str(punycode, &h.ctx()).unwrap();
     assert_eq!(
-        p.evaluate_egress("xn--3e0b707e.kr", 443).action,
+        egress(&p, "xn--3e0b707e.kr", 443, Protocol::Tls),
         Action::Deny
     );
 }
@@ -1430,11 +1869,11 @@ action = "deny"
 "#;
     let p = Policy::load_str(deny_all, &h.ctx()).unwrap();
     assert_eq!(
-        p.evaluate_egress("api.anthropic.com", 443).action,
+        egress(&p, "api.anthropic.com", 443, Protocol::Tls),
         Action::Allow
     );
     assert_eq!(
-        p.evaluate_egress("evil.example.com", 443).action,
+        egress(&p, "evil.example.com", 443, Protocol::Tls),
         Action::Deny
     );
 }
@@ -1774,5 +2213,294 @@ action = "allow"
     assert!(
         mode(&p, &h, &secret.to_string_lossy(), FileMode::Read).is_restrictive(),
         "deny 가 해소된 표기로도 걸려야 함"
+    );
+}
+
+// ---------- 총량 한도 (max_bytes_out) ----------
+
+fn quota_policy(h: &Home, limit: u64) -> Policy {
+    let src = format!(
+        r#"
+version = 1
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+port = 443
+max_bytes_out = {limit}
+action = "allow"
+"#
+    );
+    Policy::load_str(&src, &h.ctx()).unwrap()
+}
+
+#[test]
+fn a_quota_rule_allows_until_the_limit_is_passed() {
+    let h = Home::new("quota-allow");
+    let p = quota_policy(&h, 1_000);
+    for used in [0u64, 1, 999, 1_000] {
+        assert_eq!(
+            p.evaluate_egress_with_usage("mirror.example.com", 443, Protocol::Tls, used)
+                .action,
+            Action::Allow,
+            "누적 {used} 바이트는 아직 한도 안임"
+        );
+    }
+}
+
+#[test]
+fn the_next_connection_after_the_limit_is_denied() {
+    let h = Home::new("quota-deny");
+    let p = quota_policy(&h, 1_000);
+    let ev = p.evaluate_egress_with_usage("mirror.example.com", 443, Protocol::Tls, 1_001);
+    assert_eq!(ev.action, Action::Deny);
+    let rule = ev.rule.expect("한도 규칙이 감사에 남아야 함");
+    assert_eq!(rule.id, airlock_policy::QUOTA_ID);
+    assert!(
+        rule.pattern.contains("max_bytes_out=1000") && rule.pattern.contains("used=1001"),
+        "한도와 실제 누적량이 감사 표기에 남아야 함: {}",
+        rule.pattern
+    );
+    assert!(
+        rule.pattern.contains("mirror"),
+        "어느 규칙이 막혔는지 남아야 함: {}",
+        rule.pattern
+    );
+}
+
+#[test]
+fn an_exceeded_quota_is_deny_not_ask() {
+    // ask 로 두면 --yes 자동 승인이 한도를 그대로 무력화합니다
+    let h = Home::new("quota-not-ask");
+    let src = r#"
+version = 1
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+max_bytes_out = 10
+action = "ask"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    assert_eq!(
+        p.evaluate_egress_with_usage("mirror.example.com", 443, Protocol::Tls, 0)
+            .action,
+        Action::Ask
+    );
+    assert_eq!(
+        p.evaluate_egress_with_usage("mirror.example.com", 443, Protocol::Tls, 11)
+            .action,
+        Action::Deny,
+        "한도를 넘긴 뒤에는 사람에게 묻지 않고 막아야 함"
+    );
+}
+
+#[test]
+fn a_quota_does_not_widen_a_rule_that_did_not_match() {
+    let h = Home::new("quota-scope");
+    let p = quota_policy(&h, 0);
+    // 다른 호스트는 이 규칙과 무관하므로 [defaults].egress 가 답합니다
+    assert_eq!(
+        p.evaluate_egress_with_usage("other.example.com", 443, Protocol::Tls, 1_000_000)
+            .action,
+        Action::Deny
+    );
+    // 다른 포트도 마찬가지입니다
+    assert_eq!(
+        p.evaluate_egress_with_usage("mirror.example.com", 80, Protocol::Tls, 0)
+            .action,
+        Action::Deny
+    );
+}
+
+#[test]
+fn a_zero_quota_blocks_after_the_first_byte() {
+    let h = Home::new("quota-zero");
+    let p = quota_policy(&h, 0);
+    assert_eq!(
+        p.evaluate_egress_with_usage("mirror.example.com", 443, Protocol::Tls, 0)
+            .action,
+        Action::Allow,
+        "첫 연결은 막지 못함. 바이트 수는 연결이 끝나야 알 수 있음"
+    );
+    assert_eq!(
+        p.evaluate_egress_with_usage("mirror.example.com", 443, Protocol::Tls, 1)
+            .action,
+        Action::Deny
+    );
+}
+
+#[test]
+fn evaluate_egress_without_usage_never_triggers_the_quota() {
+    // 누적량을 모르는 호출부가 한도를 발동시키면 없는 사실로 막는 것이 됩니다
+    let h = Home::new("quota-nousage");
+    let p = quota_policy(&h, 0);
+    assert_eq!(
+        egress(&p, "mirror.example.com", 443, Protocol::Tls),
+        Action::Allow
+    );
+}
+
+#[test]
+fn a_quota_rule_warns_that_it_needs_the_proxy() {
+    let h = Home::new("quota-warn");
+    let p = quota_policy(&h, 100);
+    assert!(
+        p.warnings()
+            .iter()
+            .any(|w| matches!(w, LoadWarning::QuotaRuleNeedsProxy { id } if id == "mirror")),
+        "프록시 없이는 누적량이 늘 0 이라는 사실이 경고로 나와야 함: {:?}",
+        p.warnings()
+    );
+}
+
+#[test]
+fn a_quota_on_a_blocking_rule_is_refused() {
+    let h = Home::new("quota-deny-rule");
+    let src = r#"
+version = 1
+[[rules]]
+id = "nope"
+kind = "egress"
+host = "mirror.example.com"
+max_bytes_out = 100
+action = "deny"
+"#;
+    assert!(
+        matches!(load_err(&h, src), LoadError::QuotaOnBlockingRule { .. }),
+        "이미 막는 규칙에 한도를 적으면 총량 제한이 걸렸다고 잘못 믿게 됨"
+    );
+}
+
+#[test]
+fn max_bytes_out_is_rejected_on_file_and_exec_rules() {
+    let h = Home::new("quota-wrongkind");
+    for kind in ["file", "exec"] {
+        let body = if kind == "file" {
+            "path = \"~/work/**\""
+        } else {
+            "program = \"curl\""
+        };
+        let src = format!(
+            r#"
+version = 1
+[[rules]]
+id = "x"
+kind = "{kind}"
+{body}
+max_bytes_out = 100
+action = "allow"
+"#
+        );
+        assert!(
+            matches!(
+                load_err(&h, &src),
+                LoadError::UnexpectedField {
+                    field: "max_bytes_out",
+                    ..
+                }
+            ),
+            "{kind} 규칙이 반출 한도를 받아들이면 안 됨"
+        );
+    }
+}
+
+#[test]
+fn the_quota_changes_the_policy_digest() {
+    let h = Home::new("quota-digest");
+    let without = Policy::load_str(
+        r#"
+version = 1
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+action = "allow"
+"#,
+        &h.ctx(),
+    )
+    .unwrap();
+    let with = quota_policy(&h, 1_000);
+    let other = quota_policy(&h, 2_000);
+    assert_ne!(
+        without.digest(),
+        with.digest(),
+        "한도를 적은 정책과 아닌 정책이 같은 다이제스트면 안 됨"
+    );
+    assert_ne!(
+        with.digest(),
+        other.digest(),
+        "한도 값이 다이제스트에 들어가야 함"
+    );
+}
+
+#[test]
+fn the_reserved_namespace_cannot_be_taken_by_user_rules() {
+    let h = Home::new("reserved-ns");
+    for id in [
+        "airlock:egress-quota",
+        "airlock:egress-proxy",
+        "airlock:egress-summary",
+        "airlock:anything",
+    ] {
+        let src = format!(
+            r#"
+version = 1
+[[rules]]
+id = "{id}"
+kind = "egress"
+host = "a.example.com"
+action = "allow"
+"#
+        );
+        assert!(
+            matches!(load_err(&h, &src), LoadError::ReservedNamespace { .. }),
+            "{id} 를 사용자가 가져가면 감사 로그의 rule 필드가 무엇인지 알 수 없어짐"
+        );
+    }
+}
+
+#[test]
+fn the_plaintext_floor_still_wins_over_an_unexceeded_quota() {
+    // 두 바닥이 함께 걸리는 경우. 한도를 넘지 않았어도 평문은 여전히 막혀야 합니다
+    let h = Home::new("quota-plaintext");
+    let src = r#"
+version = 1
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+max_bytes_out = 1000
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    let ev = p.evaluate_egress_with_usage("mirror.example.com", 80, Protocol::Http, 0);
+    assert_eq!(ev.action, Action::Deny);
+    assert_eq!(
+        ev.rule.map(|r| r.id).unwrap_or_default(),
+        airlock_policy::PLAINTEXT_FLOOR_ID
+    );
+}
+
+#[test]
+fn an_exceeded_quota_wins_over_the_plaintext_floor_in_the_audit_trail() {
+    // 둘 다 막지만 감사에는 먼저 걸린 사유가 남아야 조사가 가능합니다
+    let h = Home::new("quota-first");
+    let src = r#"
+version = 1
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+protocol = "http"
+max_bytes_out = 10
+action = "allow"
+"#;
+    let p = Policy::load_str(src, &h.ctx()).unwrap();
+    let ev = p.evaluate_egress_with_usage("mirror.example.com", 80, Protocol::Http, 99);
+    assert_eq!(ev.action, Action::Deny);
+    assert_eq!(
+        ev.rule.map(|r| r.id).unwrap_or_default(),
+        airlock_policy::QUOTA_ID
     );
 }

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::error::LoadError;
 use crate::glob::{Pattern, TextPattern};
 use crate::host::HostPattern;
-use crate::model::{Action, FileMode, Kind, ModeSet, Tier};
+use crate::model::{Action, FileMode, Kind, ModeSet, Protocol, Tier};
 use crate::rule::{Matcher, ProgramMatch, Rule};
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +30,7 @@ pub struct RawDefaults {
     pub file: Option<String>,
     pub exec: Option<String>,
     pub egress: Option<String>,
+    pub egress_plaintext: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +48,8 @@ pub struct RawRule {
     pub argv_pattern: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub protocol: Option<String>,
+    pub max_bytes_out: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +101,13 @@ pub fn parse_action(id: &str, value: &str) -> Result<Action, LoadError> {
     })
 }
 
+pub fn parse_protocol(id: &str, value: &str) -> Result<Protocol, LoadError> {
+    Protocol::parse(value).ok_or_else(|| LoadError::UnknownProtocol {
+        id: id.to_string(),
+        value: value.to_string(),
+    })
+}
+
 fn reject(id: &str, kind: Kind, present: bool, field: &'static str) -> Result<(), LoadError> {
     if present {
         return Err(LoadError::UnexpectedField {
@@ -144,6 +154,8 @@ pub fn to_rule(raw: RawRule, home: &Path) -> Result<Rule, LoadError> {
             reject(&id, kind, raw.argv_pattern.is_some(), "argv_pattern")?;
             reject(&id, kind, raw.host.is_some(), "host")?;
             reject(&id, kind, raw.port.is_some(), "port")?;
+            reject(&id, kind, raw.protocol.is_some(), "protocol")?;
+            reject(&id, kind, raw.max_bytes_out.is_some(), "max_bytes_out")?;
 
             let modes = modes_from(&raw)?;
             let specs = raw.path.ok_or(LoadError::MissingField {
@@ -173,6 +185,8 @@ pub fn to_rule(raw: RawRule, home: &Path) -> Result<Rule, LoadError> {
             reject(&id, kind, raw.mode.is_some(), "mode")?;
             reject(&id, kind, raw.host.is_some(), "host")?;
             reject(&id, kind, raw.port.is_some(), "port")?;
+            reject(&id, kind, raw.protocol.is_some(), "protocol")?;
+            reject(&id, kind, raw.max_bytes_out.is_some(), "max_bytes_out")?;
 
             let program = match &raw.program {
                 None => None,
@@ -214,9 +228,21 @@ pub fn to_rule(raw: RawRule, home: &Path) -> Result<Rule, LoadError> {
                 id: id.clone(),
                 source,
             })?;
+            let protocol = raw
+                .protocol
+                .as_deref()
+                .map(|p| parse_protocol(&id, p))
+                .transpose()?;
+            // 이미 막는 규칙에 한도를 적는 것은 뜻이 없습니다. 조용히 무시하면 사용자가
+            // 총량 제한이 걸렸다고 믿게 되므로 로드를 거부합니다
+            if raw.max_bytes_out.is_some() && action.blocks() {
+                return Err(LoadError::QuotaOnBlockingRule { id: id.clone() });
+            }
             Matcher::Egress {
                 host,
                 port: raw.port,
+                protocol,
+                max_bytes_out: raw.max_bytes_out,
             }
         }
     };

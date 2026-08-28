@@ -6,7 +6,13 @@ use crate::glob::Pattern;
 use crate::model::Defaults;
 use crate::rule::{Matcher, Rule};
 
-pub const DOMAIN: &[u8] = b"airlock.policy.v1\x00";
+/// 정규 인코딩의 도메인 분리 상수입니다.
+///
+/// 인코딩 스키마가 바뀌면 반드시 함께 올립니다. 같은 도메인 안에서 조용히 바꾸면
+/// 옛 다이제스트와 위조된 다이제스트를 구분할 수 없습니다 (`docs/limitations.md` 7.9).
+/// v2 에서 `protocol` 축과 `[defaults].egress_plaintext` 와 `max_bytes_out` 이 들어왔습니다.
+/// 정책 파일 형식의 `version` 과는 다른 축이며 파일은 여전히 `version = 1` 입니다
+pub const DOMAIN: &[u8] = b"airlock.policy.v2\x00";
 
 fn encode_rule(enc: &mut Encoder, rule: &Rule) {
     enc.str(&rule.id)
@@ -30,8 +36,16 @@ fn encode_rule(enc: &mut Encoder, rule: &Rule) {
                 .list_str(argv_contains)
                 .opt_str(argv_pattern.as_ref().map(|p| p.raw()));
         }
-        Matcher::Egress { host, port } => {
-            enc.str(&host.raw()).opt_u64(port.map(u64::from));
+        Matcher::Egress {
+            host,
+            port,
+            protocol,
+            max_bytes_out,
+        } => {
+            enc.str(&host.raw())
+                .opt_u64(port.map(u64::from))
+                .opt_u64(protocol.map(|p| u64::from(p.tag())))
+                .opt_u64(*max_bytes_out);
         }
     }
 }
@@ -41,7 +55,8 @@ pub fn compute(defaults: &Defaults, user: &[Rule], baseline: &[Rule]) -> [u8; 32
     enc.str(SELF_PROTECT_VERSION)
         .tag(defaults.file.tag())
         .tag(defaults.exec.tag())
-        .tag(defaults.egress.tag());
+        .tag(defaults.egress.tag())
+        .tag(defaults.egress_plaintext.tag());
 
     enc.u64(user.len() as u64);
     for r in user {

@@ -37,6 +37,14 @@ pub enum LoadError {
         id: String,
         tier: &'static str,
     },
+    /// 사용자 규칙 id가 `airlock:` 이름 공간을 씁니다.
+    ///
+    /// 그 접두는 엔진과 브로커가 만드는 합성 규칙 전용입니다. 사용자가 같은 이름을 쓰면
+    /// 감사 로그의 `rule` 필드만 보고 그 결정이 엔진이 씌운 바닥인지 사람이 적은 규칙인지
+    /// 알 수 없어집니다 (`docs/policy-dsl.md` 10절)
+    ReservedNamespace {
+        id: String,
+    },
     UnknownAction {
         id: String,
         value: String,
@@ -46,6 +54,10 @@ pub enum LoadError {
         value: String,
     },
     UnknownMode {
+        id: String,
+        value: String,
+    },
+    UnknownProtocol {
         id: String,
         value: String,
     },
@@ -93,6 +105,10 @@ pub enum LoadError {
     OverrideWithoutReason {
         id: String,
     },
+    /// 이미 막는 규칙에 `max_bytes_out` 을 적었습니다.
+    QuotaOnBlockingRule {
+        id: String,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -123,6 +139,17 @@ impl fmt::Display for LoadError {
                  어느 티어를 가리키는지 알 수 없게 되므로 다른 id를 쓸 것. \
                  내장 규칙을 완화하려면 id 대신 overrides로 지목할 것"
             ),
+            Self::ReservedNamespace { id } => write!(
+                f,
+                "규칙 id `{id}`가 `airlock:` 이름 공간을 씀. 그 접두는 엔진이 만드는 합성 규칙 \
+                 전용이라 사용자 규칙이 쓰면 감사 로그의 rule 필드가 무엇을 가리키는지 알 수 \
+                 없어짐. 다른 id를 쓸 것"
+            ),
+            Self::QuotaOnBlockingRule { id } => write!(
+                f,
+                "`{id}`는 이미 막는 규칙인데 max_bytes_out을 적었음. 총량 한도는 통과시키는 \
+                 규칙에만 뜻이 있으며, 적어 두면 총량 제한이 걸렸다고 잘못 믿게 됨"
+            ),
             Self::UnknownAction { id, value } => write!(
                 f,
                 "`{id}`의 action `{value}`를 알 수 없음. allow, deny, ask, forbid 중 하나여야 함"
@@ -134,6 +161,10 @@ impl fmt::Display for LoadError {
             Self::UnknownMode { id, value } => write!(
                 f,
                 "`{id}`의 mode `{value}`를 알 수 없음. read, write, create, delete, metadata, exec 중 하나여야 함"
+            ),
+            Self::UnknownProtocol { id, value } => write!(
+                f,
+                "`{id}`의 protocol `{value}`를 알 수 없음. tcp, tls, http 중 하나여야 함"
             ),
             Self::MissingField { id, field } => {
                 write!(f, "`{id}`에 필수 필드 `{field}`가 없음")
@@ -204,6 +235,13 @@ pub enum LoadWarning {
     HostRuleNeedsProxy {
         id: String,
     },
+    ProtocolRuleNeedsProxy {
+        id: String,
+    },
+    QuotaRuleNeedsProxy {
+        id: String,
+    },
+    PlaintextEgressAllowed,
     IneffectiveRelaxation {
         id: String,
         forbid_id: String,
@@ -226,6 +264,23 @@ impl fmt::Display for LoadWarning {
                 f,
                 "`{id}`는 호스트 단위 egress 규칙임. `airlock run --egress-proxy`로 실행할 때만 \
                  강제되고, 그냥 실행하면 커널이 판정하지 못함"
+            ),
+            Self::ProtocolRuleNeedsProxy { id } => write!(
+                f,
+                "`{id}`는 protocol을 지정한 egress 규칙임. 중계 층은 connect(2)만 보고 모든 연결을 \
+                 tcp로 보고하므로, `airlock run --egress-proxy` 없이는 tls와 http 규칙이 \
+                 아무것도 매칭하지 않고 평문 바닥도 발동하지 않음"
+            ),
+            Self::QuotaRuleNeedsProxy { id } => write!(
+                f,
+                "`{id}`는 max_bytes_out을 적은 egress 규칙임. 반출 바이트는 프록시 층만 세므로 \
+                 `airlock run --egress-proxy` 없이는 누적량이 늘 0이고 한도가 한 번도 걸리지 않음"
+            ),
+            Self::PlaintextEgressAllowed => write!(
+                f,
+                "[defaults].egress_plaintext = \"allow\"는 평문 아웃바운드 바닥을 없앰. \
+                 허용된 호스트로 나가는 본문이 경로 전체에 그대로 노출됨. \
+                 특정 호스트만 열려면 그 규칙에 protocol = \"http\"를 적을 것"
             ),
             Self::IneffectiveRelaxation {
                 id,

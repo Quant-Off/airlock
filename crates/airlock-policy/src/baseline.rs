@@ -161,7 +161,7 @@ const FILE_SPECS: &[FileSpec] = &[
             "~/.config/fish/**",
         ],
         modes: W,
-        reason: "셸 초기화 파일 쓰기는 인젝션 한 번을 영구 접근으로 바꿈",
+        reason: "쉘 초기화 파일 쓰기는 인젝션 한 번을 영구 접근으로 바꿈",
         probes: &[],
     },
     FileSpec {

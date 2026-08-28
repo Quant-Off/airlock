@@ -96,6 +96,61 @@ impl fmt::Display for Kind {
     }
 }
 
+/// egress 규칙과 질의에 붙는 프로토콜 축입니다.
+///
+/// 태그는 `airlock-audit`의 같은 이름 타입과 번호를 맞춥니다. 2는 감사 층의 `udp`
+/// 자리라 비워 둡니다. 정책 어휘에는 아직 UDP가 없고, 번호가 어긋나면 감사 로그와
+/// 정책이 같은 값을 다르게 부르게 됩니다
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    Tcp,
+    Tls,
+    Http,
+}
+
+impl Protocol {
+    pub const ALL: [Protocol; 3] = [Self::Tcp, Self::Tls, Self::Http];
+
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Tcp => 1,
+            Self::Tls => 3,
+            Self::Http => 4,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Tls => "tls",
+            Self::Http => "http",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tcp" => Some(Self::Tcp),
+            "tls" => Some(Self::Tls),
+            "http" => Some(Self::Http),
+            _ => None,
+        }
+    }
+
+    /// 본문이 경계 밖에서 그대로 보이는 프로토콜인지 봅니다.
+    ///
+    /// `tcp`는 관측 층이 아무것도 모른다는 뜻이므로 평문으로 단정하지 않습니다.
+    /// 모르는 것을 안다고 기록하면 감사 로그가 거짓 보증을 합니다
+    pub fn is_plaintext(self) -> bool {
+        matches!(self, Self::Http)
+    }
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileMode {
     Read,
@@ -240,6 +295,11 @@ pub struct Defaults {
     pub file: Action,
     pub exec: Action,
     pub egress: Action,
+    /// 평문 아웃바운드가 넘을 수 없는 상한입니다.
+    ///
+    /// 다른 셋과 달리 "매칭되는 규칙이 없을 때의 답"이 아닙니다. 어떤 규칙이 답했든
+    /// 그 위에 한 번 더 씌웁니다 (`docs/policy-dsl.md` 8.2절)
+    pub egress_plaintext: Action,
 }
 
 impl Default for Defaults {
@@ -248,6 +308,7 @@ impl Default for Defaults {
             file: Action::Ask,
             exec: Action::Ask,
             egress: Action::Deny,
+            egress_plaintext: Action::Deny,
         }
     }
 }
@@ -330,6 +391,47 @@ mod tests {
         assert_eq!(d.egress, Action::Deny);
         assert_eq!(d.for_kind(Kind::Egress), Action::Deny);
         assert_eq!(d.for_kind(Kind::File), Action::Ask);
+    }
+
+    #[test]
+    fn default_plaintext_egress_is_deny() {
+        assert_eq!(Defaults::default().egress_plaintext, Action::Deny);
+    }
+
+    #[test]
+    fn protocol_tags_match_audit_protocol_tags() {
+        // airlock-audit 의 tagged_enum!(Protocol) 과 같은 번호여야 합니다.
+        // 2 는 감사 층의 udp 자리이므로 비어 있습니다
+        assert_eq!(Protocol::Tcp.tag(), 1);
+        assert_eq!(Protocol::Tls.tag(), 3);
+        assert_eq!(Protocol::Http.tag(), 4);
+        assert!(Protocol::ALL.iter().all(|p| p.tag() != 2));
+    }
+
+    #[test]
+    fn protocol_parse_rejects_unknown() {
+        assert_eq!(Protocol::parse("http"), Some(Protocol::Http));
+        assert_eq!(Protocol::parse("tls"), Some(Protocol::Tls));
+        assert_eq!(Protocol::parse("tcp"), Some(Protocol::Tcp));
+        assert_eq!(Protocol::parse("udp"), None);
+        assert_eq!(Protocol::parse("HTTP"), None);
+        assert_eq!(Protocol::parse("https"), None);
+    }
+
+    #[test]
+    fn only_http_counts_as_plaintext() {
+        assert!(Protocol::Http.is_plaintext());
+        assert!(!Protocol::Tls.is_plaintext());
+        // tcp 는 "모른다"는 뜻이지 "평문이다"가 아닙니다
+        assert!(!Protocol::Tcp.is_plaintext());
+    }
+
+    #[test]
+    fn protocol_round_trips_through_str() {
+        for p in Protocol::ALL {
+            assert_eq!(Protocol::parse(p.as_str()), Some(p));
+            assert_eq!(p.to_string(), p.as_str());
+        }
     }
 
     #[test]

@@ -9,9 +9,11 @@ pub mod model;
 pub mod path;
 pub mod rule;
 
-pub use engine::{Evaluation, LoadContext, MatchedRule, Policy};
+pub use engine::{
+    Evaluation, LoadContext, MatchedRule, PLAINTEXT_FLOOR_ID, Policy, QUOTA_ID, RESERVED_PREFIX,
+};
 pub use error::{LoadError, LoadWarning};
-pub use model::{Action, Defaults, FileMode, Kind, ModeSet, Tier};
+pub use model::{Action, Defaults, FileMode, Kind, ModeSet, Protocol, Tier};
 pub use path::NormalizedPath;
 pub use rule::{Matcher, Query, Rule};
 

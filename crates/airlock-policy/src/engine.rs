@@ -6,9 +6,27 @@ use crate::digest;
 use crate::dsl;
 use crate::error::{LoadError, LoadWarning};
 use crate::host::HostPattern;
-use crate::model::{Action, Defaults, FileMode, Kind, Tier};
+use crate::model::{Action, Defaults, FileMode, Kind, Protocol, Tier};
 use crate::path::{self as pathmod, NormalizedPath};
 use crate::rule::{Matcher, Query, Rule};
+
+/// 평문 바닥이 결정을 바꿨을 때 감사 로그와 explain 에 나가는 합성 규칙 id입니다.
+///
+/// 정책 파일이 쓸 수 없는 예약 id이며, 사용자 규칙이 같은 id를 쓰면 로드를 거부합니다.
+/// 브로커의 `airlock:egress-proxy` 와 같은 `airlock:` 이름 공간입니다
+pub const PLAINTEXT_FLOOR_ID: &str = "airlock:egress-plaintext";
+
+/// 총량 한도가 결정을 바꿨을 때 감사 로그와 explain 에 나가는 합성 규칙 id입니다.
+///
+/// `PLAINTEXT_FLOOR_ID` 와 같은 이름 공간이며 사용자 규칙이 쓸 수 없습니다
+pub const QUOTA_ID: &str = "airlock:egress-quota";
+
+/// 엔진과 브로커가 만드는 합성 규칙 전용 이름 공간.
+///
+/// 사용자 규칙이 이 접두를 쓰면 감사 로그의 `rule` 필드만 보고 그 결정이 엔진이 씌운
+/// 바닥인지 사람이 적은 규칙인지 알 수 없어집니다. 개별 id 를 하나씩 예약하는 대신 접두를
+/// 통째로 막아 두면 나중에 늘어나는 합성 id 도 자동으로 보호됩니다
+pub const RESERVED_PREFIX: &str = "airlock:";
 
 #[derive(Debug, Clone)]
 pub struct LoadContext {
@@ -149,14 +167,20 @@ impl Policy {
             if let Some(v) = &d.egress {
                 defaults.egress = dsl::parse_action("[defaults].egress", v)?;
             }
+            if let Some(v) = &d.egress_plaintext {
+                defaults.egress_plaintext = dsl::parse_action("[defaults].egress_plaintext", v)?;
+            }
         }
         if defaults.egress == Action::Allow {
             return Err(LoadError::EgressDefaultAllow);
         }
+        // egress_plaintext 의 allow 는 거부하지 않습니다. 여는 범위가 "모든 호스트"가
+        // 아니라 "이미 허용된 호스트에 대한 평문"이라 훨씬 좁습니다. 대신 경고를 냅니다
         for (kind, action) in [
             ("file", defaults.file),
             ("exec", defaults.exec),
             ("egress", defaults.egress),
+            ("egress_plaintext", defaults.egress_plaintext),
         ] {
             if action == Action::Forbid {
                 return Err(LoadError::ForbidDefault { kind });
@@ -227,6 +251,7 @@ impl Policy {
             .iter()
             .map(|r| (r.id.as_str(), "베이스라인"))
             .chain(self_protect.iter().map(|r| (r.id.as_str(), "자기보호")))
+            .chain(std::iter::once((PLAINTEXT_FLOOR_ID, "평문 바닥")))
             .collect();
 
         let mut seen: HashSet<&str> = HashSet::new();
@@ -239,6 +264,11 @@ impl Policy {
                     id: r.id.clone(),
                     tier,
                 });
+            }
+            // 알려진 합성 id 뿐 아니라 이름 공간 전체를 막습니다. 나중에 늘어나는 합성 id
+            // 하나를 예약 목록에 넣는 것을 잊어도 사용자가 그 이름을 가져갈 수 없습니다
+            if r.id.starts_with(RESERVED_PREFIX) {
+                return Err(LoadError::ReservedNamespace { id: r.id.clone() });
             }
             if r.action == Action::Forbid {
                 return Err(LoadError::ForbidInUserRule { id: r.id.clone() });
@@ -328,7 +358,7 @@ impl Policy {
 
         let digest = digest::compute(&defaults, &user, &base.rules);
 
-        let mut warnings = collect_warnings(&user, &used_overrides);
+        let mut warnings = collect_warnings(&defaults, &user, &used_overrides);
         warnings.extend(ineffective);
 
         let (baseline_forbid, baseline_rest): (Vec<Rule>, Vec<Rule>) = base
@@ -386,9 +416,9 @@ impl Policy {
         &self.self_protect
     }
 
-    fn lookup(&self, query: &Query<'_>) -> (Action, Option<MatchedRule>) {
+    fn lookup<'a>(&'a self, query: &Query<'_>) -> (Action, Option<&'a Rule>) {
         if let Some(rule) = self.self_protect.iter().find(|r| r.matches(query)) {
-            return (rule.action, Some(MatchedRule::of(rule, query)));
+            return (rule.action, Some(rule));
         }
 
         let mut matched_forbid = self
@@ -405,7 +435,7 @@ impl Policy {
                 match named {
                     // 매칭된 forbid 하나라도 지목되지 않았으면 그 forbid가 이깁니다.
                     // 겹치는 보호를 지목 없이 함께 푸는 경로를 막습니다
-                    None => return (forbid.action, Some(MatchedRule::of(forbid, query))),
+                    None => return (forbid.action, Some(forbid)),
                     Some(u) => {
                         if relaxation.is_none() {
                             relaxation = Some(u);
@@ -414,13 +444,13 @@ impl Policy {
                 }
             }
             if let Some(u) = relaxation {
-                return (u.action, Some(MatchedRule::of(u, query)));
+                return (u.action, Some(u));
             }
         }
 
         for tier in [&self.user, &self.baseline_rest] {
             if let Some(rule) = tier.iter().find(|r| r.matches(query)) {
-                return (rule.action, Some(MatchedRule::of(rule, query)));
+                return (rule.action, Some(rule));
             }
         }
 
@@ -429,22 +459,33 @@ impl Policy {
 
     pub fn evaluate_file(&self, raw: &Path, mode: FileMode, cwd: &Path) -> Evaluation {
         let np = pathmod::normalize(raw, cwd, &self.home);
-        let (requested_action, requested_rule) = self.lookup(&Query::File {
+        let requested_query = Query::File {
             path: &np.requested,
             mode,
-        });
+        };
+        let (requested_action, requested_rule) = self.lookup(&requested_query);
         let (action, rule) = if np.diverges() {
-            let (resolved_action, resolved_rule) = self.lookup(&Query::File {
+            let resolved_query = Query::File {
                 path: &np.resolved,
                 mode,
-            });
+            };
+            let (resolved_action, resolved_rule) = self.lookup(&resolved_query);
             if resolved_action > requested_action {
-                (resolved_action, resolved_rule)
+                (
+                    resolved_action,
+                    resolved_rule.map(|r| MatchedRule::of(r, &resolved_query)),
+                )
             } else {
-                (requested_action, requested_rule)
+                (
+                    requested_action,
+                    requested_rule.map(|r| MatchedRule::of(r, &requested_query)),
+                )
             }
         } else {
-            (requested_action, requested_rule)
+            (
+                requested_action,
+                requested_rule.map(|r| MatchedRule::of(r, &requested_query)),
+            )
         };
 
         Evaluation {
@@ -464,32 +505,44 @@ impl Policy {
     /// 깨지면 4.1절의 양방향 평가가 생략되어 링크 우회를 놓칩니다. inode에 규칙을
     /// 거는 Landlock처럼 링크 우회가 구조적으로 불가능한 백엔드에서만 씁니다
     pub fn evaluate_resolved_file(&self, path: &Path, mode: FileMode) -> Evaluation {
-        let (action, rule) = self.lookup(&Query::File { path, mode });
+        let query = Query::File { path, mode };
+        let (action, rule) = self.lookup(&query);
         Evaluation {
             action,
-            rule,
+            rule: rule.map(|r| MatchedRule::of(r, &query)),
             path: None,
         }
     }
 
     pub fn evaluate_exec(&self, program: &Path, argv: &[String], cwd: &Path) -> Evaluation {
         let np = pathmod::normalize(program, cwd, &self.home);
-        let (requested_action, requested_rule) = self.lookup(&Query::Exec {
+        let requested_query = Query::Exec {
             program: &np.requested,
             argv,
-        });
+        };
+        let (requested_action, requested_rule) = self.lookup(&requested_query);
         let (action, rule) = if np.diverges() {
-            let (resolved_action, resolved_rule) = self.lookup(&Query::Exec {
+            let resolved_query = Query::Exec {
                 program: &np.resolved,
                 argv,
-            });
+            };
+            let (resolved_action, resolved_rule) = self.lookup(&resolved_query);
             if resolved_action > requested_action {
-                (resolved_action, resolved_rule)
+                (
+                    resolved_action,
+                    resolved_rule.map(|r| MatchedRule::of(r, &resolved_query)),
+                )
             } else {
-                (requested_action, requested_rule)
+                (
+                    requested_action,
+                    requested_rule.map(|r| MatchedRule::of(r, &requested_query)),
+                )
             }
         } else {
-            (requested_action, requested_rule)
+            (
+                requested_action,
+                requested_rule.map(|r| MatchedRule::of(r, &requested_query)),
+            )
         };
 
         Evaluation {
@@ -499,8 +552,93 @@ impl Policy {
         }
     }
 
-    pub fn evaluate_egress(&self, host: &str, port: u16) -> Evaluation {
-        let (action, rule) = self.lookup(&Query::Egress { host, port });
+    /// 아웃바운드 연결 하나를 판정합니다.
+    ///
+    /// 누적 반출량을 모르는 호출부용입니다. 총량 한도는 발동하지 않습니다.
+    ///
+    /// # Arguments
+    /// `host` - 관측된 호스트 문자열. 정규화는 이 안에서 함
+    /// `port` - 목적지 포트
+    /// `protocol` - 관측 층이 판단한 프로토콜. 중계 층은 항상 `Tcp`를 넘김
+    pub fn evaluate_egress(&self, host: &str, port: u16, protocol: Protocol) -> Evaluation {
+        self.evaluate_egress_with_usage(host, port, protocol, 0)
+    }
+
+    /// 아웃바운드 연결 하나를 누적 반출량과 함께 판정합니다.
+    ///
+    /// 4티어 평가가 끝난 뒤 두 바닥을 순서대로 씌웁니다. 먼저 매칭된 규칙의
+    /// `max_bytes_out` 한도를 보고(8.4절), 그다음 평문 질의에 한해
+    /// [`Defaults::egress_plaintext`] 바닥을 봅니다(8.2절).
+    ///
+    /// 판정 지점을 여기 하나로 두는 것이 핵심입니다. 브로커가 따로 한도를 검사하면 두
+    /// 지점이 언젠가 갈라지고, 갈라지는 순간 감사 로그가 거짓 보증을 합니다.
+    ///
+    /// # Arguments
+    /// `host` - 관측된 호스트 문자열. 정규화는 이 안에서 함
+    /// `port` - 목적지 포트
+    /// `protocol` - 관측 층이 판단한 프로토콜. 중계 층은 항상 `Tcp`를 넘김
+    /// `bytes_out` - 이 세션에서 이 목적지로 이미 반출한 누적 바이트
+    pub fn evaluate_egress_with_usage(
+        &self,
+        host: &str,
+        port: u16,
+        protocol: Protocol,
+        bytes_out: u64,
+    ) -> Evaluation {
+        let query = Query::Egress {
+            host,
+            port,
+            protocol,
+        };
+        let (action, matched) = self.lookup(&query);
+        let declares_protocol = matches!(
+            matched.map(|r| &r.matcher),
+            Some(Matcher::Egress {
+                protocol: Some(_),
+                ..
+            })
+        );
+        let rule = matched.map(|r| MatchedRule::of(r, &query));
+
+        // 총량 한도. 바이트 수는 연결이 끝나야 알 수 있으므로 한도를 넘긴 그 연결 자체는
+        // 막지 못하고 다음 연결부터 막힙니다. 초과 시 결정은 deny 로 고정합니다. ask 로
+        // 두면 --yes 자동 승인이 한도를 그대로 무력화합니다
+        if let Some(Matcher::Egress {
+            max_bytes_out: Some(limit),
+            ..
+        }) = matched.map(|r| &r.matcher)
+            && bytes_out > *limit
+        {
+            let floored = action.more_restrictive(Action::Deny);
+            if floored != action {
+                return Evaluation {
+                    action: floored,
+                    rule: Some(quota_rule(
+                        floored,
+                        rule.as_ref(),
+                        host,
+                        port,
+                        *limit,
+                        bytes_out,
+                    )),
+                    path: None,
+                };
+            }
+        }
+
+        // 호스트만 적은 allow 가 평문까지 암묵 허가하면 안 됩니다. 평문을 열려면 사람이
+        // 규칙에 protocol = "http" 라고 직접 적어야 합니다
+        if protocol.is_plaintext() && !declares_protocol {
+            let floored = action.more_restrictive(self.defaults.egress_plaintext);
+            if floored != action {
+                return Evaluation {
+                    action: floored,
+                    rule: Some(plaintext_floor_rule(floored, rule.as_ref(), host, port)),
+                    path: None,
+                };
+            }
+        }
+
         Evaluation {
             action,
             rule,
@@ -509,8 +647,85 @@ impl Policy {
     }
 }
 
-fn collect_warnings(user: &[Rule], used_overrides: &HashSet<String>) -> Vec<LoadWarning> {
+/// 총량 한도가 내린 결정을 규칙 하나로 표현합니다.
+///
+/// 한도와 실제 누적량을 매칭 표기에 남깁니다. 감사 로그만 보고 "무엇이 얼마를 넘겨서
+/// 막혔는가" 를 알 수 있어야 하기 때문입니다.
+///
+/// # Arguments
+/// `action` - 한도를 씌운 뒤의 결정
+/// `matched` - 한도를 씌우기 전에 답한 규칙
+/// `host` - 질의 호스트
+/// `port` - 질의 포트
+/// `limit` - 규칙이 적은 한도
+/// `used` - 이 세션에서 이 목적지로 이미 반출한 누적 바이트
+fn quota_rule(
+    action: Action,
+    matched: Option<&MatchedRule>,
+    host: &str,
+    port: u16,
+    limit: u64,
+    used: u64,
+) -> MatchedRule {
+    let origin = matched
+        .map(|m| m.id.as_str())
+        .unwrap_or("[defaults].egress");
+    MatchedRule {
+        id: QUOTA_ID.to_string(),
+        tier: Tier::Baseline,
+        action,
+        pattern: format!("{host}:{port} [max_bytes_out={limit} used={used}] <- {origin}"),
+        reason: Some(
+            "이 목적지로 누적 반출한 바이트가 max_bytes_out 을 넘음. 바이트 수는 연결이 끝나야 \
+             알 수 있으므로 한도를 넘긴 그 연결 자체는 막지 못했고 이번 연결부터 막힘"
+                .to_string(),
+        ),
+    }
+}
+
+/// 평문 바닥이 내린 결정을 규칙 하나로 표현합니다.
+///
+/// 원래 매칭된 규칙의 id를 매칭 표기 안에 남깁니다. 어느 규칙이 평문을 열려다 막혔는지
+/// 감사 로그만 보고 알 수 있어야 하기 때문입니다.
+///
+/// # Arguments
+/// `action` - 바닥을 씌운 뒤의 결정
+/// `matched` - 바닥을 씌우기 전에 답한 규칙. 없으면 `[defaults]`가 답한 것임
+/// `host` - 질의 호스트
+/// `port` - 질의 포트
+fn plaintext_floor_rule(
+    action: Action,
+    matched: Option<&MatchedRule>,
+    host: &str,
+    port: u16,
+) -> MatchedRule {
+    let pattern = match matched {
+        Some(m) => format!("{} [http] <- {}", m.pattern, m.id),
+        None => format!("{host}:{port} [http] <- [defaults].egress"),
+    };
+    MatchedRule {
+        id: PLAINTEXT_FLOOR_ID.to_string(),
+        tier: Tier::Baseline,
+        action,
+        pattern,
+        reason: Some(
+            "평문 아웃바운드는 [defaults].egress_plaintext 가 정한 바닥을 넘지 못함. \
+             열려면 그 규칙에 protocol = \"http\" 를 명시할 것"
+                .to_string(),
+        ),
+    }
+}
+
+fn collect_warnings(
+    defaults: &Defaults,
+    user: &[Rule],
+    used_overrides: &HashSet<String>,
+) -> Vec<LoadWarning> {
     let mut warnings = Vec::new();
+
+    if defaults.egress_plaintext == Action::Allow {
+        warnings.push(LoadWarning::PlaintextEgressAllowed);
+    }
 
     for r in user {
         if let Some(target) = &r.overrides
@@ -521,7 +736,7 @@ fn collect_warnings(user: &[Rule], used_overrides: &HashSet<String>) -> Vec<Load
                 target: target.clone(),
             });
         }
-        if let Matcher::Egress { host, .. } = &r.matcher {
+        if let Matcher::Egress { host, protocol, .. } = &r.matcher {
             // 포트 단위까지만 강제하는 백엔드는 주소 단위 규칙을 표현할 수 없습니다.
             // IP 리터럴도 도메인 패턴과 마찬가지입니다. `*`는 전면 차단이라 표현 가능합니다
             if matches!(
@@ -530,6 +745,20 @@ fn collect_warnings(user: &[Rule], used_overrides: &HashSet<String>) -> Vec<Load
             ) {
                 warnings.push(LoadWarning::HostRuleNeedsProxy { id: r.id.clone() });
             }
+            // 중계 층은 connect(2)만 보고 모든 연결을 Tcp로 보고합니다
+            // (docs/limitations.md 5.12). 프로토콜 조건은 프록시가 있어야 의미가 생깁니다
+            if protocol.is_some() {
+                warnings.push(LoadWarning::ProtocolRuleNeedsProxy { id: r.id.clone() });
+            }
+        }
+        // 반출 바이트는 프록시 층만 셉니다. 중계 층은 connect(2) 만 보므로 누적량이 늘 0
+        // 이고 한도가 한 번도 걸리지 않습니다
+        if let Matcher::Egress {
+            max_bytes_out: Some(_),
+            ..
+        } = &r.matcher
+        {
+            warnings.push(LoadWarning::QuotaRuleNeedsProxy { id: r.id.clone() });
         }
     }
 
@@ -592,15 +821,23 @@ fn shadowed_by(rule: &Rule, earlier: &[Rule]) -> Option<String> {
             }
             covered_by
         }
-        Matcher::Egress { host, port } => {
+        Matcher::Egress {
+            host,
+            port,
+            protocol,
+            // 한도는 매칭 여부를 바꾸지 않으므로 도달 가능성 판정에 쓰이지 않습니다
+            max_bytes_out: _,
+        } => {
             let witness = egress_witness(host);
             let probe_port = port.unwrap_or(443);
+            let probe_protocol = protocol.unwrap_or(Protocol::Tcp);
             let q = Query::Egress {
                 host: &witness,
                 port: probe_port,
+                protocol: probe_protocol,
             };
-            // 포트를 생략한 규칙은 모든 포트를 덮으므로, 앞선 규칙이 그것을
-            // 덮으려면 마찬가지로 포트를 생략했거나 같은 포트여야 합니다
+            // 포트나 프로토콜을 생략한 규칙은 그 축 전체를 덮으므로, 앞선 규칙이 그것을
+            // 덮으려면 마찬가지로 생략했거나 같은 값이어야 합니다
             earlier
                 .iter()
                 .find(|p| {
@@ -608,6 +845,16 @@ fn shadowed_by(rule: &Rule, earlier: &[Rule]) -> Option<String> {
                         && !matches!(
                             (&p.matcher, port),
                             (Matcher::Egress { port: Some(_), .. }, None)
+                        )
+                        && !matches!(
+                            (&p.matcher, protocol),
+                            (
+                                Matcher::Egress {
+                                    protocol: Some(_),
+                                    ..
+                                },
+                                None
+                            )
                         )
                 })
                 .map(|p| p.id.clone())
