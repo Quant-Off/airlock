@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use airlock_canonical::display::sanitize;
-use airlock_policy::{Action, FileMode, LoadContext, Policy};
+use airlock_policy::{Action, FileMode, LoadContext, PLAINTEXT_FLOOR_ID, Policy, Protocol};
 
 use crate::paths;
 
@@ -27,6 +27,14 @@ pub enum PolicyCommand {
 
         #[arg(long, default_value_t = 443, help = "아웃바운드 포트")]
         port: u16,
+
+        #[arg(
+            long,
+            default_value = "tcp",
+            help = "아웃바운드 프로토콜 tcp|tls|http. 기본값 tcp는 관측 층이 프로토콜을 \
+                    모른다는 뜻이며 중계 층이 넘기는 값과 같음"
+        )]
+        protocol: String,
 
         #[arg(long, value_name = "FILE")]
         policy: Option<PathBuf>,
@@ -100,6 +108,7 @@ pub fn exec(cmd: PolicyCommand, audit_root: Option<PathBuf>) -> i32 {
             exec,
             host,
             port,
+            protocol,
             policy,
             args,
         } => {
@@ -125,13 +134,23 @@ pub fn exec(cmd: PolicyCommand, audit_root: Option<PathBuf>) -> i32 {
                 let mut argv = vec![program.clone()];
                 argv.extend(args.iter().cloned());
                 let ev = policy.evaluate_exec(&resolved, &argv, &cwd);
-                print_exec(&ev, &argv);
+                print_exec(
+                    &ev,
+                    &argv,
+                    airlock_broker::profile::exec_whitelist_mode(&policy),
+                );
                 return exit_for(ev.action);
             }
 
             if let Some(host) = host {
-                let ev = policy.evaluate_egress(&host, port);
-                print_egress(&ev, &host, port);
+                let Some(protocol) = Protocol::parse(&protocol) else {
+                    eprintln!(
+                        "airlock: 알 수 없는 protocol `{protocol}`. tcp, tls, http 중 하나여야 함"
+                    );
+                    return 64;
+                };
+                let ev = policy.evaluate_egress(&host, port, protocol);
+                print_egress(&ev, &host, port, protocol);
                 return exit_for(ev.action);
             }
 
@@ -161,8 +180,8 @@ pub fn exec(cmd: PolicyCommand, audit_root: Option<PathBuf>) -> i32 {
             );
             let d = policy.defaults();
             println!(
-                "  기본값     file={} exec={} egress={}",
-                d.file, d.exec, d.egress
+                "  기본값     file={} exec={} egress={} egress_plaintext={}",
+                d.file, d.exec, d.egress, d.egress_plaintext
             );
 
             if policy.warnings().is_empty() {
@@ -246,7 +265,13 @@ fn print_file(ev: &airlock_policy::Evaluation, mode: FileMode) {
     print_rule(ev);
 }
 
-fn print_exec(ev: &airlock_policy::Evaluation, argv: &[String]) {
+/// exec 결정을 출력합니다.
+///
+/// # Arguments
+/// `ev` - 평가 결과
+/// `argv` - 질의에 쓰인 argv
+/// `whitelist` - 이 정책에서 exec 이 커널 화이트리스트로 걸리는지
+fn print_exec(ev: &airlock_policy::Evaluation, argv: &[String], whitelist: bool) {
     if let Some(np) = &ev.path {
         println!("프로그램 {}", sanitize(&np.requested.display().to_string()));
         if np.diverges() {
@@ -256,15 +281,41 @@ fn print_exec(ev: &airlock_policy::Evaluation, argv: &[String]) {
     println!("argv     {argv:?}");
     println!("결정     {}", colored(ev.action));
     print_rule(ev);
-    if ev.action.is_restrictive() {
+    // 프로그램 경로와 argv 조건은 성질이 다릅니다. 둘을 한 문장으로 뭉뚱그리면 강제되는
+    // 것을 강제되지 않는다고 말하거나 그 반대가 됩니다 (docs/policy-dsl.md 7.1)
+    if whitelist {
         println!(
-            "\x1b[2m참고 exec 규칙은 보안 경계가 아니라 tripwire임. 실제 방어는 file과 egress 규칙에서 나옴\x1b[0m"
+            "\x1b[2m참고 [defaults].exec 이 allow 가 아니므로 프로그램 경로는 커널 화이트리스트임. \
+             argv 조건은 커널이 볼 수 없어 tripwire 로만 남음\x1b[0m"
+        );
+    } else if ev.action.is_restrictive() {
+        println!(
+            "\x1b[2m참고 [defaults].exec = allow 라 exec 화이트리스트를 걸지 않음. \
+             이 규칙은 보안 경계가 아니라 tripwire 이며 실제 방어는 file 과 egress 규칙에서 나옴\x1b[0m"
         );
     }
 }
 
-fn print_egress(ev: &airlock_policy::Evaluation, host: &str, port: u16) {
-    println!("호스트   {}:{port}", sanitize(host));
+fn print_egress(ev: &airlock_policy::Evaluation, host: &str, port: u16, protocol: Protocol) {
+    println!("호스트   {}", sanitize(host));
+    println!("포트     {port}");
+    println!("프로토콜 {protocol}");
     println!("결정     {}", colored(ev.action));
     print_rule(ev);
+
+    // 평문 바닥이 결정을 바꿨을 때만 엔진이 합성 규칙을 냅니다. 그 사실을 드러내지 않으면
+    // 사용자는 자기가 적은 allow 규칙이 왜 통하지 않는지 알 수 없습니다
+    if ev.rule.as_ref().is_some_and(|r| r.id == PLAINTEXT_FLOOR_ID) {
+        println!(
+            "\x1b[33m평문 바닥이 결정을 바꿨음.\x1b[0m [defaults].egress_plaintext 가 상한이며 \
+             열려면 그 egress 규칙에 protocol = \"http\" 를 명시할 것"
+        );
+    }
+    if protocol == Protocol::Tcp {
+        println!(
+            "\x1b[2m참고 protocol=tcp 는 관측 층이 프로토콜을 모른다는 뜻임. \
+             중계 층만으로 도는 세션은 항상 이 값이라 평문 바닥이 발동하지 않음. \
+             평문 판정은 airlock run --egress-proxy 위에서만 성립함\x1b[0m"
+        );
+    }
 }

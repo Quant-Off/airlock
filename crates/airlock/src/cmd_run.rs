@@ -19,6 +19,16 @@ pub struct RunArgs {
     #[arg(long, value_name = "DIR", help = "감사 로그 루트")]
     pub audit_dir: Option<PathBuf>,
 
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "세션 상위 앵커(anchors.jsonl)를 둘 디렉토리. 생략하면 감사 루트. \
+                같은 트리에 두면 체인을 재계산할 수 있는 주체가 앵커도 같은 비용으로 \
+                재계산하므로, 실질 탐지력은 다른 볼륨이나 원격 append-only 마운트로 \
+                분리했을 때만 생김"
+    )]
+    pub anchor_dir: Option<PathBuf>,
+
     #[arg(long, value_name = "DIR", help = "쓰기 허용 작업 공간. 기본값은 cwd")]
     pub workspace: Option<PathBuf>,
 
@@ -138,7 +148,16 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
 
     let proxy_planned = args.egress_proxy && !args.no_network;
     for w in policy.warnings() {
-        if proxy_planned && matches!(w, LoadWarning::HostRuleNeedsProxy { .. }) {
+        // 프록시가 붙으면 호스트도 프로토콜도 실제로 판정됩니다. 그때까지 경고를
+        // 그대로 내면 해결된 경고가 매 실행마다 쌓여 진짜 경고를 덮습니다
+        if proxy_planned
+            && matches!(
+                w,
+                LoadWarning::HostRuleNeedsProxy { .. }
+                    | LoadWarning::ProtocolRuleNeedsProxy { .. }
+                    | LoadWarning::QuotaRuleNeedsProxy { .. }
+            )
+        {
             continue;
         }
         eprintln!("airlock: 경고 {w}");
@@ -218,10 +237,16 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
             .map(|p| p.to_string_lossy().into_owned()),
         airlock_version: env!("CARGO_PKG_VERSION").to_string(),
         mediation,
+        anchor_dir: args.anchor_dir.as_ref().map(|d| paths::absolutize(d, &cwd)),
     };
 
     // 배너가 강제 층의 한계를 그대로 보여주려면 정책에서 유도되는 gap이
-    // 출력 전에 채워져 있어야 합니다. prepare는 결정적이라 run 안에서 다시 불려도 안전합니다
+    // 출력 전에 채워져 있어야 합니다. prepare는 결정적이라 run 안에서 다시 불려도 안전합니다.
+    // 최상위 프로그램도 먼저 알려 줍니다. 그것이 빠지면 exec 화이트리스트 모드에서
+    // 배너의 규칙 수와 gap이 실제로 걸릴 프로파일과 한 박자 어긋납니다
+    if let Some(resolved) = airlock_broker::which(&program) {
+        enforcer.set_program(&resolved);
+    }
     if let Err(e) = enforcer.prepare(&policy) {
         eprintln!("airlock: {e}");
         return 70;
@@ -235,6 +260,7 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         &workspace,
         mediation,
         proxy.as_ref().map(|p| p.addr()),
+        config.anchor_dir.as_deref(),
     );
 
     let report = match airlock_broker::run(
@@ -273,6 +299,12 @@ fn genesis_argv(args: &RunArgs, workspace: &std::path::Path) -> Vec<String> {
     }
     if let Some(d) = &args.audit_dir {
         argv.push("--audit-dir".to_string());
+        argv.push(d.display().to_string());
+    }
+    // 앵커를 어디에 두었는지가 그 세션의 탐지력을 결정합니다. 같은 트리에 두었는지
+    // 다른 볼륨으로 분리했는지는 사후에 로그만 보고 알 수 있어야 합니다
+    if let Some(d) = &args.anchor_dir {
+        argv.push("--anchor-dir".to_string());
         argv.push(d.display().to_string());
     }
     // 작업 공간은 기본값이 cwd 이므로 명시 여부와 무관하게 실제 값을 남깁니다.
@@ -401,6 +433,57 @@ fn build_enforcer(
     }
 }
 
+/// 관측 층이 프로토콜을 모른 채 도는 세션의 한계.
+///
+/// 중계 층은 `connect(2)`만 보므로 모든 연결을 `tcp`로 보고합니다
+/// (`docs/limitations.md` 5.12). 곧 프록시가 없으면 `protocol` 조건 규칙이 아무것도
+/// 매칭하지 않고 `[defaults].egress_plaintext` 바닥도 발동하지 않습니다. 정책이 평문을
+/// 막는다는 보증은 프록시 층 위에서만 성립하므로, 그 사실을 배너가 직접 말해야 합니다.
+///
+/// # Arguments
+/// `policy` - 이 세션의 정책
+/// `proxy` - egress 프록시 주소. 없으면 프록시가 꺼진 세션
+fn egress_observation_gaps(policy: &Policy, proxy: Option<std::net::SocketAddr>) -> Vec<String> {
+    if proxy.is_some() {
+        return Vec::new();
+    }
+    let mut gaps = vec![
+        "중계 층은 connect(2)만 보므로 모든 연결을 protocol=tcp로 보고함. \
+         프록시 없이는 protocol 조건 규칙이 아무것도 매칭하지 않음"
+            .to_string(),
+    ];
+    let floor = policy.defaults().egress_plaintext;
+    if floor.blocks() {
+        gaps.push(format!(
+            "[defaults].egress_plaintext = \"{floor}\" 가 이 세션에서는 한 번도 발동하지 않음. \
+             평문 판정은 --egress-proxy 위에서만 성립하므로 지금은 평문 차단이 강제되지 않음"
+        ));
+    }
+    let protocol_rules: Vec<&str> = policy
+        .user_rules()
+        .iter()
+        .filter(|r| {
+            matches!(
+                &r.matcher,
+                airlock_policy::Matcher::Egress {
+                    protocol: Some(_),
+                    ..
+                }
+            )
+        })
+        .map(|r| r.id.as_str())
+        .collect();
+    if !protocol_rules.is_empty() {
+        gaps.push(format!(
+            "protocol을 지정한 egress 규칙 {}개가 이 세션에서 죽어 있음: {}",
+            protocol_rules.len(),
+            protocol_rules.join(", ")
+        ));
+    }
+    gaps
+}
+
+#[allow(clippy::too_many_arguments)]
 fn print_banner(
     policy: &Policy,
     enforcer: &dyn Enforcer,
@@ -409,6 +492,7 @@ fn print_banner(
     workspace: &std::path::Path,
     mediation: airlock_broker::Mediation,
     proxy: Option<std::net::SocketAddr>,
+    anchor_dir: Option<&std::path::Path>,
 ) {
     let digest = airlock_audit::Hash::from_bytes(policy.digest());
     let short: String = digest.to_hex().chars().take(12).collect();
@@ -438,10 +522,22 @@ fn print_banner(
     }
     eprintln!("  승인     {}", approver.describe());
     eprintln!("  감사     {}", session_dir.display());
+    let anchors = airlock_broker::anchor_dir_for(session_dir, anchor_dir);
+    if anchor_dir.is_some() {
+        eprintln!("  앵커     {}", anchors.display());
+    } else {
+        // 같은 트리에 두면 체인을 다시 계산할 수 있는 주체가 앵커도 같은 비용으로 다시
+        // 계산합니다. 분리하지 않았다는 사실을 배너가 감추면 없는 보증을 믿게 됩니다
+        eprintln!(
+            "  앵커     {} (감사 루트와 같은 트리. 재계산 탐지력 없음, --anchor-dir로 분리할 것)",
+            anchors.display()
+        );
+    }
     for gap in enforcer
         .gaps()
         .into_iter()
         .chain(airlock_broker::mediation_gaps(mediation))
+        .chain(egress_observation_gaps(policy, proxy))
     {
         eprintln!("  \x1b[33m한계\x1b[0m     {gap}");
     }
@@ -460,6 +556,21 @@ fn print_summary(report: &airlock_broker::RunReport) {
     eprintln!("  승인요청 {}", report.asked);
     eprintln!("  차단     {}", report.denied);
     eprintln!("  체인헤드 {short}");
+    match report.anchor.failure() {
+        None => eprintln!("  앵커     {}", report.anchor.path().display()),
+        // 앵커 없는 세션은 감사 보증이 약해진 세션입니다. 자식은 이미 끝났으므로 종료
+        // 코드를 덮지는 않지만, 조용히 넘기면 사용자가 그 사실을 영영 모릅니다
+        Some(why) => {
+            eprintln!(
+                "  \x1b[1;31m앵커 실패\x1b[0m {} : {why}",
+                report.anchor.path().display()
+            );
+            eprintln!(
+                "  \x1b[1;31m경고\x1b[0m     이 세션은 상위 앵커에 남지 않았음. \
+                 세션 통째 삭제와 체인 재계산을 탐지할 수 없음"
+            );
+        }
+    }
     eprintln!(
         "  검증     airlock audit verify {}",
         report.audit_dir.display()
