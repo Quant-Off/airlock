@@ -1,9 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use airlock_audit::{Entry, Event, Warning, verify_dir};
+use airlock_audit::{
+    AnchorCheck, AnchorFailure, Entry, Event, ReviewLog, Warning, check_session, verify_anchors,
+    verify_dir,
+};
 use airlock_canonical::display::sanitize;
 
 use crate::paths;
+use crate::render;
+use crate::report::{Report, range_of};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AuditCommand {
@@ -13,6 +18,14 @@ pub enum AuditCommand {
         dir: Option<PathBuf>,
         #[arg(long, help = "모든 세션을 검증함")]
         all: bool,
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "세션 상위 앵커(anchors.jsonl)가 있는 디렉토리. \
+                    airlock run --anchor-dir 로 분리했다면 같은 값을 넘겨야 함. \
+                    생략하면 감사 루트"
+        )]
+        anchor_dir: Option<PathBuf>,
     },
     #[command(about = "감사 엔트리를 사람이 읽는 형태로 출력함")]
     Show {
@@ -25,28 +38,83 @@ pub enum AuditCommand {
     },
     #[command(about = "세션 목록을 보여줌")]
     List,
+
+    #[command(
+        about = "매일 이상여부 점검 보고를 만듦",
+        long_about = "범위 안의 모든 세션을 검증하고 결정·승인·아웃바운드를 집계함. \
+이상이 하나라도 있으면 종료 코드가 비영이므로 cron 이나 launchd 에 그대로 걸 수 있음. \
+종료 코드는 0 이상 없음, 2 증거 이상(무결성·앵커·읽기 실패), 3 운영 이상(미응답 ask 등), \
+64 인자 오류, 70 내부 오류임"
+    )]
+    Report {
+        #[arg(long, value_name = "YYYY-MM-DD", help = "이 날짜 00:00:00 UTC 부터")]
+        since: Option<String>,
+        #[arg(
+            long,
+            value_name = "YYYY-MM-DD",
+            help = "이 날짜 23:59:59 UTC 까지 (그 날을 통째로 포함함)"
+        )]
+        until: Option<String>,
+        #[arg(long, help = "SIEM 과 스크립트가 먹을 수 있는 JSON 으로 출력함")]
+        json: bool,
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "앵커(anchors.jsonl)와 확인 기록(reviews.jsonl)이 있는 디렉토리. \
+                    생략하면 감사 루트"
+        )]
+        anchor_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "사람 신원 없는 자동 승인을 이상으로 셈. 기본값은 표시만 함"
+        )]
+        strict_approval: bool,
+    },
+
+    #[command(
+        about = "책임자가 점검했다는 사실을 기록함",
+        long_about = "리포트를 다시 계산해 그 범위와 다이제스트를 확인 체인에 남김. \
+확인자 uid 와 euid 는 커널에서 직접 읽고 터미널은 관측된 값만 남김. \
+종료 코드는 리포트와 같으며 기록 자체가 실패하면 70 임"
+    )]
+    Ack {
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        since: Option<String>,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        until: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        anchor_dir: Option<PathBuf>,
+        #[arg(long, value_name = "TEXT", help = "확인자가 남기는 메모")]
+        note: Option<String>,
+        #[arg(long, help = "자동 승인을 이상으로 세고 그 판정을 기록함")]
+        strict_approval: bool,
+    },
 }
 
 pub fn exec(cmd: AuditCommand, audit_root_override: Option<PathBuf>) -> i32 {
     let root = audit_root_override.unwrap_or_else(paths::audit_root);
     match cmd {
-        AuditCommand::Verify { dir, all } => {
+        AuditCommand::Verify {
+            dir,
+            all,
+            anchor_dir,
+        } => {
+            let anchors = anchor_dir.unwrap_or_else(|| root.clone());
+            let chain = report_anchor_chain(&anchors);
             if all {
                 let sessions = paths::all_sessions(&root);
                 if sessions.is_empty() {
                     eprintln!("airlock: {}에 세션이 없음", root.display());
                     return 1;
                 }
-                let mut failed = 0;
+                let mut worst = chain;
                 for s in sessions {
-                    if verify_one(&s) != 0 {
-                        failed += 1;
-                    }
+                    worst = worst.max(verify_one(&s, &anchors));
                 }
-                return if failed == 0 { 0 } else { 1 };
+                return worst;
             }
             match resolve_dir(dir, &root) {
-                Some(d) => verify_one(&d),
+                Some(d) => chain.max(verify_one(&d, &anchors)),
                 None => 1,
             }
         }
@@ -59,7 +127,151 @@ pub fn exec(cmd: AuditCommand, audit_root_override: Option<PathBuf>) -> i32 {
             None => 1,
         },
         AuditCommand::List => list(&root),
+        AuditCommand::Report {
+            since,
+            until,
+            json,
+            anchor_dir,
+            strict_approval,
+        } => report(&root, anchor_dir, since, until, json, strict_approval),
+        AuditCommand::Ack {
+            since,
+            until,
+            anchor_dir,
+            note,
+            strict_approval,
+        } => ack(&root, anchor_dir, since, until, note, strict_approval),
     }
+}
+
+/// 점검 보고를 만들어 찍고 종료 코드를 정합니다.
+///
+/// # Arguments
+/// `root` - 감사 루트
+/// `anchor_dir` - 앵커와 확인 기록이 있는 디렉토리. 생략하면 감사 루트
+/// `since` - 시작 날짜
+/// `until` - 끝 날짜
+/// `as_json` - JSON 출력 여부
+/// `strict_approval` - 자동 승인을 이상으로 셀지 여부
+fn report(
+    root: &Path,
+    anchor_dir: Option<PathBuf>,
+    since: Option<String>,
+    until: Option<String>,
+    as_json: bool,
+    strict_approval: bool,
+) -> i32 {
+    let anchors = anchor_dir.unwrap_or_else(|| root.to_path_buf());
+    let range = match range_of(since.as_deref(), until.as_deref()) {
+        Ok(r) => r,
+        Err(why) => {
+            eprintln!("airlock: {why}");
+            return 64;
+        }
+    };
+    let built = Report::build(root, &anchors, since, until, range, strict_approval);
+    if as_json {
+        match serde_json::to_string_pretty(&render::json(&built)) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                // 직렬화가 실패하면 보고가 없는 것이므로 통과로 끝내지 않습니다
+                eprintln!("airlock: 보고를 JSON 으로 만들지 못함: {e}");
+                return 70;
+            }
+        }
+    } else {
+        render::human(&built);
+    }
+    built.exit_code()
+}
+
+/// 확인 도장을 남깁니다.
+///
+/// 리포트를 다시 계산해 그 범위와 다이제스트를 그대로 기록합니다. 호출자가 다이제스트를
+/// 넘기는 경로는 없습니다. 사람이 보지 않은 범위에 도장을 찍을 수 없어야 하기 때문입니다.
+///
+/// # Arguments
+/// `root` - 감사 루트
+/// `anchor_dir` - 확인 기록을 둘 디렉토리
+/// `since` - 시작 날짜
+/// `until` - 끝 날짜
+/// `note` - 확인자 메모
+/// `strict_approval` - 자동 승인을 이상으로 셀지 여부
+fn ack(
+    root: &Path,
+    anchor_dir: Option<PathBuf>,
+    since: Option<String>,
+    until: Option<String>,
+    note: Option<String>,
+    strict_approval: bool,
+) -> i32 {
+    let anchors = anchor_dir.unwrap_or_else(|| root.to_path_buf());
+    let range = match range_of(since.as_deref(), until.as_deref()) {
+        Ok(r) => r,
+        Err(why) => {
+            eprintln!("airlock: {why}");
+            return 64;
+        }
+    };
+    let built = Report::build(root, &anchors, since, until, range, strict_approval);
+    let subject = built.subject();
+    let verdict = built.verdict();
+
+    let mut log = match ReviewLog::open(&anchors) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("airlock: 확인 기록을 열지 못함: {e}");
+            return 70;
+        }
+    };
+    let entry = match log.append(&subject, verdict, note.as_deref()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("airlock: 확인 기록을 남기지 못함: {e}");
+            return 70;
+        }
+    };
+
+    // 방금 쓴 줄이 정말 이 범위와 이 리포트를 가리키는지 다시 봅니다. 기록과 대상이
+    // 어긋난 채로 성공을 보고하면 그 도장이 알리바이가 됩니다
+    if let Err(why) = airlock_audit::check_review(&entry, &subject) {
+        eprintln!("airlock: 확인 기록이 리포트와 어긋남: {why}");
+        return 70;
+    }
+
+    let tty = match &entry.reviewer_tty {
+        Some(t) => sanitize(t),
+        None => "\x1b[33m미관측\x1b[0m".to_string(),
+    };
+    println!(
+        "\x1b[1;36mairlock\x1b[0m 확인 기록 seq {} {}",
+        entry.seq,
+        log.path().display()
+    );
+    println!(
+        "  확인자   uid={} euid={} tty={tty}",
+        entry.reviewer_uid, entry.reviewer_euid
+    );
+    println!("  시각     {}", render::short_time(entry.ts));
+    println!(
+        "  범위     {} 세션 {}개",
+        match (&entry.since, &entry.until) {
+            (None, None) => "전체".to_string(),
+            (Some(a), None) => format!("{} 이후", sanitize(a)),
+            (None, Some(b)) => format!("{} 까지", sanitize(b)),
+            (Some(a), Some(b)) => format!("{} .. {}", sanitize(a), sanitize(b)),
+        },
+        entry.sessions.len()
+    );
+    println!("  다이제스트 {}", entry.report_digest);
+    println!("  판정     {}", verdict.label());
+    if !built.anomalies.is_empty() {
+        println!(
+            "  \x1b[1;31m이상 {}건\x1b[0m 확인 기록에 이상으로 남았음. airlock audit report 로 내용을 볼 것",
+            built.anomalies.len()
+        );
+    }
+    built.exit_code()
 }
 
 fn resolve_dir(dir: Option<PathBuf>, root: &Path) -> Option<PathBuf> {
@@ -75,7 +287,75 @@ fn resolve_dir(dir: Option<PathBuf>, root: &Path) -> Option<PathBuf> {
     }
 }
 
-fn verify_one(dir: &Path) -> i32 {
+/// 앵커 체인 자체의 무결성을 먼저 보고합니다.
+///
+/// 체인이 깨져 있으면 개별 세션 대조 결과를 믿을 수 없으므로 실패로 냅니다. 파일이 아예
+/// 없는 것은 변조가 아니라 "탐지 불가"이므로 눈에 띄게 표시하되 종료 코드는 올리지
+/// 않습니다. 크래시로 죽은 세션과 앵커 삭제를 이 층에서 구분할 방법이 없기 때문입니다
+/// (`docs/audit-format.md` 8.4).
+///
+/// # Arguments
+/// `anchors` - 앵커 루트
+fn report_anchor_chain(anchors: &Path) -> i32 {
+    match verify_anchors(anchors) {
+        Ok(report) => {
+            println!(
+                "\x1b[32m앵커 확인\x1b[0m {} ({} 줄, 세션 {}개, head seq {})",
+                anchors.join(airlock_audit::ANCHOR_FILE).display(),
+                report.entries,
+                report.sessions,
+                report.head_seq
+            );
+            for w in &report.warnings {
+                println!("  \x1b[33m경고\x1b[0m {w}");
+            }
+            0
+        }
+        Err(AnchorFailure::FileAbsent) => {
+            println!(
+                "\x1b[33m앵커 탐지불가\x1b[0m {}",
+                anchors.join(airlock_audit::ANCHOR_FILE).display()
+            );
+            println!("  {}", AnchorFailure::FileAbsent);
+            println!("  세션 통째 삭제와 체인 재계산을 이 검증으로는 알 수 없음. 통과가 아님");
+            0
+        }
+        Err(failure) => {
+            println!("\x1b[1;31m앵커 실패\x1b[0m {}", anchors.display());
+            println!("  {failure}");
+            2
+        }
+    }
+}
+
+/// 세션 체인의 head가 앵커 기록과 맞는지 대조해 한 줄로 보고합니다.
+///
+/// # Arguments
+/// `anchors` - 앵커 루트
+/// `report` - 이미 통과한 세션 체인 검증 결과
+fn report_session_anchor(anchors: &Path, report: &airlock_audit::VerifyReport) -> i32 {
+    match check_session(anchors, &report.session, report.head_seq, &report.head_hash) {
+        Ok(AnchorCheck::Matches { anchor_seq }) => {
+            println!("  앵커     seq {anchor_seq}에서 head 일치");
+            0
+        }
+        // 앵커 줄이 없는 세션은 통과가 아니라 탐지 불가입니다. 이 세션이 통째로
+        // 지워졌어도 알아낼 방법이 없다는 뜻이므로 그대로 적습니다
+        Ok(AnchorCheck::Missing) => {
+            println!(
+                "  \x1b[33m앵커\x1b[0m     이 세션의 앵커 줄이 없음. 탐지 불가이며 통과가 아님"
+            );
+            0
+        }
+        Err(AnchorFailure::FileAbsent) => 0,
+        Err(failure) => {
+            println!("  \x1b[1;31m앵커 불일치\x1b[0m {failure}");
+            2
+        }
+    }
+}
+
+fn verify_one(dir: &Path, anchors: &Path) -> i32 {
     match verify_dir(dir) {
         Ok(report) => {
             println!(
@@ -93,7 +373,7 @@ fn verify_one(dir: &Path) -> i32 {
                 };
                 println!("  {label} {w}");
             }
-            0
+            report_session_anchor(anchors, &report)
         }
         Err(failure) => {
             println!("\x1b[1;31m무결성 실패\x1b[0m {}", dir.display());
@@ -108,6 +388,26 @@ fn decision_color(entry: &Entry) -> &'static str {
         airlock_audit::Decision::Allow => "\x1b[32m",
         airlock_audit::Decision::Ask => "\x1b[33m",
         airlock_audit::Decision::Deny | airlock_audit::Decision::Forbid => "\x1b[31m",
+    }
+}
+
+/// 승인자 신원을 사람이 읽는 한 조각으로 만듭니다.
+///
+/// 신원이 없는 승인은 `--yes` 자동 승인이거나 신원을 관측하지 못한 채널입니다. 그것을
+/// 사람이 승인한 것처럼 보이게 하면 감사 로그가 거짓 보증을 하므로, 없다는 사실을
+/// 그대로 적습니다.
+///
+/// # Arguments
+/// `uid` - 승인에 답한 계정의 실효 uid
+/// `tty` - 승인 프롬프트가 나간 터미널 장치 경로
+fn approver(uid: Option<u32>, tty: Option<&str>) -> String {
+    match (uid, tty) {
+        (None, None) => "\x1b[33m승인자없음(사람 확인 아님)\x1b[0m".to_string(),
+        (uid, tty) => {
+            let uid = uid.map_or_else(|| "?".to_string(), |u| u.to_string());
+            let tty = tty.map_or_else(|| "?".to_string(), sanitize);
+            format!("승인자 uid={uid} tty={tty}")
+        }
     }
 }
 
@@ -158,12 +458,30 @@ fn describe_event(event: &Event) -> String {
             port,
             protocol,
         } => format!("아웃바운드 {protocol} {}:{port}", sanitize(host)),
+        Event::EgressSummary {
+            host,
+            port,
+            protocol,
+            bytes_out,
+            bytes_in,
+            duration_ms,
+        } => format!(
+            "아웃바운드 종료 {protocol} {}:{port} 반출 {} 수신 {} {}",
+            sanitize(host),
+            render::human_bytes(*bytes_out),
+            render::human_bytes(*bytes_in),
+            render::human_millis(*duration_ms)
+        ),
         Event::Approval {
             for_seq,
             granted,
             note,
+            approver_uid,
+            approver_tty,
         } => {
             let mut s = format!("승인응답 seq={for_seq} {granted}");
+            s.push(' ');
+            s.push_str(&approver(*approver_uid, approver_tty.as_deref()));
             if let Some(n) = note {
                 s.push_str(&format!(" ({})", sanitize(n)));
             }

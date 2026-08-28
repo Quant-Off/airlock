@@ -3,6 +3,8 @@ mod cmd_policy;
 mod cmd_run;
 mod cmd_setup;
 mod paths;
+mod render;
+mod report;
 
 use std::path::PathBuf;
 

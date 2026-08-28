@@ -85,6 +85,21 @@ fn printed(out: &Output) -> String {
     format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(out))
 }
 
+/// 이 테스트들이 쓰는 쉘.
+///
+/// macOS 의 `/bin/sh` 는 dyld variant 기구로 자기를 `/bin/bash` 로 다시 exec 합니다.
+/// `[defaults].exec` 이 allow 가 아닌 정책에서는 exec 이 커널 화이트리스트가 되므로,
+/// 최상위 프로그램만 허용해서는 그 재실행이 막혀 프로세스가 뜨지 못합니다
+/// (`docs/limitations.md` 4.13). 그 성질 자체는 강제 층 테스트가 따로 고정하므로
+/// 여기서는 variant 를 쓰지 않는 쉘을 고릅니다
+fn shell() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/bin/zsh"
+    } else {
+        "/bin/sh"
+    }
+}
+
 fn work_dir(s: &Scratch) -> PathBuf {
     let ws = s.path().join("work");
     std::fs::create_dir_all(&ws).unwrap();
@@ -213,7 +228,7 @@ fn a_signaled_child_does_not_look_like_success() {
             s.audit().to_str().unwrap(),
             "--yes",
             "--",
-            "/bin/sh",
+            shell(),
             "-c",
             "kill -TERM $$",
         ],
@@ -459,4 +474,417 @@ fn shipped_policy_presets_load() {
         );
         assert_eq!(code(&out), 0, "{name}: {}", stderr(&out));
     }
+}
+
+// ---------- 매일 이상여부 점검과 책임자 확인 ----------
+
+/// 세션 하나를 남기고 그 감사 루트를 돌려줍니다
+fn one_session(s: &Scratch, ws: &Path) {
+    let out = airlock(
+        s,
+        ws,
+        &[
+            "run",
+            "--audit-dir",
+            s.audit().to_str().unwrap(),
+            "--yes",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+fn report(s: &Scratch, ws: &Path, extra: &[&str]) -> Output {
+    let root = s.audit();
+    let root = root.to_str().unwrap();
+    let mut args = vec!["audit", "report", "--audit-root", root];
+    args.extend_from_slice(extra);
+    airlock(s, ws, &args)
+}
+
+fn report_json(s: &Scratch, ws: &Path) -> serde_json::Value {
+    let out = report(s, ws, &["--json"]);
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("JSON 을 파싱하지 못함: {e}\n{}", printed(&out)))
+}
+
+#[test]
+fn a_clean_report_exits_zero() {
+    let s = Scratch::new("report-ok");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 0, "{}", printed(&out));
+    let text = printed(&out);
+    assert!(text.contains("이상 없음"), "{text}");
+    assert!(
+        text.contains("확인 기록 없음"),
+        "확인 기록이 없다는 사실이 드러나야 함: {text}"
+    );
+}
+
+#[test]
+fn a_tampered_chain_makes_the_report_exit_non_zero() {
+    let s = Scratch::new("report-tamper");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+
+    let chain = s.session().join("chain.jsonl");
+    let body = std::fs::read_to_string(&chain).unwrap();
+    std::fs::write(&chain, body.replacen("\"allow\"", "\"deny\"", 1)).unwrap();
+
+    let out = report(&s, &ws, &[]);
+    assert_ne!(
+        code(&out),
+        0,
+        "변조된 체인이 통과하면 안 됨: {}",
+        printed(&out)
+    );
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+    assert!(printed(&out).contains("integrity"), "{}", printed(&out));
+}
+
+#[test]
+fn a_missing_anchor_makes_the_report_exit_non_zero() {
+    // 탐지 불가는 통과가 아닙니다
+    let s = Scratch::new("report-noanchor");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+    std::fs::remove_file(s.audit().join("anchors.jsonl")).unwrap();
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+    assert!(printed(&out).contains("탐지"), "{}", printed(&out));
+}
+
+#[test]
+fn a_deleted_session_directory_is_caught_by_the_anchor_chain() {
+    // 남은 세션만 훑으면 세션 통째 삭제가 "이상 없음" 으로 보고됩니다
+    let s = Scratch::new("report-deleted");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+    std::fs::remove_dir_all(s.audit().join("sessions")).unwrap();
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+    assert!(
+        printed(&out).contains("session_missing"),
+        "{}",
+        printed(&out)
+    );
+}
+
+#[test]
+fn a_tampered_review_chain_makes_the_report_exit_non_zero() {
+    let s = Scratch::new("report-review-tamper");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+    let ack = airlock(
+        &s,
+        &ws,
+        &["audit", "ack", "--audit-root", s.audit().to_str().unwrap()],
+    );
+    assert_eq!(code(&ack), 0, "{}", printed(&ack));
+
+    let reviews = s.audit().join("reviews.jsonl");
+    let body = std::fs::read_to_string(&reviews).unwrap();
+    std::fs::write(&reviews, body.replacen("\"clean\"", "\"anomalous\"", 1)).unwrap();
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+    assert!(
+        printed(&out).contains("review_chain_broken"),
+        "{}",
+        printed(&out)
+    );
+}
+
+#[test]
+fn a_deleted_review_line_is_caught() {
+    let s = Scratch::new("report-review-delete");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+    for _ in 0..2 {
+        let ack = airlock(
+            &s,
+            &ws,
+            &["audit", "ack", "--audit-root", s.audit().to_str().unwrap()],
+        );
+        assert_eq!(code(&ack), 0, "{}", printed(&ack));
+    }
+
+    let reviews = s.audit().join("reviews.jsonl");
+    let body = std::fs::read_to_string(&reviews).unwrap();
+    let kept: Vec<&str> = body.lines().skip(1).collect();
+    std::fs::write(&reviews, format!("{}\n", kept.join("\n"))).unwrap();
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+}
+
+#[test]
+fn ack_records_the_reviewer_and_the_report_shows_it() {
+    let s = Scratch::new("ack");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+
+    let ack = airlock(
+        &s,
+        &ws,
+        &[
+            "audit",
+            "ack",
+            "--audit-root",
+            s.audit().to_str().unwrap(),
+            "--note",
+            "일일 점검 완료",
+        ],
+    );
+    assert_eq!(code(&ack), 0, "{}", printed(&ack));
+    assert!(printed(&ack).contains("확인 기록"), "{}", printed(&ack));
+
+    let after = report(&s, &ws, &[]);
+    assert_eq!(code(&after), 0, "{}", printed(&after));
+    let text = printed(&after);
+    assert!(text.contains("마지막 확인"), "{text}");
+    assert!(text.contains("일일 점검 완료"), "{text}");
+    assert!(!text.contains("확인 기록 없음"), "{text}");
+
+    // 확인자 uid 는 커널이 읽은 값이어야 합니다
+    let json = report_json(&s, &ws);
+    let last = &json["review"]["last"];
+    assert!(last["reviewer_uid"].is_number(), "{json}");
+    assert!(last["reviewer_euid"].is_number(), "{json}");
+    assert_eq!(last["verdict"], "clean", "{json}");
+    assert_eq!(json["review"]["status"], "ok", "{json}");
+}
+
+#[test]
+fn a_new_session_after_the_last_ack_is_revealed() {
+    // 매일 점검이 밀렸는지 사람이 보는 유일한 방법입니다
+    let s = Scratch::new("ack-stale");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+    let ack = airlock(
+        &s,
+        &ws,
+        &["audit", "ack", "--audit-root", s.audit().to_str().unwrap()],
+    );
+    assert_eq!(code(&ack), 0, "{}", printed(&ack));
+
+    one_session(&s, &ws);
+    let out = report(&s, &ws, &[]);
+    let text = printed(&out);
+    assert!(text.contains("미확인"), "새 세션이 드러나야 함: {text}");
+
+    let json = report_json(&s, &ws);
+    assert_eq!(json["review"]["sessions_after_last_review"], 1, "{json}");
+}
+
+#[test]
+fn acking_a_different_range_does_not_cover_this_one() {
+    // 사람이 보지 않은 범위에 도장을 옮겨 찍을 수 없어야 합니다
+    let s = Scratch::new("ack-range");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+
+    let ack = airlock(
+        &s,
+        &ws,
+        &[
+            "audit",
+            "ack",
+            "--audit-root",
+            s.audit().to_str().unwrap(),
+            "--since",
+            "2000-01-01",
+            "--until",
+            "2000-01-02",
+        ],
+    );
+    assert_eq!(code(&ack), 0, "{}", printed(&ack));
+
+    let json = report_json(&s, &ws);
+    let last = &json["review"]["last"];
+    assert_eq!(last["since"], "2000-01-01", "{json}");
+    assert!(
+        last["sessions"].as_array().map(|v| v.len()) == Some(0),
+        "그 범위에는 세션이 없었으므로 이 범위를 확인한 것이 아님: {json}"
+    );
+    assert_ne!(
+        last["report_digest"], json["report_digest"],
+        "다른 범위의 다이제스트가 이 범위의 것과 같으면 안 됨: {json}"
+    );
+}
+
+#[test]
+fn a_bad_date_is_a_usage_error() {
+    let s = Scratch::new("report-baddate");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+    for bad in ["2026-13-01", "20260826", "2026-02-30"] {
+        let out = report(&s, &ws, &["--since", bad]);
+        assert_eq!(code(&out), 64, "{bad}: {}", printed(&out));
+    }
+}
+
+#[test]
+fn the_json_report_has_a_stable_schema_and_no_colour_codes() {
+    let s = Scratch::new("report-json");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+
+    let out = report(&s, &ws, &["--json"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!text.contains('\u{1b}'), "JSON 에 색상 코드가 섞이면 안 됨");
+
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON 파싱");
+    assert_eq!(json["schema"], "airlock.audit-report.v1");
+    for key in [
+        "generated_ts",
+        "root",
+        "anchor_dir",
+        "range",
+        "body_digest",
+        "report_digest",
+        "verdict",
+        "exit_code",
+        "anchor_chain",
+        "review",
+        "sessions",
+        "totals",
+        "anomalies",
+    ] {
+        assert!(!json[key].is_null(), "{key} 가 없음: {json}");
+    }
+    let session = &json["sessions"][0];
+    for key in [
+        "dir",
+        "session",
+        "started_ts",
+        "integrity",
+        "anchor",
+        "decisions",
+        "approvals",
+        "denied_exec",
+        "egress",
+    ] {
+        assert!(!session[key].is_null(), "sessions[0].{key} 가 없음: {json}");
+    }
+    assert_eq!(session["integrity"]["status"], "ok", "{json}");
+    assert_eq!(session["anchor"]["status"], "matches", "{json}");
+    assert_eq!(json["exit_code"], 0, "{json}");
+}
+
+#[test]
+fn an_auto_approved_session_never_looks_human_confirmed() {
+    // --yes 세션의 승인은 사람 신원이 없습니다. 그것을 사람 확인처럼 보이게 하면
+    // 승인 통제 자체가 무의미해집니다
+    let s = Scratch::new("report-auto");
+    let ws = work_dir(&s);
+    // 베이스라인의 sudo-exec 이 ask 이므로 --yes 가 그것을 자동 승인합니다
+    let out = airlock(
+        &s,
+        &ws,
+        &[
+            "run",
+            "--audit-dir",
+            s.audit().to_str().unwrap(),
+            "--observe",
+            "--yes",
+            "--",
+            "/usr/bin/sudo",
+            "-V",
+        ],
+    );
+    let _ = out;
+
+    let json = report_json(&s, &ws);
+    let approvals = &json["sessions"][0]["approvals"];
+    assert_eq!(
+        approvals["identified"], 0,
+        "자동 승인이 사람 승인으로 세어지면 안 됨: {json}"
+    );
+    if approvals["unidentified"].as_u64().unwrap_or(0) > 0 {
+        assert!(
+            printed(&report(&s, &ws, &[])).contains("신원없음"),
+            "신원 없는 승인이 화면에 드러나야 함"
+        );
+        // --strict-approval 은 신원 없이 허용된 건만 이상으로 셉니다
+        if approvals["auto_granted"].as_u64().unwrap_or(0) > 0 {
+            let strict = report(&s, &ws, &["--strict-approval"]);
+            assert_eq!(code(&strict), 3, "{}", printed(&strict));
+        }
+    }
+}
+
+#[test]
+fn an_unanswered_ask_is_an_operational_anomaly() {
+    // 사람이 답하지 않고 죽은 세션을 직접 만듭니다. 브로커 경로로는 승인자가 언제나
+    // 무언가를 답하므로 이 상태는 크래시로만 생깁니다
+    use airlock_audit::{
+        AnchorLog, AuditLog, Decision, Enforcement, Event, GenesisInfo, Hash, Mediation, Record,
+        SessionId,
+    };
+
+    let s = Scratch::new("report-unanswered");
+    let ws = work_dir(&s);
+    let dir = s.audit().join("sessions").join("1700000000000000000-1");
+    let id = SessionId::from_bytes([3; 16]);
+    let (head_seq, head_hash) = {
+        let mut log = AuditLog::create(
+            &dir,
+            id,
+            Enforcement::Observe,
+            true,
+            GenesisInfo {
+                airlock_version: "0.0.0-test".into(),
+                argv: vec!["airlock".into(), "run".into()],
+                cwd: "/tmp".into(),
+                policy_digest: Hash::ZERO,
+                policy_source: None,
+                mediation: Mediation::Off,
+                operator: None,
+                policy_signer: None,
+            },
+        )
+        .unwrap();
+        log.append(
+            Record::new(
+                "pid:1 test",
+                Event::Exec {
+                    program: "/bin/rm".into(),
+                    argv: vec!["rm".into(), "-rf".into()],
+                    cwd: "/tmp".into(),
+                },
+                Decision::Ask,
+            )
+            .with_rule("danger-rm"),
+        )
+        .unwrap();
+        (log.head_seq().unwrap(), log.head_hash())
+    };
+    AnchorLog::open(s.audit())
+        .unwrap()
+        .append(id, head_seq, head_hash)
+        .unwrap();
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 3, "{}", printed(&out));
+    assert!(
+        printed(&out).contains("unanswered_ask"),
+        "{}",
+        printed(&out)
+    );
+
+    let json = report_json(&s, &ws);
+    assert_eq!(
+        json["sessions"][0]["approvals"]["unanswered_ask"], 1,
+        "{json}"
+    );
+    assert_eq!(json["exit_code"], 3, "{json}");
+    assert_eq!(json["verdict"], "anomalous", "{json}");
 }
