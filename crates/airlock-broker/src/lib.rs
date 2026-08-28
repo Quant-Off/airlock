@@ -17,15 +17,17 @@ pub mod notify;
 
 pub use airlock_audit::Mediation;
 pub use approve::{
-    ApprovalRequest, ApproveAll, Approver, DEFAULT_ASK_TIMEOUT, RefuseAll, TtyApprover,
+    ApprovalRequest, ApproveAll, Approver, ApproverIdentity, DEFAULT_ASK_TIMEOUT, RefuseAll,
+    TtyApprover,
 };
 pub use egress::SessionGate;
 pub use enforcer::{Enforcer, ObserveEnforcer, default_enforcer};
 pub use error::{BrokerError, Result};
 pub use profile::{GeneratedProfile, ProfileOptions};
 pub use session::{
-    Outcome, PROXY_RULE_ID, RunReport, Session, SessionConfig, effective_mediation, mediation_gaps,
-    run, which,
+    Actor, AnchorOutcome, Closed, Outcome, PROXY_RULE_ID, RunReport, Session, SessionConfig,
+    UNKNOWN_ACTOR, anchor_dir_for, effective_mediation, mediation_gaps, policy_protocol_of, run,
+    which,
 };
 
 #[cfg(target_os = "macos")]

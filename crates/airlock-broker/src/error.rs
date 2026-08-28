@@ -22,6 +22,11 @@ pub enum BrokerError {
     ProfileNotRepresentable(Vec<String>),
     NoControlTerminal,
     InvalidPath(PathBuf),
+    /// 이미 닫힌 세션에 엔트리를 붙이려 했습니다.
+    ///
+    /// `SessionEnd` 뒤에 자란 체인은 앵커보다 앞서 나가서 "종료 후 덧붙이기" 로 보고됩니다.
+    /// 늦게 도착한 사실 하나를 남기려다 세션 전체의 무결성 보고를 깨뜨리지 않습니다
+    SessionClosed,
 }
 
 impl fmt::Display for BrokerError {
@@ -54,6 +59,11 @@ impl fmt::Display for BrokerError {
                 "/dev/tty를 열 수 없어 승인을 받을 수 없음. ask 결정은 거부로 처리됨"
             ),
             Self::InvalidPath(p) => write!(f, "경로를 다룰 수 없음: {}", p.display()),
+            Self::SessionClosed => write!(
+                f,
+                "세션이 이미 닫힘. session_end 뒤에 엔트리를 붙이면 앵커보다 체인이 길어져 \
+                 종료 후 덧붙이기로 보고됨"
+            ),
         }
     }
 }

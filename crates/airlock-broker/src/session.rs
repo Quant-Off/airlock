@@ -3,7 +3,8 @@ use std::process::Command;
 
 use airlock_audit as audit;
 use airlock_audit::{
-    AuditLog, Decision, Enforcement, Event, GenesisInfo, Granted, Mediation, Record,
+    ANCHOR_FILE, AnchorLog, AuditLog, Decision, Enforcement, Event, GenesisInfo, Granted,
+    Mediation, Record,
 };
 use airlock_policy::{Action, Evaluation, FileMode, MatchedRule, Policy, Tier};
 
@@ -15,6 +16,35 @@ use crate::error::{BrokerError, Result};
 ///
 /// 규칙 없는 allow 로 남기면 정책이 연 것처럼 보이므로 출처를 분명히 적습니다
 pub const PROXY_RULE_ID: &str = "airlock:egress-proxy";
+
+/// 행위 주체를 관측하지 못한 판정이 감사에 남을 때 쓰는 actor.
+///
+/// 프록시 경로는 연결의 peer pid 를 알지 못합니다. 브로커 자신의 actor 를 쓰면 브로커가
+/// 한 일처럼 보이고, 관측된 pid 를 쓰면 없는 관측을 지어내는 것이 됩니다. 모른다는 사실
+/// 자체를 이름으로 남깁니다
+pub const UNKNOWN_ACTOR: &str = "airlock:unknown-peer";
+
+/// 아웃바운드 결과 기록이 감사에 남을 때 쓰는 규칙 id.
+///
+/// `EgressSummary` 는 판정이 아니라 사실 기록입니다. `decision` 자리는 스키마 때문에
+/// `allow` 지만 그것을 허용한 규칙은 없습니다. 규칙 없는 allow 로 남기면 `[defaults]` 가
+/// 열어 준 것처럼 보이므로, 판정이 아니라는 사실 자체를 이름으로 남깁니다
+pub const EGRESS_SUMMARY_RULE_ID: &str = "airlock:egress-summary";
+
+/// 감사 엔트리의 `actor` 자리에 들어갈 주체.
+///
+/// 세 경우가 로그에서 서로 구분되어야 합니다. 브로커가 스스로 부른 판정, 중계 층이 pid
+/// 까지 관측한 판정, 주체를 모르는 채로 내린 판정은 사후 조사에서 뜻이 전혀 다릅니다
+/// (`docs/limitations.md` 7.6)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Actor {
+    /// 브로커가 직접 부른 판정. 세션 actor 를 그대로 씁니다
+    Broker,
+    /// 중계 층이 관측한 실제 행위 주체의 pid
+    Observed(u32),
+    /// 행위 주체를 관측할 수 없는 경로
+    Unknown,
+}
 
 pub fn decision_of(action: Action) -> Decision {
     match action {
@@ -33,6 +63,23 @@ pub fn audit_mode_of(mode: FileMode) -> audit::FileMode {
         FileMode::Delete => audit::FileMode::Delete,
         FileMode::Metadata => audit::FileMode::Metadata,
         FileMode::Exec => audit::FileMode::Exec,
+    }
+}
+
+/// 감사 층의 프로토콜 태그를 정책 어휘로 옮깁니다.
+///
+/// 정책에는 UDP 가 없으므로 `Udp` 는 `Tcp` 로 낮춥니다. `Tcp` 는 "관측 층이 프로토콜을
+/// 모른다" 는 뜻이라 평문 바닥이 발동하지 않는 쪽이고, UDP 만 통과시키는 특례가 생기지
+/// 않습니다. 태그 번호는 두 타입이 같지만 변환을 명시적으로 두어 한쪽이 늘어날 때
+/// 컴파일이 깨지게 합니다
+///
+/// # Arguments
+/// `protocol` - 감사 층이 기록할 프로토콜 태그
+pub fn policy_protocol_of(protocol: audit::Protocol) -> airlock_policy::Protocol {
+    match protocol {
+        audit::Protocol::Tcp | audit::Protocol::Udp => airlock_policy::Protocol::Tcp,
+        audit::Protocol::Tls => airlock_policy::Protocol::Tls,
+        audit::Protocol::Http => airlock_policy::Protocol::Http,
     }
 }
 
@@ -63,6 +110,120 @@ pub struct SessionConfig {
     /// 요청된 중계 수준. 이 플랫폼에서 실제로 적용되는 값은
     /// [`effective_mediation`]이 정하며, 제네시스에는 적용된 값이 기록됩니다
     pub mediation: Mediation,
+    /// 세션 상위 앵커 체인을 둘 디렉토리. `None`이면 [`anchor_dir_for`]가 정합니다
+    pub anchor_dir: Option<PathBuf>,
+}
+
+/// 이 세션의 앵커 루트를 정합니다.
+///
+/// 명시값이 없으면 감사 루트를 씁니다. 세션 디렉토리는 `<감사루트>/sessions/<세션>`
+/// 이므로 `sessions`를 한 단계 더 거슬러 올라갑니다 (`docs/audit-format.md` 8.1).
+/// 그 레이아웃이 아니면 세션 디렉토리 바로 위를 씁니다. 어느 쪽이든 앵커는 세션
+/// 디렉토리 바깥이라 세션 통째 삭제가 흔적을 남깁니다.
+///
+/// # Arguments
+/// `audit_dir` - 이 세션의 체인이 들어갈 디렉토리
+/// `explicit` - 사용자가 지정한 앵커 루트
+pub fn anchor_dir_for(audit_dir: &Path, explicit: Option<&Path>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir.to_path_buf();
+    }
+    let Some(parent) = audit_dir.parent() else {
+        return audit_dir.to_path_buf();
+    };
+    if parent.file_name() == Some(std::ffi::OsStr::new("sessions"))
+        && let Some(root) = parent.parent()
+    {
+        return root.to_path_buf();
+    }
+    parent.to_path_buf()
+}
+
+/// 앵커 append 를 직렬화하는 잠금 파일 이름.
+///
+/// 앵커 루트는 여러 airlock 프로세스가 공유합니다. 이름을 점으로 시작해 세션 디렉토리
+/// 목록과 섞이지 않게 둡니다
+pub const ANCHOR_LOCK_FILE: &str = ".anchors.lock";
+
+/// 자식이 끝난 뒤 프록시 릴레이가 결과를 남길 때까지 기다리는 상한.
+///
+/// 자식은 이미 종료했으므로 그 자식이 열어 둔 연결은 대개 곧바로 닫힙니다. 상한을 두는
+/// 이유는 자식이 남긴 긴 연결 하나에 세션 종료가 무한히 묶이지 않게 하기 위함입니다
+pub const PROXY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 앵커 루트를 만들고 프로세스 사이 잠금을 잡습니다.
+///
+/// [`AnchorLog::open`]은 기존 체인을 끝까지 읽어 head를 잡은 뒤 이어 붙입니다. 두 세션이
+/// 같은 앵커 루트에서 동시에 끝나면 둘 다 같은 head를 읽고 같은 seq로 써서 체인이 깨지고,
+/// 깨진 체인에는 그 뒤로 아무도 이어 붙이지 못합니다. 앵커는 세션당 한 줄뿐이라 이 잠금이
+/// 성능을 지배하지 않습니다.
+///
+/// 반환한 파일이 살아 있는 동안 잠금이 유지되며 닫히면 커널이 놓습니다.
+///
+/// # Arguments
+/// `dir` - 앵커 루트
+///
+/// # Errors
+/// 디렉토리를 만들지 못하거나 잠금 파일을 열지 못하면 실패합니다. 잠금 없이 이어 붙이는
+/// 경로는 두지 않습니다. 체인을 깨뜨리는 쪽이 앵커를 못 남기는 쪽보다 나쁩니다.
+fn lock_anchor_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let path = dir.join(ANCHOR_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)?;
+
+    // # Safety
+    // flock 은 유효한 fd 하나와 상수 플래그만 받고 메모리를 건드리지 않습니다. 잠금은
+    // 열린 파일 서술에 붙으므로 같은 프로세스의 다른 열기끼리도 서로를 배제합니다
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// 세션 하나의 앵커 기록 결과.
+///
+/// 실패를 `Ok`로 삼키지 않는 자리입니다. 앵커 없는 세션은 감사 보증이 약해진 세션이며,
+/// 그 사실이 보고에 남아야 사용자가 알아챌 수 있습니다
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorOutcome {
+    Written { path: PathBuf, seq: u64 },
+    Failed { path: PathBuf, why: String },
+}
+
+impl AnchorOutcome {
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Written { .. } => None,
+            Self::Failed { why, .. } => Some(why),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Written { path, .. } | Self::Failed { path, .. } => path,
+        }
+    }
+}
+
+/// 세션을 닫은 결과.
+#[derive(Debug, Clone)]
+pub struct Closed {
+    pub head_seq: Option<u64>,
+    pub head_hash: audit::Hash,
+    pub anchor: AnchorOutcome,
 }
 
 /// 요청한 중계 수준이 이 플랫폼에서 실제로 무엇이 되는지.
@@ -143,6 +304,11 @@ pub struct Session {
     asked: u64,
     denied: u64,
     proxy: Option<std::net::SocketAddr>,
+    anchor_dir: PathBuf,
+    /// 목적지별 누적 반출 바이트. `max_bytes_out` 판정의 입력입니다
+    egress_bytes_out: std::collections::HashMap<(String, u16), u64>,
+    /// `SessionEnd` 를 이미 썼는지. 그 뒤의 append 는 거부합니다
+    closed: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -180,6 +346,10 @@ impl Session {
                 policy_digest: audit::Hash::from_bytes(policy.digest()),
                 policy_source: config.policy_source.clone(),
                 mediation: config.mediation,
+                // 사람 식별자와 정책 서명자는 아직 관측 경로가 없습니다. 자리를 채우려고
+                // 계정 이름을 넣으면 없는 책임 주체를 지어내는 것이 됩니다
+                operator: None,
+                policy_signer: None,
             },
         )?;
 
@@ -192,7 +362,15 @@ impl Session {
             asked: 0,
             denied: 0,
             proxy: None,
+            anchor_dir: anchor_dir_for(&config.audit_dir, config.anchor_dir.as_deref()),
+            egress_bytes_out: std::collections::HashMap::new(),
+            closed: false,
         })
+    }
+
+    /// 이 세션이 앵커를 남길 디렉토리.
+    pub fn anchor_dir(&self) -> &Path {
+        &self.anchor_dir
     }
 
     /// 이 세션의 egress 프록시 주소를 알려 줍니다.
@@ -253,14 +431,33 @@ impl Session {
         }
     }
 
+    /// 이 판정을 누구의 것으로 기록할지 정합니다.
+    ///
+    /// # Arguments
+    /// `actor` - 호출부가 관측한 주체
+    fn actor_label(&self, actor: Actor) -> String {
+        match actor {
+            Actor::Broker => self.actor.clone(),
+            Actor::Observed(pid) => format!("pid:{pid}"),
+            Actor::Unknown => UNKNOWN_ACTOR.to_string(),
+        }
+    }
+
     fn commit(
         &mut self,
         event: Event,
         eval: &Evaluation,
         request: ApprovalRequest,
+        actor: Actor,
     ) -> Result<Outcome> {
+        // 닫힌 세션에는 붙이지 않습니다. 늦게 도착한 판정 하나를 남기려다 체인이 앵커보다
+        // 길어지면 세션 전체가 "종료 후 덧붙이기" 로 보고됩니다. 호출부는 이 오류를
+        // 거부로 처리하므로 늦은 연결은 통과하지 못합니다
+        if self.closed {
+            return Err(BrokerError::SessionClosed);
+        }
         let decision = decision_of(eval.action);
-        let mut record = Record::new(self.actor.clone(), event, decision);
+        let mut record = Record::new(self.actor_label(actor), event, decision);
         if let Some(rule) = &eval.rule {
             record = record.with_rule(rule.id.clone());
         }
@@ -287,12 +484,17 @@ impl Session {
         }
 
         let note = self.approver.note();
+        // 신원은 승인 채널이 스스로 관측한 것만 씁니다. 사람이 답하지 않는 승인자는
+        // 반드시 None 이며, 그 구분이 감사 로그에서 자동 승인을 드러냅니다
+        let identity = self.approver.identity();
         self.log.append(Record::new(
             audit::BROKER_ACTOR,
             Event::Approval {
                 for_seq: entry.seq,
                 granted,
                 note,
+                approver_uid: identity.as_ref().map(|i| i.uid),
+                approver_tty: identity.and_then(|i| i.tty),
             },
             decision_of(effective),
         ))?;
@@ -303,7 +505,13 @@ impl Session {
         })
     }
 
-    pub fn check_file(&mut self, path: &Path, mode: FileMode) -> Result<Outcome> {
+    /// 파일 접근 하나를 판정하고 기록합니다.
+    ///
+    /// # Arguments
+    /// `path` - 관측된 경로
+    /// `mode` - 접근 모드
+    /// `actor` - 이 접근을 실제로 시도한 주체
+    pub fn check_file(&mut self, path: &Path, mode: FileMode, actor: Actor) -> Result<Outcome> {
         let cwd = self.cwd.clone();
         let eval = self.policy.evaluate_file(path, mode, &cwd);
         let (requested, resolved) = self.resolve(&eval);
@@ -320,10 +528,16 @@ impl Session {
             path_resolved: resolved,
             mode: audit_mode_of(mode),
         };
-        self.commit(event, &eval, request)
+        self.commit(event, &eval, request, actor)
     }
 
-    pub fn check_exec(&mut self, program: &Path, argv: &[String]) -> Result<Outcome> {
+    /// 프로세스 실행 하나를 판정하고 기록합니다.
+    ///
+    /// # Arguments
+    /// `program` - 관측된 프로그램 경로
+    /// `argv` - 관측된 argv
+    /// `actor` - 이 실행을 실제로 시도한 주체
+    pub fn check_exec(&mut self, program: &Path, argv: &[String], actor: Actor) -> Result<Outcome> {
         let cwd = self.cwd.clone();
         let eval = self.policy.evaluate_exec(program, argv, &cwd);
         let (requested, resolved) = self.resolve(&eval);
@@ -341,14 +555,22 @@ impl Session {
             argv: argv.to_vec(),
             cwd: cwd.to_string_lossy().into_owned(),
         };
-        self.commit(event, &eval, request)
+        self.commit(event, &eval, request, actor)
     }
 
+    /// 아웃바운드 연결 하나를 판정하고 기록합니다.
+    ///
+    /// # Arguments
+    /// `host` - 관측된 호스트 문자열
+    /// `port` - 목적지 포트
+    /// `protocol` - 관측 층이 판단한 프로토콜. 중계 층은 항상 `Tcp`를 넘김
+    /// `actor` - 이 연결을 실제로 시도한 주체
     pub fn check_egress(
         &mut self,
         host: &str,
         port: u16,
         protocol: audit::Protocol,
+        actor: Actor,
     ) -> Result<Outcome> {
         let eval = if self.is_proxy_endpoint(host, port) {
             Evaluation {
@@ -363,25 +585,119 @@ impl Session {
                 path: None,
             }
         } else {
-            self.policy.evaluate_egress(host, port)
+            // 누적 반출량을 함께 넘겨 총량 한도까지 한 지점에서 판정합니다. 브로커가 따로
+            // 한도를 검사하면 두 판정 지점이 언젠가 갈라집니다
+            self.policy.evaluate_egress_with_usage(
+                host,
+                port,
+                policy_protocol_of(protocol),
+                self.bytes_out_to(host, port),
+            )
         };
         let request = ApprovalRequest::new("아웃바운드 연결 시도")
             .fact("호스트", host.to_string())
-            .fact("포트", port.to_string());
+            .fact("포트", port.to_string())
+            .fact("프로토콜", protocol.as_str());
 
         let event = Event::Egress {
             host: host.to_string(),
             port,
             protocol,
         };
-        self.commit(event, &eval, request)
+        self.commit(event, &eval, request, actor)
     }
 
-    pub fn finish(&mut self, status: Option<&std::process::ExitStatus>) -> Result<audit::Hash> {
+    /// 이 세션에서 그 목적지로 지금까지 반출한 누적 바이트.
+    ///
+    /// 프록시 층이 결과를 남긴 만큼만 셉니다. 프록시 없는 세션에서는 언제나 0 이며, 곧
+    /// `max_bytes_out` 이 한 번도 걸리지 않습니다 (`docs/limitations.md`).
+    ///
+    /// # Arguments
+    /// `host` - 관측된 호스트 문자열
+    /// `port` - 목적지 포트
+    pub fn bytes_out_to(&self, host: &str, port: u16) -> u64 {
+        self.egress_bytes_out
+            .get(&(quota_key(host), port))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 끝난 아웃바운드 연결 하나의 결과를 기록합니다.
+    ///
+    /// **정책을 다시 평가하지 않습니다.** 판정은 연결 시작 시점에 이미 끝났고 이것은 그
+    /// 결과입니다. `decision` 이 `allow` 인 것은 스키마 때문이며 규칙 id 가 사실 기록임을
+    /// 밝힙니다.
+    ///
+    /// 누적 반출량을 여기서 갱신합니다. 곧 `max_bytes_out` 이 다음 연결부터 걸립니다.
+    ///
+    /// # Arguments
+    /// `host` - 프록시가 관측한 목적지 호스트
+    /// `port` - 목적지 포트
+    /// `protocol` - 프록시가 관측한 프로토콜
+    /// `bytes_out` - 목적지로 실제로 나간 바이트
+    /// `bytes_in` - 목적지에서 실제로 받은 바이트
+    /// `duration_ms` - 연결이 살아 있던 밀리초
+    /// `actor` - 이 연결을 낸 주체. 프록시 경로는 관측하지 못함
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_egress_summary(
+        &mut self,
+        host: &str,
+        port: u16,
+        protocol: audit::Protocol,
+        bytes_out: u64,
+        bytes_in: u64,
+        duration_ms: u64,
+        actor: Actor,
+    ) -> Result<()> {
+        if self.closed {
+            return Err(BrokerError::SessionClosed);
+        }
+        self.log.append(
+            Record::new(
+                self.actor_label(actor),
+                Event::EgressSummary {
+                    host: host.to_string(),
+                    port,
+                    protocol,
+                    bytes_out,
+                    bytes_in,
+                    duration_ms,
+                },
+                Decision::Allow,
+            )
+            .with_rule(EGRESS_SUMMARY_RULE_ID),
+        )?;
+
+        // 기록에 성공한 뒤에만 누적합니다. 실패한 append 의 바이트를 세면 감사에 없는
+        // 반출이 한도 계산에만 반영되어 로그와 판정이 갈라집니다
+        let slot = self
+            .egress_bytes_out
+            .entry((quota_key(host), port))
+            .or_insert(0);
+        *slot = slot.saturating_add(bytes_out);
+        Ok(())
+    }
+
+    /// `SessionEnd`를 쓰고 세션 상위 앵커에 최종 head를 남깁니다.
+    ///
+    /// 앵커는 반드시 `SessionEnd` 다음입니다. 먼저 쓰면 앵커가 가리키는 head 뒤로 엔트리가
+    /// 하나 더 자라서, 정상 종료가 "종료 후 덧붙이기"로 보고됩니다.
+    ///
+    /// # Arguments
+    /// `status` - 자식의 종료 상태. 자식이 뜨지 못했으면 `None`
+    ///
+    /// # Errors
+    /// `SessionEnd` 기록에 실패하면 실패합니다. 앵커 기록 실패는 여기서 오류가 되지
+    /// 않고 [`Closed::anchor`]에 담겨 올라갑니다. 이미 끝난 자식 실행을 되돌릴 수는
+    /// 없으므로 사실을 보고에 남기고 호출부가 판단하게 합니다
+    pub fn finish(&mut self, status: Option<&std::process::ExitStatus>) -> Result<Closed> {
         let audit_status = match status {
             Some(s) => exit_status_of(s),
             None => audit::ExitStatus::Unknown,
         };
+        // 여기서부터 이 세션은 닫힌 것으로 봅니다. 아직 살아 있는 프록시 릴레이가 결과를
+        // 들고 와도 거부되며, 그 사실은 경고로 나갑니다
+        self.closed = true;
         self.log.append(Record::new(
             audit::BROKER_ACTOR,
             Event::SessionEnd {
@@ -389,8 +705,70 @@ impl Session {
             },
             Decision::Allow,
         ))?;
-        Ok(self.log.head_hash())
+
+        let head_seq = self.log.head_seq();
+        let head_hash = self.log.head_hash();
+        Ok(Closed {
+            head_seq,
+            head_hash,
+            anchor: self.append_anchor(head_seq, head_hash),
+        })
     }
+
+    /// 이 세션의 최종 head를 앵커 체인에 잇습니다.
+    ///
+    /// # Arguments
+    /// `head_seq` - 세션 체인의 마지막 seq
+    /// `head_hash` - 세션 체인의 마지막 hash
+    fn append_anchor(&self, head_seq: Option<u64>, head_hash: audit::Hash) -> AnchorOutcome {
+        let path = self.anchor_dir.join(ANCHOR_FILE);
+        let Some(seq) = head_seq else {
+            return AnchorOutcome::Failed {
+                path,
+                why: "세션 체인이 비어 있어 앵커할 head 가 없음".to_string(),
+            };
+        };
+        let session = self.log.session();
+        // 잠금을 먼저 잡습니다. AnchorLog::open 이 head 를 읽는 순간부터 append 가 끝날
+        // 때까지 다른 세션이 끼어들면 두 줄이 같은 seq 를 갖게 됩니다
+        let _guard = match lock_anchor_dir(&self.anchor_dir) {
+            Ok(g) => g,
+            Err(e) => {
+                return AnchorOutcome::Failed {
+                    path,
+                    why: format!("앵커 잠금을 잡지 못함: {e}"),
+                };
+            }
+        };
+        match AnchorLog::open(&self.anchor_dir) {
+            Ok(mut log) => match log.append(session, seq, head_hash) {
+                Ok(entry) => AnchorOutcome::Written {
+                    path,
+                    seq: entry.seq,
+                },
+                Err(e) => AnchorOutcome::Failed {
+                    path,
+                    why: e.to_string(),
+                },
+            },
+            Err(e) => AnchorOutcome::Failed {
+                path,
+                why: e.to_string(),
+            },
+        }
+    }
+}
+
+/// 누적 반출량을 셀 때 쓰는 목적지 키.
+///
+/// 정책 엔진과 같은 정규화를 씁니다. 표기가 다르면 같은 목적지가 두 칸으로 나뉘어 한도가
+/// 표기를 바꾸는 것만으로 초기화됩니다. 정규화할 수 없는 호스트는 원문 그대로 두며, 그런
+/// 호스트는 정책 엔진에서도 어느 규칙에도 매칭되지 않아 한도가 붙을 일이 없습니다
+///
+/// # Arguments
+/// `host` - 관측된 호스트 문자열
+fn quota_key(host: &str) -> String {
+    airlock_policy::host::normalize_host(host).unwrap_or_else(|| host.to_string())
 }
 
 pub fn which(program: &str) -> Option<PathBuf> {
@@ -426,13 +804,18 @@ pub struct RunReport {
     /// 실제로 적용된 중계 수준
     pub mediation: Mediation,
     pub gaps: Vec<String>,
+    /// 세션 상위 앵커 기록 결과.
+    ///
+    /// 실패해도 자식의 종료 코드는 덮지 않습니다. 이미 끝난 실행을 되돌릴 수 없기
+    /// 때문입니다. 대신 이 값이 실패를 담고 있으면 호출부가 눈에 띄게 보고해야 합니다
+    pub anchor: AnchorOutcome,
 }
 
 impl RunReport {
     /// 브로커 자신의 종료 코드.
     ///
     /// 자식이 시그널로 죽은 것을 성공으로 보고하면 래퍼를 CI에 넣은 순간 실패가 사라집니다.
-    /// 셸 관례대로 128에 시그널 번호를 더해 돌려줍니다
+    /// 쉘 관례대로 128에 시그널 번호를 더해 돌려줍니다
     pub fn exit_status(&self) -> i32 {
         if let Some(code) = self.exit_code {
             return code;
@@ -455,6 +838,9 @@ pub fn run(
 ) -> Result<RunReport> {
     let resolved =
         which(program).ok_or_else(|| BrokerError::ProgramNotFound(program.to_string()))?;
+    // 최상위 프로그램을 prepare 보다 먼저 알려 줍니다. wrap 시점에도 같은 보정이 있지만,
+    // 그때는 배너가 이미 나간 뒤라 규칙 수와 gap 이 실제로 걸릴 프로파일과 어긋납니다
+    enforcer.set_program(&resolved);
     enforcer.prepare(&policy)?;
 
     /// 로더 주입에 쓰이는 환경 변수 접두.
@@ -463,7 +849,7 @@ pub fn run(
     /// `kind = "exec"` allowlist 가 통째로 무의미해지므로 전달하지 않습니다
     const INJECTION_PREFIXES: &[&str] = &["LD_", "DYLD_"];
 
-    /// 셸이 시작할 때 읽어 실행하는 환경 변수.
+    /// 쉘이 시작할 때 읽어 실행하는 환경 변수.
     const INJECTION_EXACT: &[&str] = &[
         "BASH_ENV",
         "ENV",
@@ -572,16 +958,16 @@ pub fn run(
     argv.push(program.to_string());
     argv.extend_from_slice(args);
 
-    let outcome = session.check_exec(&resolved, &argv)?;
+    // 이 판정은 브로커가 spawn 전에 직접 부르는 것이므로 관측된 자식 pid 가 없습니다
+    let outcome = session.check_exec(&resolved, &argv, Actor::Broker)?;
     if !outcome.permitted() {
         let asked = session.asked_count();
         let denied = session.denied_count();
-        let head_seq = session.head_seq();
-        let hash = session.finish(None)?;
+        let closed = session.finish(None)?;
         return Ok(RunReport {
             audit_dir: config.audit_dir.clone(),
-            head_seq,
-            head_hash: hash,
+            head_seq: closed.head_seq,
+            head_hash: closed.head_hash,
             exit_code: None,
             signal: None,
             asked,
@@ -589,6 +975,7 @@ pub fn run(
             enforcement,
             mediation: effective,
             gaps,
+            anchor: closed.anchor,
         });
     }
 
@@ -604,8 +991,10 @@ pub fn run(
         );
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&stop);
+        // 살아 있는 연결 수는 serve 가 소유권을 가져가기 전에 받아 두어야 합니다
+        let live = server.live_connections();
         let handle = std::thread::spawn(move || server.serve(gate, flag));
-        (stop, handle)
+        (stop, handle, live)
     });
 
     // 감독 스레드를 spawn보다 먼저 띄웁니다. spawn은 자식이 exec을 마쳐야 돌아오는데
@@ -639,8 +1028,20 @@ pub fn run(
     // accept 루프만 멈춥니다. 살아 있는 릴레이 스레드는 자기 연결이 끝나면
     // 알아서 돌아오므로, 여기서 join 을 기다리면 자식이 남긴 긴 연결에 세션
     // 종료가 묶입니다
-    if let Some((stop, _)) = &proxy_thread {
+    if let Some((stop, _, _)) = &proxy_thread {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // 다만 아주 짧게는 기다립니다. 릴레이는 자기 연결이 끝날 때 반출량을 감사에 남기는데,
+    // 그것이 session_end 뒤에 붙으면 체인이 앵커보다 길어져 세션 전체가 "종료 후 덧붙이기"
+    // 로 보고됩니다. 상한을 두는 이유는 자식이 남긴 긴 연결에 종료가 묶이지 않게 하기
+    // 위함이며, 상한을 넘겨 도착한 결과는 기록되지 않고 경고로 나갑니다
+    if let Some((_, _, live)) = &proxy_thread {
+        let deadline = std::time::Instant::now() + PROXY_DRAIN_TIMEOUT;
+        while live.load(std::sync::atomic::Ordering::Relaxed) > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     drop(proxy_thread);
 
@@ -650,13 +1051,12 @@ pub fn run(
     };
     let asked = session.asked_count();
     let denied = session.denied_count();
-    let head_seq = session.head_seq();
-    let hash = session.finish(Some(&status))?;
+    let closed = session.finish(Some(&status))?;
 
     Ok(RunReport {
         audit_dir: config.audit_dir.clone(),
-        head_seq,
-        head_hash: hash,
+        head_seq: closed.head_seq,
+        head_hash: closed.head_hash,
         exit_code: status.code(),
         signal: {
             use std::os::unix::process::ExitStatusExt;
@@ -667,6 +1067,7 @@ pub fn run(
         enforcement,
         mediation: effective,
         gaps,
+        anchor: closed.anchor,
     })
 }
 
@@ -767,5 +1168,57 @@ mod tests {
     #[test]
     fn which_rejects_missing_bare_names() {
         assert_eq!(which("airlock-no-such-binary-xyz"), None);
+    }
+
+    #[test]
+    fn udp_is_evaluated_as_tcp_not_as_plaintext() {
+        use airlock_policy::Protocol as P;
+        assert_eq!(policy_protocol_of(audit::Protocol::Tcp), P::Tcp);
+        assert_eq!(
+            policy_protocol_of(audit::Protocol::Udp),
+            P::Tcp,
+            "정책 어휘에 없는 UDP 가 특례로 통과하면 안 됨"
+        );
+        assert_eq!(policy_protocol_of(audit::Protocol::Tls), P::Tls);
+        assert_eq!(policy_protocol_of(audit::Protocol::Http), P::Http);
+        assert!(
+            !policy_protocol_of(audit::Protocol::Udp).is_plaintext(),
+            "모르는 것을 평문으로 단정하면 감사 로그가 거짓 보증을 함"
+        );
+    }
+
+    #[test]
+    fn protocol_tags_agree_across_the_two_crates() {
+        for p in [
+            audit::Protocol::Tcp,
+            audit::Protocol::Tls,
+            audit::Protocol::Http,
+        ] {
+            assert_eq!(
+                policy_protocol_of(p).tag(),
+                p.tag(),
+                "{p} 태그가 두 크레이트에서 어긋남"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_anchor_root_is_outside_the_session_directory() {
+        let session = Path::new("/tmp/root/sessions/1700-42");
+        assert_eq!(
+            anchor_dir_for(session, None),
+            PathBuf::from("/tmp/root"),
+            "앵커가 감사 루트에 있어야 세션 통째 삭제가 흔적을 남김"
+        );
+        // sessions 레이아웃이 아니면 바로 위를 씁니다. 어느 쪽이든 세션 바깥입니다
+        assert_eq!(
+            anchor_dir_for(Path::new("/tmp/flat/one"), None),
+            PathBuf::from("/tmp/flat")
+        );
+        assert_eq!(
+            anchor_dir_for(session, Some(Path::new("/mnt/wormvol"))),
+            PathBuf::from("/mnt/wormvol"),
+            "명시한 앵커 루트가 이겨야 분리가 가능함"
+        );
     }
 }

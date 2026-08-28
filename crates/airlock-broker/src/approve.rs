@@ -25,6 +25,19 @@ use airlock_policy::MatchedRule;
 /// 깁니다. 만료는 거부로 처리하며 그 사실이 감사 로그에 `timed_out`으로 남습니다
 pub const DEFAULT_ASK_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 승인 프롬프트에 실제로 답한 주체의 신원.
+///
+/// 브로커가 직접 관측한 값만 담습니다. 에이전트나 정책 파일이 만든 문자열은 이 자리에
+/// 들어오지 않습니다. 사람이 답하지 않은 승인은 이 값 자체가 없어야 하며, 그 구분이
+/// 감사 로그에서 "사람이 승인함" 과 "자동 승인" 을 가릅니다
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproverIdentity {
+    /// `geteuid(2)` 가 돌려준 실효 uid
+    pub uid: u32,
+    /// 승인 프롬프트가 나간 터미널 장치 경로. 이름을 읽지 못하면 `None`
+    pub tty: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub headline: String,
@@ -57,6 +70,15 @@ pub trait Approver: fmt::Debug + Send {
     fn describe(&self) -> String;
 
     fn note(&self) -> Option<String> {
+        None
+    }
+
+    /// 이 채널 뒤에 있는 사람의 신원.
+    ///
+    /// 기본값이 `None` 인 것은 의도된 것입니다. 사람이 답하지 않는 승인자가 신원을 내면
+    /// 자동 승인이 사람 승인처럼 기록되고, 그것은 승인 통제 자체를 무의미하게 만듭니다.
+    /// 실제로 사람을 관측하는 구현만 이 메서드를 덮어씁니다
+    fn identity(&self) -> Option<ApproverIdentity> {
         None
     }
 }
@@ -214,6 +236,40 @@ fn render(request: &ApprovalRequest) -> String {
     out
 }
 
+/// 승인에 답한 계정의 실효 uid.
+///
+/// # Safety
+/// `geteuid(2)` 는 인자가 없고 메모리를 건드리지 않으며 POSIX 가 항상 성공을 보장합니다.
+/// 실패 경로가 없으므로 반환값 검사도 필요 없습니다
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// 승인 프롬프트가 실제로 나간 터미널 장치 경로.
+///
+/// `/dev/tty` 는 제어 터미널을 가리키는 별칭이라 세션마다 다른 장치를 뜻합니다. 별칭을
+/// 그대로 기록하면 어느 터미널에서 승인했는지가 로그에 남지 않으므로 열어서 실제 이름을
+/// 읽습니다. 읽지 못하면 `None` 입니다. 모르는 것을 아는 것처럼 적지 않습니다
+///
+/// # Safety
+/// `ttyname_r` 은 방금 연 유효한 fd 와 길이를 받아 버퍼에 그 길이만큼만 씁니다. 정적
+/// 버퍼를 쓰는 `ttyname` 대신 재진입 가능한 쪽을 쓰는 이유는 감독 스레드와 프록시
+/// 스레드가 같은 시점에 이 함수를 부를 수 있기 때문입니다
+fn control_tty() -> Option<String> {
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let mut buf = [0 as libc::c_char; 128];
+    let rc = unsafe { libc::ttyname_r(tty.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    name.to_str().ok().map(str::to_string)
+}
+
 impl Approver for TtyApprover {
     fn ask(&mut self, request: &ApprovalRequest) -> Granted {
         let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
@@ -262,6 +318,13 @@ impl Approver for TtyApprover {
             self.timeout.as_secs()
         )
     }
+
+    fn identity(&self) -> Option<ApproverIdentity> {
+        Some(ApproverIdentity {
+            uid: effective_uid(),
+            tty: control_tty(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +350,36 @@ mod tests {
     fn refuse_all_never_approves() {
         let mut a = RefuseAll::default();
         assert_eq!(a.ask(&request()), Granted::Refused);
+    }
+
+    #[test]
+    fn automatic_approvers_never_claim_a_human() {
+        assert_eq!(
+            ApproveAll.identity(),
+            None,
+            "자동 승인이 사람 신원을 내면 --yes 세션이 사람이 승인한 것처럼 기록됨"
+        );
+        assert_eq!(
+            RefuseAll::default().identity(),
+            None,
+            "거부만 하는 승인자에게는 승인한 사람이 없음"
+        );
+    }
+
+    #[test]
+    fn the_tty_approver_reports_what_the_broker_observed() {
+        let id = TtyApprover::new()
+            .identity()
+            .expect("사람이 답하는 채널은 신원을 내야 함");
+        assert_eq!(
+            id.uid,
+            unsafe { libc::geteuid() },
+            "uid 는 브로커가 직접 읽은 값이어야 함"
+        );
+        if let Some(tty) = &id.tty {
+            assert!(tty.starts_with("/dev/"), "관측한 장치 경로가 아님: {tty}");
+            assert_ne!(tty, "/dev/tty", "별칭이 아니라 실제 장치 이름이어야 함");
+        }
     }
 
     #[test]

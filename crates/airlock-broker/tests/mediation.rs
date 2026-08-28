@@ -61,6 +61,7 @@ fn config(scratch: &Path, level: Mediation, argv: Vec<String>) -> SessionConfig 
         policy_source: None,
         airlock_version: "test".to_string(),
         mediation: level,
+        anchor_dir: None,
     }
 }
 
@@ -87,6 +88,9 @@ fn run_it(
         enforcer,
         Box::new(ApproveAll),
         &cfg,
+        // 이 파일은 중계 층만 봅니다. 프록시를 띄우면 같은 연결이 두 번 기록되어
+        // 무엇을 중계가 보았는지가 흐려집니다 (docs/egress-proxy.md 4.1)
+        None,
     )
     .unwrap();
     let (entries, problem) = airlock_audit::read_entries_lossy(&report.audit_dir).unwrap();

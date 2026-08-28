@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use airlock_audit::Protocol;
 use airlock_policy::FileMode;
 
-use crate::session::Session;
+use crate::session::{Actor, Session};
 
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
@@ -603,7 +603,7 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
                         Ok(s) => s,
                         Err(_) => break,
                     };
-                    s.check_egress(&host, port, protocol)
+                    s.check_egress(&host, port, protocol, Actor::Observed(pid))
                         .map(|o| o.permitted())
                         .unwrap_or(false)
                 }
@@ -633,7 +633,7 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
                         Ok(s) => s,
                         Err(_) => break,
                     };
-                    s.check_exec(&program, &argv)
+                    s.check_exec(&program, &argv, Actor::Observed(pid))
                         .map(|o| o.permitted())
                         .unwrap_or(false)
                 }
@@ -657,7 +657,7 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
                         Ok(s) => s,
                         Err(_) => break,
                     };
-                    s.check_file(&path, mode)
+                    s.check_file(&path, mode, Actor::Observed(pid))
                         .map(|o| o.permitted())
                         .unwrap_or(false)
                 }

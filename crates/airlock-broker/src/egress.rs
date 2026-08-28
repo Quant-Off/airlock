@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use airlock_audit::Protocol as AuditProtocol;
 use airlock_proxy::{Decision, EgressGate, Protocol};
 
-use crate::session::Session;
+use crate::session::{Actor, Session};
 
 /// 세션을 프록시의 판정 경계로 넘기는 어댑터.
 ///
@@ -42,11 +42,51 @@ impl EgressGate for SessionGate {
         let Ok(mut session) = self.session.lock() else {
             return Decision::Deny;
         };
-        match session.check_egress(host, port, audit_protocol(protocol)) {
+        // 프록시는 연결의 peer pid 를 알지 못합니다. 브로커 자신의 actor 를 쓰면 브로커가
+        // 나간 것처럼 보이므로 모른다는 사실을 그대로 남깁니다 (docs/limitations.md 7.6)
+        match session.check_egress(host, port, audit_protocol(protocol), Actor::Unknown) {
             Ok(outcome) if outcome.permitted() => Decision::Allow,
             // 기록에 실패한 판정은 통과시키지 않습니다. 감사에 남지 않은 연결을
             // 허용하면 로그가 세션의 전부라는 보증이 깨집니다
             _ => Decision::Deny,
+        }
+    }
+
+    /// 끝난 연결 하나의 결과를 감사에 남기는 함수입니다.
+    ///
+    /// 판정이 아니라 사실 기록이므로 정책을 다시 평가하지 않습니다. actor 는 판정 때와 같은
+    /// `Unknown` 입니다. 결과만 다른 주체로 남기면 같은 연결의 두 엔트리가 서로 다른 것을
+    /// 가리키게 됩니다.
+    ///
+    /// 기록 실패는 여기서 되돌릴 수 없습니다. 연결은 이미 끝났고 바이트는 이미 나갔습니다.
+    /// 조용히 삼키지 않고 사실을 알립니다
+    fn finished(
+        &self,
+        host: &str,
+        port: u16,
+        protocol: Protocol,
+        bytes_out: u64,
+        bytes_in: u64,
+        duration_ms: u64,
+    ) {
+        let Ok(mut session) = self.session.lock() else {
+            eprintln!(
+                "airlock: 경고 세션 잠금이 오염되어 {host}:{port} 의 반출 {bytes_out} 바이트를 기록하지 못함"
+            );
+            return;
+        };
+        if let Err(e) = session.record_egress_summary(
+            host,
+            port,
+            audit_protocol(protocol),
+            bytes_out,
+            bytes_in,
+            duration_ms,
+            Actor::Unknown,
+        ) {
+            eprintln!(
+                "airlock: 경고 {host}:{port} 의 반출 {bytes_out} 바이트를 감사에 남기지 못함: {e}"
+            );
         }
     }
 }

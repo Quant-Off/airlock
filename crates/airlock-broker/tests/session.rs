@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use airlock_audit::{
     CHAIN_FILE, Decision, Enforcement, Entry, Event, Granted, Mediation, Protocol, verify_dir,
 };
-use airlock_broker::{ApprovalRequest, Approver, Session, SessionConfig};
+use airlock_broker::{Actor, AnchorOutcome, ApprovalRequest, Approver, Session, SessionConfig};
 use airlock_policy::{Action, FileMode, LoadContext, Policy};
 
 struct Scratch(PathBuf);
@@ -113,6 +113,7 @@ fn config(scratch: &Scratch, mediation: Mediation) -> SessionConfig {
         policy_source: None,
         airlock_version: "0.0.0-test".to_string(),
         mediation,
+        anchor_dir: None,
     }
 }
 
@@ -159,7 +160,9 @@ action = "allow"
     let (mut session, asked) = start(&s, p, Granted::Refused);
 
     let target = s.ws().join("main.rs");
-    let out = session.check_file(&target, FileMode::Read).unwrap();
+    let out = session
+        .check_file(&target, FileMode::Read, Actor::Broker)
+        .unwrap();
     assert_eq!(out.action, Action::Allow);
     assert!(out.permitted());
     assert_eq!(session.asked_count(), 0);
@@ -188,7 +191,11 @@ fn denied_file_access_is_recorded_and_counted() {
     let (mut session, _) = start(&s, p, Granted::Approved);
 
     let out = session
-        .check_file(Path::new("/tmp/elsewhere/x"), FileMode::Write)
+        .check_file(
+            Path::new("/tmp/elsewhere/x"),
+            FileMode::Write,
+            Actor::Broker,
+        )
         .unwrap();
     assert_eq!(out.action, Action::Deny);
     assert!(!out.permitted());
@@ -217,7 +224,9 @@ action = "allow"
     let (mut session, _) = start(&s, p, Granted::Approved);
 
     let key = home.join(".ssh/id_ed25519");
-    let out = session.check_file(&key, FileMode::Read).unwrap();
+    let out = session
+        .check_file(&key, FileMode::Read, Actor::Broker)
+        .unwrap();
     assert_eq!(
         out.action,
         Action::Forbid,
@@ -249,7 +258,7 @@ action = "ask"
     let (mut session, asked) = start(&s, p, Granted::Approved);
 
     let out = session
-        .check_file(&s.ws().join("config"), FileMode::Write)
+        .check_file(&s.ws().join("config"), FileMode::Write, Actor::Broker)
         .unwrap();
     assert_eq!(out.action, Action::Allow, "승인했는데 허용되지 않았음");
     assert_eq!(session.asked_count(), 1);
@@ -268,10 +277,17 @@ action = "ask"
             for_seq,
             granted,
             note,
+            approver_uid,
+            approver_tty,
         } => {
             assert_eq!(*for_seq, es[1].seq, "승인 엔트리가 시도를 가리켜야 함");
             assert_eq!(*granted, Granted::Approved);
             assert_eq!(note.as_deref(), Some("테스트"));
+            assert_eq!(
+                (*approver_uid, approver_tty.as_deref()),
+                (None, None),
+                "신원을 관측하지 않는 승인자가 사람 신원을 남기면 안 됨"
+            );
         }
         other => panic!("승인 엔트리가 아님: {other:?}"),
     }
@@ -298,7 +314,7 @@ action = "ask"
     let (mut session, _) = start(&s, p, Granted::Refused);
 
     let out = session
-        .check_file(&s.ws().join("config"), FileMode::Write)
+        .check_file(&s.ws().join("config"), FileMode::Write, Actor::Broker)
         .unwrap();
     assert_eq!(out.action, Action::Deny);
     assert_eq!(session.asked_count(), 1);
@@ -327,7 +343,7 @@ action = "ask"
     let (mut session, _) = start(&s, p, Granted::TimedOut);
 
     let out = session
-        .check_file(&s.ws().join("config"), FileMode::Write)
+        .check_file(&s.ws().join("config"), FileMode::Write, Actor::Broker)
         .unwrap();
     assert_eq!(out.action, Action::Deny, "응답이 없으면 거부여야 함");
     assert_eq!(session.denied_count(), 1);
@@ -371,7 +387,7 @@ action = "allow"
     let (mut session, _) = start(&s, p, Granted::Refused);
 
     let argv = vec![tool.to_string_lossy().into_owned(), "hi".to_string()];
-    let out = session.check_exec(&tool, &argv).unwrap();
+    let out = session.check_exec(&tool, &argv, Actor::Broker).unwrap();
     assert_eq!(out.action, Action::Allow);
 
     let es = entries(&s.session_dir());
@@ -406,12 +422,12 @@ action = "allow"
     let (mut session, _) = start(&s, p, Granted::Refused);
 
     let allowed = session
-        .check_egress("api.anthropic.com", 443, Protocol::Tls)
+        .check_egress("api.anthropic.com", 443, Protocol::Tls, Actor::Broker)
         .unwrap();
     assert_eq!(allowed.action, Action::Allow);
 
     let blocked = session
-        .check_egress("169.254.169.254", 80, Protocol::Http)
+        .check_egress("169.254.169.254", 80, Protocol::Http, Actor::Broker)
         .unwrap();
     assert_eq!(blocked.action, Action::Deny);
     assert_eq!(session.denied_count(), 1);
@@ -476,17 +492,17 @@ action = "ask"
     );
     let (mut session, _) = start(&s, p, Granted::Approved);
     session
-        .check_file(&s.ws().join("config"), FileMode::Write)
+        .check_file(&s.ws().join("config"), FileMode::Write, Actor::Broker)
         .unwrap();
     session
-        .check_file(&s.path().join("nope"), FileMode::Read)
+        .check_file(&s.path().join("nope"), FileMode::Read, Actor::Broker)
         .unwrap();
 
     let status = std::process::Command::new("/bin/sh")
         .args(["-c", "exit 3"])
         .status()
         .unwrap();
-    let head = session.finish(Some(&status)).unwrap();
+    let closed = session.finish(Some(&status)).unwrap();
 
     let es = entries(&s.session_dir());
     match es.last().map(|e| &e.event) {
@@ -497,7 +513,16 @@ action = "ask"
         ),
         other => panic!("세션 종료 엔트리가 아님: {other:?}"),
     }
-    assert_eq!(head, es.last().unwrap().hash, "돌려준 체인 헤드가 다름");
+    assert_eq!(
+        closed.head_hash,
+        es.last().unwrap().hash,
+        "돌려준 체인 헤드가 다름"
+    );
+    assert!(
+        matches!(closed.anchor, AnchorOutcome::Written { .. }),
+        "세션 종료가 앵커를 남기지 않았음: {:?}",
+        closed.anchor
+    );
 
     let report = verify_dir(s.session_dir()).unwrap();
     assert_eq!(report.entries, es.len() as u64);
@@ -534,6 +559,312 @@ fn signaled_child_is_recorded_as_signaled() {
     verify_dir(s.session_dir()).unwrap();
 }
 
+// ---------- 승인자 신원 ----------
+
+#[test]
+fn an_automatic_approval_never_looks_like_a_human_one() {
+    let s = Scratch::new("auto-approve");
+    let p = policy(
+        &s,
+        &format!(
+            r#"
+[[rules]]
+id = "shell-config"
+kind = "file"
+path = "{}/config"
+action = "ask"
+"#,
+            s.ws().display()
+        ),
+    );
+    let mut session = Session::start(
+        p,
+        Enforcement::Observe,
+        Box::new(airlock_broker::ApproveAll),
+        &config(&s, Mediation::ExecNet),
+    )
+    .unwrap();
+
+    let out = session
+        .check_file(&s.ws().join("config"), FileMode::Write, Actor::Broker)
+        .unwrap();
+    assert_eq!(out.action, Action::Allow);
+
+    let es = entries(&s.session_dir());
+    match es.last().map(|e| &e.event) {
+        Some(Event::Approval {
+            approver_uid,
+            approver_tty,
+            note,
+            ..
+        }) => {
+            assert_eq!(
+                (*approver_uid, approver_tty.as_deref()),
+                (None, None),
+                "--yes 자동 승인이 사람 신원을 남기면 승인 통제 자체가 무의미해짐"
+            );
+            assert!(note.is_some(), "자동 승인이라는 사실이 남아야 함");
+        }
+        other => panic!("승인 엔트리가 아님: {other:?}"),
+    }
+}
+
+// ---------- actor 실체화 ----------
+
+#[test]
+fn the_log_tells_broker_observed_and_unknown_apart() {
+    let s = Scratch::new("actor");
+    let p = policy(
+        &s,
+        &format!(
+            r#"
+[[rules]]
+id = "ws"
+kind = "file"
+path = "{}/**"
+action = "allow"
+"#,
+            s.ws().display()
+        ),
+    );
+    let (mut session, _) = start(&s, p, Granted::Refused);
+
+    session
+        .check_file(&s.ws().join("a"), FileMode::Read, Actor::Broker)
+        .unwrap();
+    session
+        .check_file(&s.ws().join("b"), FileMode::Read, Actor::Observed(41233))
+        .unwrap();
+    session
+        .check_file(&s.ws().join("c"), FileMode::Read, Actor::Unknown)
+        .unwrap();
+
+    let es = entries(&s.session_dir());
+    let actors: Vec<&str> = es[1..4].iter().map(|e| e.actor.as_str()).collect();
+    assert_eq!(actors[0], "pid:1 test", "브로커 판정은 세션 actor 를 씀");
+    assert_eq!(
+        actors[1], "pid:41233",
+        "중계가 관측한 pid 가 그대로 남아야 어느 자손이 열었는지 복원됨"
+    );
+    assert_eq!(
+        actors[2],
+        airlock_broker::UNKNOWN_ACTOR,
+        "주체를 모르는 판정이 브로커 자신처럼 보이면 안 됨"
+    );
+    assert_ne!(actors[0], actors[1]);
+    assert_ne!(actors[0], actors[2]);
+    assert_ne!(actors[1], actors[2]);
+    verify_dir(s.session_dir()).unwrap();
+}
+
+// ---------- 평문 바닥 ----------
+
+#[test]
+fn plaintext_egress_is_floored_even_on_an_allowed_host() {
+    let s = Scratch::new("plaintext");
+    let p = policy(
+        &s,
+        r#"
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+port = 80
+action = "allow"
+"#,
+    );
+    let (mut session, _) = start(&s, p, Granted::Refused);
+
+    let tls = session
+        .check_egress("mirror.example.com", 80, Protocol::Tls, Actor::Unknown)
+        .unwrap();
+    assert_eq!(
+        tls.action,
+        Action::Allow,
+        "호스트 allow 는 그대로 통해야 함"
+    );
+
+    let plain = session
+        .check_egress("mirror.example.com", 80, Protocol::Http, Actor::Unknown)
+        .unwrap();
+    assert_eq!(
+        plain.action,
+        Action::Deny,
+        "호스트만 적은 allow 가 평문까지 암묵 허가하면 안 됨"
+    );
+
+    let es = entries(&s.session_dir());
+    let last = es.last().unwrap();
+    assert_eq!(last.decision, Decision::Deny);
+    assert_eq!(
+        last.rule.as_deref(),
+        Some(airlock_policy::PLAINTEXT_FLOOR_ID),
+        "어느 규칙이 막았는지 감사 로그만 보고 알 수 있어야 함"
+    );
+    match &last.event {
+        Event::Egress { protocol, .. } => assert_eq!(*protocol, Protocol::Http),
+        other => panic!("egress 엔트리가 아님: {other:?}"),
+    }
+}
+
+// ---------- 앵커 ----------
+
+#[test]
+fn finishing_anchors_the_session_outside_its_own_directory() {
+    let s = Scratch::new("anchor");
+    let (mut session, _) = start(&s, policy(&s, ""), Granted::Refused);
+    let anchors = session.anchor_dir().to_path_buf();
+
+    let closed = session.finish(None).unwrap();
+    let AnchorOutcome::Written { path, .. } = &closed.anchor else {
+        panic!("앵커가 기록되지 않았음: {:?}", closed.anchor);
+    };
+    assert!(path.is_file(), "{} 가 만들어지지 않았음", path.display());
+    assert!(
+        !path.starts_with(s.session_dir()),
+        "앵커가 세션 디렉토리 안에 있으면 세션 통째 삭제로 함께 사라짐: {}",
+        path.display()
+    );
+
+    let report = airlock_audit::verify_anchors(&anchors).unwrap();
+    assert_eq!(report.entries, 1);
+
+    let verified = verify_dir(s.session_dir()).unwrap();
+    let check = airlock_audit::check_session(
+        &anchors,
+        &verified.session,
+        verified.head_seq,
+        &verified.head_hash,
+    )
+    .unwrap();
+    assert!(
+        matches!(check, airlock_audit::AnchorCheck::Matches { .. }),
+        "앵커와 세션 head 가 어긋남: {check:?}"
+    );
+}
+
+#[test]
+fn an_explicit_anchor_root_is_honoured() {
+    let s = Scratch::new("anchor-explicit");
+    let separated = s.path().join("elsewhere/anchors");
+    let cfg = SessionConfig {
+        anchor_dir: Some(separated.clone()),
+        ..config(&s, Mediation::ExecNet)
+    };
+    let mut session = Session::start(
+        policy(&s, ""),
+        Enforcement::Observe,
+        Box::new(Scripted::new(Granted::Refused)),
+        &cfg,
+    )
+    .unwrap();
+
+    let closed = session.finish(None).unwrap();
+    assert_eq!(closed.anchor.failure(), None, "{:?}", closed.anchor);
+    assert!(
+        separated.join(airlock_audit::ANCHOR_FILE).is_file(),
+        "명시한 앵커 루트에 쓰이지 않았음"
+    );
+}
+
+#[test]
+fn a_second_session_extends_the_same_anchor_chain() {
+    let s = Scratch::new("anchor-chain");
+    for name in ["one", "two"] {
+        let cfg = SessionConfig {
+            audit_dir: s.path().join("sessions").join(name),
+            ..config(&s, Mediation::ExecNet)
+        };
+        let mut session = Session::start(
+            policy(&s, ""),
+            Enforcement::Observe,
+            Box::new(Scripted::new(Granted::Refused)),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(session.finish(None).unwrap().anchor.failure(), None);
+    }
+
+    let report = airlock_audit::verify_anchors(s.path()).unwrap();
+    assert_eq!(report.entries, 2, "두 세션이 한 체인에 이어져야 함");
+    assert_eq!(report.sessions, 2);
+}
+
+#[test]
+fn concurrent_sessions_do_not_corrupt_the_shared_anchor_chain() {
+    let s = Scratch::new("anchor-race");
+    let root = s.path().to_path_buf();
+    let mut handles = Vec::new();
+    for i in 0..6 {
+        let dir = root.join("sessions").join(format!("s{i}"));
+        let home = root.join("home");
+        let audit = root.join("audit");
+        let cwd = root.clone();
+        handles.push(std::thread::spawn(move || {
+            let ctx = LoadContext::new(&home, &audit);
+            let policy = Policy::baseline_only(&ctx).unwrap();
+            let cfg = SessionConfig {
+                audit_dir: dir,
+                actor: "pid:1 test".to_string(),
+                cwd,
+                argv: vec!["airlock".to_string()],
+                fsync_per_entry: false,
+                policy_source: None,
+                airlock_version: "0.0.0-test".to_string(),
+                mediation: Mediation::ExecNet,
+                anchor_dir: None,
+            };
+            let mut session = Session::start(
+                policy,
+                Enforcement::Observe,
+                Box::new(Scripted::new(Granted::Refused)),
+                &cfg,
+            )
+            .unwrap();
+            session.finish(None).unwrap().anchor
+        }));
+    }
+
+    for h in handles {
+        let anchor = h.join().unwrap();
+        assert_eq!(anchor.failure(), None, "{anchor:?}");
+    }
+
+    // 잠금이 없으면 두 세션이 같은 head 를 읽고 같은 seq 로 써서 체인이 깨집니다.
+    // 깨진 체인에는 그 뒤로 아무도 이어 붙이지 못합니다
+    let report = airlock_audit::verify_anchors(s.path()).unwrap();
+    assert_eq!(report.entries, 6);
+    assert_eq!(report.sessions, 6);
+}
+
+#[test]
+fn an_unwritable_anchor_root_is_reported_not_swallowed() {
+    let s = Scratch::new("anchor-fail");
+    // 앵커 루트 자리에 파일을 놓아 디렉토리 생성을 실패시킵니다
+    let blocked = s.path().join("blocked");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let cfg = SessionConfig {
+        anchor_dir: Some(blocked.join("under")),
+        ..config(&s, Mediation::ExecNet)
+    };
+    let mut session = Session::start(
+        policy(&s, ""),
+        Enforcement::Observe,
+        Box::new(Scripted::new(Granted::Refused)),
+        &cfg,
+    )
+    .unwrap();
+
+    let closed = session.finish(None).unwrap();
+    assert!(
+        closed.anchor.failure().is_some(),
+        "앵커 실패를 성공으로 보고하면 앵커 없는 세션이 앵커된 세션처럼 보임: {:?}",
+        closed.anchor
+    );
+    // 세션 체인 자체는 정상입니다. 앵커 실패가 감사 로그를 망가뜨리지는 않습니다
+    verify_dir(s.session_dir()).unwrap();
+}
+
 #[test]
 fn every_decision_lands_in_the_chain_in_order() {
     let s = Scratch::new("order");
@@ -553,13 +884,13 @@ action = "allow"
     let (mut session, _) = start(&s, p, Granted::Refused);
 
     session
-        .check_file(&s.ws().join("a"), FileMode::Read)
+        .check_file(&s.ws().join("a"), FileMode::Read, Actor::Broker)
         .unwrap();
     session
-        .check_file(&s.path().join("other/b"), FileMode::Read)
+        .check_file(&s.path().join("other/b"), FileMode::Read, Actor::Broker)
         .unwrap();
     session
-        .check_file(&s.ws().join("c"), FileMode::Write)
+        .check_file(&s.ws().join("c"), FileMode::Write, Actor::Broker)
         .unwrap();
     session.finish(None).unwrap();
 
@@ -578,5 +909,352 @@ action = "allow"
     for (i, e) in es.iter().enumerate() {
         assert_eq!(e.seq, i as u64, "seq에 빈틈이 있음");
     }
+    verify_dir(s.session_dir()).unwrap();
+}
+
+// ---------- 아웃바운드 결과 기록과 총량 한도 ----------
+
+fn quota_policy(scratch: &Scratch, limit: u64) -> Policy {
+    policy(
+        scratch,
+        &format!(
+            r#"
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "mirror.example.com"
+port = 443
+max_bytes_out = {limit}
+action = "allow"
+"#
+        ),
+    )
+}
+
+#[test]
+fn an_egress_summary_is_a_fact_not_a_decision() {
+    let s = Scratch::new("summary");
+    let (mut session, _) = start(&s, quota_policy(&s, 1_000_000), Granted::Refused);
+    session
+        .check_egress("mirror.example.com", 443, Protocol::Tls, Actor::Unknown)
+        .unwrap();
+    session
+        .record_egress_summary(
+            "mirror.example.com",
+            443,
+            Protocol::Tls,
+            4_096,
+            8_192,
+            250,
+            Actor::Unknown,
+        )
+        .unwrap();
+    session.finish(None).unwrap();
+
+    let es = entries(&s.session_dir());
+    let summary = es
+        .iter()
+        .find(|e| matches!(e.event, Event::EgressSummary { .. }))
+        .expect("결과 엔트리가 남아야 함");
+    assert_eq!(summary.decision, Decision::Allow);
+    assert_eq!(
+        summary.rule.as_deref(),
+        Some("airlock:egress-summary"),
+        "규칙 없는 allow 로 남기면 [defaults] 가 열어 준 것처럼 보임"
+    );
+    match &summary.event {
+        Event::EgressSummary {
+            host,
+            port,
+            bytes_out,
+            bytes_in,
+            duration_ms,
+            ..
+        } => {
+            assert_eq!(host, "mirror.example.com");
+            assert_eq!(*port, 443);
+            assert_eq!(*bytes_out, 4_096);
+            assert_eq!(*bytes_in, 8_192);
+            assert_eq!(*duration_ms, 250);
+        }
+        other => panic!("결과 엔트리가 아님: {other:?}"),
+    }
+    // 시도 엔트리와 결과 엔트리는 서로 다른 사실이며 둘 다 남아야 합니다
+    assert!(es.iter().any(|e| matches!(e.event, Event::Egress { .. })));
+    verify_dir(s.session_dir()).unwrap();
+}
+
+#[test]
+fn the_quota_blocks_the_next_connection_and_the_audit_says_why() {
+    let s = Scratch::new("quota");
+    let (mut session, _) = start(&s, quota_policy(&s, 1_000), Granted::Refused);
+
+    // 한도를 넘길 연결 자체는 막지 못합니다. 바이트 수는 연결이 끝나야 알기 때문입니다
+    let first = session
+        .check_egress("mirror.example.com", 443, Protocol::Tls, Actor::Unknown)
+        .unwrap();
+    assert!(first.permitted());
+    session
+        .record_egress_summary(
+            "mirror.example.com",
+            443,
+            Protocol::Tls,
+            5_000,
+            0,
+            10,
+            Actor::Unknown,
+        )
+        .unwrap();
+    assert_eq!(session.bytes_out_to("mirror.example.com", 443), 5_000);
+
+    // 다음 연결부터 막힙니다
+    let second = session
+        .check_egress("mirror.example.com", 443, Protocol::Tls, Actor::Unknown)
+        .unwrap();
+    assert!(!second.permitted(), "한도를 넘긴 뒤에는 막혀야 함");
+    session.finish(None).unwrap();
+
+    let es = entries(&s.session_dir());
+    let blocked = es
+        .iter()
+        .filter(|e| matches!(e.event, Event::Egress { .. }))
+        .nth(1)
+        .expect("두 번째 시도 엔트리");
+    assert_eq!(blocked.decision, Decision::Deny);
+    assert_eq!(
+        blocked.rule.as_deref(),
+        Some(airlock_policy::QUOTA_ID),
+        "초과 사실이 감사의 규칙 id 로 드러나야 함"
+    );
+    verify_dir(s.session_dir()).unwrap();
+}
+
+#[test]
+fn the_quota_key_survives_host_spelling_changes() {
+    // 표기를 바꾸는 것만으로 누적량이 초기화되면 한도가 아무것도 막지 못합니다
+    let s = Scratch::new("quota-spelling");
+    let (mut session, _) = start(&s, quota_policy(&s, 10), Granted::Refused);
+    session
+        .record_egress_summary(
+            "MIRROR.Example.com.",
+            443,
+            Protocol::Tls,
+            100,
+            0,
+            1,
+            Actor::Unknown,
+        )
+        .unwrap();
+    assert_eq!(session.bytes_out_to("mirror.example.com", 443), 100);
+    let out = session
+        .check_egress("mirror.example.com", 443, Protocol::Tls, Actor::Unknown)
+        .unwrap();
+    assert!(!out.permitted());
+    session.finish(None).unwrap();
+}
+
+#[test]
+fn the_quota_is_per_destination() {
+    let s = Scratch::new("quota-dest");
+    let p = policy(
+        &s,
+        r#"
+[[rules]]
+id = "mirror"
+kind = "egress"
+host = "*.example.com"
+max_bytes_out = 10
+action = "allow"
+"#,
+    );
+    let (mut session, _) = start(&s, p, Granted::Refused);
+    session
+        .record_egress_summary(
+            "a.example.com",
+            443,
+            Protocol::Tls,
+            999,
+            0,
+            1,
+            Actor::Unknown,
+        )
+        .unwrap();
+    assert!(
+        !session
+            .check_egress("a.example.com", 443, Protocol::Tls, Actor::Unknown)
+            .unwrap()
+            .permitted()
+    );
+    assert!(
+        session
+            .check_egress("b.example.com", 443, Protocol::Tls, Actor::Unknown)
+            .unwrap()
+            .permitted(),
+        "다른 목적지의 누적량까지 함께 막으면 안 됨"
+    );
+    // 포트가 다르면 다른 목적지입니다
+    assert!(
+        session
+            .check_egress("a.example.com", 8443, Protocol::Tls, Actor::Unknown)
+            .unwrap()
+            .permitted()
+    );
+    session.finish(None).unwrap();
+}
+
+#[test]
+fn a_closed_session_refuses_late_results() {
+    // session_end 뒤에 붙는 엔트리는 체인을 앵커보다 길게 만들어 세션 전체를
+    // "종료 후 덧붙이기" 로 보고하게 합니다
+    let s = Scratch::new("late");
+    let (mut session, _) = start(&s, quota_policy(&s, 1_000_000), Granted::Refused);
+    let closed = session.finish(None).unwrap();
+
+    let err = session.record_egress_summary(
+        "mirror.example.com",
+        443,
+        Protocol::Tls,
+        1,
+        1,
+        1,
+        Actor::Unknown,
+    );
+    assert!(err.is_err(), "닫힌 세션이 늦은 결과를 받아들이면 안 됨");
+    assert!(
+        session
+            .check_egress("mirror.example.com", 443, Protocol::Tls, Actor::Unknown)
+            .is_err(),
+        "닫힌 세션의 판정도 거부되어야 함"
+    );
+
+    let report = verify_dir(s.session_dir()).unwrap();
+    assert_eq!(Some(report.head_seq), closed.head_seq);
+    assert!(matches!(closed.anchor, AnchorOutcome::Written { .. }));
+    airlock_audit::check_session(
+        s.path(),
+        &report.session,
+        report.head_seq,
+        &report.head_hash,
+    )
+    .expect("앵커와 체인이 어긋나면 안 됨");
+}
+
+// ---------- 프록시에서 감사까지의 전체 경로 ----------
+
+/// 한 연결만 받아 고정 응답을 돌려주는 목적지. 받은 바이트 수를 돌려줍니다
+fn echo_origin(reply: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<usize>) {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = l.local_addr().unwrap();
+    let h = std::thread::spawn(move || {
+        let Ok((mut s, _)) = l.accept() else { return 0 };
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok();
+        let mut got = 0usize;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = s.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        let _ = s.write_all(&reply);
+        let _ = s.shutdown(Shutdown::Write);
+        got
+    });
+    (addr, h)
+}
+
+#[test]
+fn the_proxy_records_what_actually_left_the_machine() {
+    use std::io::{BufRead, Read, Write};
+    use std::net::{Shutdown, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let s = Scratch::new("proxy-summary");
+    let payload = vec![b'x'; 30_000];
+    let reply = vec![b'y'; 7_000];
+    let (origin, origin_h) = echo_origin(reply.clone());
+
+    let p = policy(
+        &s,
+        &format!(
+            r#"
+[[rules]]
+id = "loop"
+kind = "egress"
+host = "127.0.0.1"
+port = {}
+action = "allow"
+"#,
+            origin.port()
+        ),
+    );
+    let (session, _) = start(&s, p, Granted::Refused);
+    let shared = Arc::new(Mutex::new(session));
+
+    let server = airlock_proxy::ProxyServer::bind().unwrap();
+    let addr = server.addr();
+    let live = server.live_connections();
+    let gate: Arc<dyn airlock_proxy::EgressGate> =
+        Arc::new(airlock_broker::SessionGate::new(Arc::clone(&shared)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let serving = std::thread::spawn(move || server.serve(gate, flag));
+
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    c.write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", origin.port()).as_bytes())
+        .unwrap();
+    let mut r = std::io::BufReader::new(c.try_clone().unwrap());
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+    let mut blank = String::new();
+    r.read_line(&mut blank).unwrap();
+    c.write_all(&payload).unwrap();
+    c.shutdown(Shutdown::Write).unwrap();
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got.len(), reply.len());
+    assert_eq!(origin_h.join().unwrap(), payload.len());
+
+    // 릴레이가 결과를 남길 때까지 기다립니다
+    for _ in 0..200 {
+        if live.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = serving.join();
+
+    let mut session = shared.lock().unwrap();
+    assert_eq!(
+        session.bytes_out_to("127.0.0.1", origin.port()),
+        payload.len() as u64,
+        "누적 반출량이 실제 전송량과 달라짐"
+    );
+    session.finish(None).unwrap();
+    drop(session);
+
+    let es = entries(&s.session_dir());
+    let summary = es
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::EgressSummary {
+                bytes_out,
+                bytes_in,
+                protocol,
+                ..
+            } => Some((*bytes_out, *bytes_in, *protocol)),
+            _ => None,
+        })
+        .expect("결과 엔트리가 남아야 함");
+    assert_eq!(summary.0, payload.len() as u64, "반출 바이트가 실제와 다름");
+    assert_eq!(summary.1, reply.len() as u64, "수신 바이트가 실제와 다름");
+    assert_eq!(summary.2, Protocol::Tls);
     verify_dir(s.session_dir()).unwrap();
 }
