@@ -4,53 +4,89 @@ use airlock_broker::{
     ApproveAll, Approver, Enforcer, ObserveEnforcer, ProfileOptions, RefuseAll, SessionConfig,
     TtyApprover,
 };
+use airlock_i18n::tr;
 use airlock_policy::{LoadContext, LoadWarning, Policy};
 
 use crate::paths;
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    #[arg(long, value_name = "FILE", help = "정책 파일 경로")]
+    #[arg(long, value_name = "FILE", help = tr!("정책 파일 경로", "policy file path"))]
     pub policy: Option<PathBuf>,
 
-    #[arg(long, help = "강제 없이 기록만 함 (학습 모드)")]
+    #[arg(
+        long,
+        help = tr!(
+            "강제 없이 기록만 함 (학습 모드)",
+            "record only, without enforcement (learning mode)"
+        )
+    )]
     pub observe: bool,
 
-    #[arg(long, value_name = "DIR", help = "감사 로그 루트")]
+    #[arg(long, value_name = "DIR", help = tr!("감사 로그 루트", "audit log root"))]
     pub audit_dir: Option<PathBuf>,
 
     #[arg(
         long,
         value_name = "DIR",
-        help = "세션 상위 앵커(anchors.jsonl)를 둘 디렉토리. 생략하면 감사 루트. \
+        help = tr!(
+            "세션 상위 앵커(anchors.jsonl)를 둘 디렉토리. 생략하면 감사 루트. \
                 같은 트리에 두면 체인을 재계산할 수 있는 주체가 앵커도 같은 비용으로 \
                 재계산하므로, 실질 탐지력은 다른 볼륨이나 원격 append-only 마운트로 \
-                분리했을 때만 생김"
+                분리했을 때만 생김",
+            "directory for the session anchors (anchors.jsonl); defaults to the audit \
+                root. If it lives in the same tree, whoever can recompute the chain can \
+                recompute the anchors at the same cost, so real detection power only \
+                comes from a separate volume or a remote append-only mount"
+        )
     )]
     pub anchor_dir: Option<PathBuf>,
 
-    #[arg(long, value_name = "DIR", help = "쓰기 허용 작업 공간. 기본값은 cwd")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = tr!(
+            "쓰기 허용 작업 공간. 기본값은 cwd",
+            "writable workspace; defaults to the cwd"
+        )
+    )]
     pub workspace: Option<PathBuf>,
 
-    #[arg(long, help = "아웃바운드 네트워크를 통째로 차단함")]
+    #[arg(
+        long,
+        help = tr!(
+            "아웃바운드 네트워크를 통째로 차단함",
+            "block outbound networking entirely"
+        )
+    )]
     pub no_network: bool,
 
     #[arg(
         long,
-        help = "아웃바운드를 로컬 egress 프록시로 강제 경유시켜 호스트 단위 정책을 강제함. \
-                프록시 설정을 무시하는 도구는 연결에 실패함"
+        help = tr!(
+            "아웃바운드를 로컬 egress 프록시로 강제 경유시켜 호스트 단위 정책을 강제함. \
+                프록시 설정을 무시하는 도구는 연결에 실패함",
+            "force outbound traffic through a local egress proxy so per-host policy is \
+                enforced; tools that ignore proxy settings will fail to connect"
+        )
     )]
     pub egress_proxy: bool,
 
     #[arg(
         long,
-        help = "모든 ask를 사람 확인 없이 승인함. 승인 통제를 포기하는 설정임"
+        help = tr!(
+            "모든 ask를 사람 확인 없이 승인함. 승인 통제를 포기하는 설정임",
+            "approve every ask without human confirmation; this abandons approval control"
+        )
     )]
     pub yes: bool,
 
     #[arg(
         long,
-        help = "엔트리마다 fsync 하지 않음. 크래시 시 구간 손실을 감수함"
+        help = tr!(
+            "엔트리마다 fsync 하지 않음. 크래시 시 구간 손실을 감수함",
+            "do not fsync per entry; accepts losing a window of entries on a crash"
+        )
     )]
     pub no_fsync: bool,
 
@@ -58,7 +94,11 @@ pub struct RunArgs {
         long,
         default_value = "exec-net",
         value_name = "LEVEL",
-        help = "런타임 중계 수준 off|exec-net|full. full은 파일 열기까지 기록하지만 느림 (Linux 전용)"
+        help = tr!(
+            "런타임 중계 수준 off|exec-net|full. full은 파일 열기까지 기록하지만 느림 (Linux 전용)",
+            "runtime mediation level off|exec-net|full; full also records file opens but \
+                is slow (Linux only)"
+        )
     )]
     pub mediate: String,
 
@@ -67,7 +107,7 @@ pub struct RunArgs {
         allow_hyphen_values = true,
         required = true,
         value_name = "CMD",
-        help = "실행할 명령과 인자"
+        help = tr!("실행할 명령과 인자", "command and arguments to run")
     )]
     pub command: Vec<String>,
 }
@@ -76,15 +116,30 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("airlock: 현재 디렉토리를 알 수 없음: {e}");
+            eprintln!(
+                "airlock: {}",
+                tr!(
+                    format!("현재 디렉토리를 알 수 없음: {e}"),
+                    format!("cannot determine the current directory: {e}")
+                )
+            );
             return 70;
         }
     };
 
     let Some(mediation) = airlock_broker::Mediation::parse(&args.mediate) else {
         eprintln!(
-            "airlock: 알 수 없는 --mediate `{}`. off, exec-net, full 중 하나여야 함",
-            args.mediate
+            "airlock: {}",
+            tr!(
+                format!(
+                    "알 수 없는 --mediate `{}`. off, exec-net, full 중 하나여야 함",
+                    args.mediate
+                ),
+                format!(
+                    "unknown --mediate `{}`; must be one of off, exec-net, full",
+                    args.mediate
+                )
+            )
         );
         return 64;
     };
@@ -118,8 +173,20 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
     // HOME이 없거나 상대 경로면 ~/ 앵커 forbid가 전부 엉뚱한 곳을 가리킵니다. 시크릿
     // 보호가 사라진 채로 도는 것보다 중단이 낫습니다
     let Some(home) = airlock_policy::path::home_dir_checked() else {
-        eprintln!("airlock: HOME이 비어 있거나 절대 경로가 아님");
-        eprintln!("airlock: ~/ 로 시작하는 시크릿 보호 규칙이 전부 무효가 되므로 실행을 중단함");
+        eprintln!(
+            "airlock: {}",
+            tr!(
+                "HOME이 비어 있거나 절대 경로가 아님",
+                "HOME is empty or not an absolute path"
+            )
+        );
+        eprintln!(
+            "airlock: {}",
+            tr!(
+                "~/ 로 시작하는 시크릿 보호 규칙이 전부 무효가 되므로 실행을 중단함",
+                "aborting because every ~/-anchored secret protection rule would be void"
+            )
+        );
         return 78;
     };
 
@@ -133,14 +200,26 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
             Ok(policy) => policy,
             Err(e) => {
                 eprintln!("airlock: {e}");
-                eprintln!("airlock: 정책이 적용되지 않았으므로 실행을 중단함");
+                eprintln!(
+                    "airlock: {}",
+                    tr!(
+                        "정책이 적용되지 않았으므로 실행을 중단함",
+                        "aborting because the policy was not applied"
+                    )
+                );
                 return 78;
             }
         },
         None => match Policy::baseline_only(&ctx) {
             Ok(policy) => policy,
             Err(e) => {
-                eprintln!("airlock: 내장 베이스라인 로드 실패: {e}");
+                eprintln!(
+                    "airlock: {}",
+                    tr!(
+                        format!("내장 베이스라인 로드 실패: {e}"),
+                        format!("failed to load the built-in baseline: {e}")
+                    )
+                );
                 return 70;
             }
         },
@@ -160,7 +239,7 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         {
             continue;
         }
-        eprintln!("airlock: 경고 {w}");
+        eprintln!("airlock: {} {w}", tr!("경고", "warning"));
     }
 
     let workspace = paths::absolutize(&args.workspace.clone().unwrap_or_else(|| cwd.clone()), &cwd);
@@ -175,16 +254,33 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         match airlock_proxy::ProxyServer::bind() {
             Ok(server) => Some(server),
             Err(e) => {
-                eprintln!("airlock: egress 프록시를 띄우지 못함: {e}");
                 eprintln!(
-                    "airlock: 프록시 없이 계속하면 호스트 정책이 강제되지 않으므로 실행을 중단함"
+                    "airlock: {}",
+                    tr!(
+                        format!("egress 프록시를 띄우지 못함: {e}"),
+                        format!("failed to start the egress proxy: {e}")
+                    )
+                );
+                eprintln!(
+                    "airlock: {}",
+                    tr!(
+                        "프록시 없이 계속하면 호스트 정책이 강제되지 않으므로 실행을 중단함",
+                        "aborting because continuing without the proxy would leave host \
+                         policy unenforced"
+                    )
                 );
                 return 70;
             }
         }
     } else {
         if args.egress_proxy && args.no_network {
-            eprintln!("airlock: --no-network가 있으므로 --egress-proxy는 무시됨");
+            eprintln!(
+                "airlock: {}",
+                tr!(
+                    "--no-network가 있으므로 --egress-proxy는 무시됨",
+                    "--egress-proxy is ignored because --no-network is set"
+                )
+            );
         }
         None
     };
@@ -201,8 +297,13 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
             Err(why) => {
                 eprintln!("airlock: {why}");
                 eprintln!(
-                    "airlock: 커널 강제 없이는 에이전트를 격리할 수 없으므로 실행을 중단함. \
-                     기록만 원하면 --observe를 명시할 것"
+                    "airlock: {}",
+                    tr!(
+                        "커널 강제 없이는 에이전트를 격리할 수 없으므로 실행을 중단함. \
+                         기록만 원하면 --observe를 명시할 것",
+                        "aborting because the agent cannot be isolated without kernel \
+                         enforcement; pass --observe explicitly if you only want recording"
+                    )
                 );
                 return 70;
             }
@@ -211,15 +312,26 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
 
     let approver: Box<dyn Approver> = if args.yes {
         eprintln!(
-            "airlock: 경고 --yes는 모든 ask를 사람 확인 없이 승인함. 감사 로그에 자동 승인으로 기록됨"
+            "airlock: {}",
+            tr!(
+                "경고 --yes는 모든 ask를 사람 확인 없이 승인함. 감사 로그에 자동 승인으로 기록됨",
+                "warning: --yes approves every ask without human confirmation; recorded \
+                 in the audit log as automatic approval"
+            )
         );
         Box::new(ApproveAll)
     } else if TtyApprover::available() {
         Box::new(TtyApprover::new())
     } else {
-        eprintln!("airlock: 경고 /dev/tty가 없어 모든 ask를 거부함");
+        eprintln!(
+            "airlock: {}",
+            tr!(
+                "경고 /dev/tty가 없어 모든 ask를 거부함",
+                "warning: refusing every ask because /dev/tty is unavailable"
+            )
+        );
         Box::new(RefuseAll {
-            why: "제어 터미널 없음".to_string(),
+            why: tr!("제어 터미널 없음", "no controlling terminal").to_string(),
         })
     };
 
@@ -346,26 +458,51 @@ fn check_workspace(workspace: &std::path::Path, explicit: bool) -> Result<(), St
     let ws = canon(workspace);
 
     if ws.parent().is_none() {
-        return Err(format!(
-            "작업 공간이 파일시스템 루트({})임. 루트를 쓰기 허용으로 열지 않음. \
-             --workspace 로 실제 작업 디렉토리를 지정할 것",
-            ws.display()
+        return Err(tr!(
+            format!(
+                "작업 공간이 파일시스템 루트({})임. 루트를 쓰기 허용으로 열지 않음. \
+                 --workspace 로 실제 작업 디렉토리를 지정할 것",
+                ws.display()
+            ),
+            format!(
+                "the workspace is the filesystem root ({}); refusing to open the root \
+                 for writing. Point --workspace at the actual working directory",
+                ws.display()
+            )
         ));
     }
 
     let home = canon(&airlock_policy::path::home_dir());
     if ws == home {
         if !explicit {
-            return Err(format!(
-                "작업 공간이 홈 전체({})가 됨. 작업 공간은 통째로 쓰기 허용이므로 \
-                 홈에서 그냥 실행하지 않음. 하위 디렉토리로 옮기거나 --workspace 로 \
-                 좁혀서 지정할 것",
-                ws.display()
+            return Err(tr!(
+                format!(
+                    "작업 공간이 홈 전체({})가 됨. 작업 공간은 통째로 쓰기 허용이므로 \
+                     홈에서 그냥 실행하지 않음. 하위 디렉토리로 옮기거나 --workspace 로 \
+                     좁혀서 지정할 것",
+                    ws.display()
+                ),
+                format!(
+                    "the workspace would be your entire home ({}); the workspace is \
+                     writable as a whole, so refusing to run bare from home. Move into a \
+                     subdirectory or narrow it with --workspace",
+                    ws.display()
+                )
             ));
         }
         eprintln!(
-            "airlock: 경고 작업 공간이 홈 전체({})임. 홈 아래 모든 파일이 쓰기 허용됨",
-            ws.display()
+            "airlock: {}",
+            tr!(
+                format!(
+                    "경고 작업 공간이 홈 전체({})임. 홈 아래 모든 파일이 쓰기 허용됨",
+                    ws.display()
+                ),
+                format!(
+                    "warning: the workspace is your entire home ({}); every file under \
+                     home becomes writable",
+                    ws.display()
+                )
+            )
         );
     }
     Ok(())
@@ -416,7 +553,11 @@ fn build_enforcer(
     {
         if !airlock_broker::LandlockEnforcer::available() {
             let _ = (workspace, allow_network, proxy);
-            return Err("커널이 Landlock을 지원하지 않음(5.13 이상 필요)".to_string());
+            return Err(tr!(
+                "커널이 Landlock을 지원하지 않음(5.13 이상 필요)",
+                "the kernel does not support Landlock (5.13 or later required)"
+            )
+            .to_string());
         }
         Ok(Box::new(
             airlock_broker::LandlockEnforcer::new().with_options(options(
@@ -429,7 +570,11 @@ fn build_enforcer(
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (workspace, allow_network, proxy);
-        Err("이 플랫폼의 커널 강제 백엔드가 아직 없음".to_string())
+        Err(tr!(
+            "이 플랫폼의 커널 강제 백엔드가 아직 없음",
+            "no kernel enforcement backend exists for this platform yet"
+        )
+        .to_string())
     }
 }
 
@@ -448,15 +593,27 @@ fn egress_observation_gaps(policy: &Policy, proxy: Option<std::net::SocketAddr>)
         return Vec::new();
     }
     let mut gaps = vec![
-        "중계 층은 connect(2)만 보므로 모든 연결을 protocol=tcp로 보고함. \
-         프록시 없이는 protocol 조건 규칙이 아무것도 매칭하지 않음"
-            .to_string(),
+        tr!(
+            "중계 층은 connect(2)만 보므로 모든 연결을 protocol=tcp로 보고함. \
+             프록시 없이는 protocol 조건 규칙이 아무것도 매칭하지 않음",
+            "the mediation layer only sees connect(2), so every connection is reported \
+             as protocol=tcp; without the proxy, no protocol-conditioned rule matches \
+             anything"
+        )
+        .to_string(),
     ];
     let floor = policy.defaults().egress_plaintext;
     if floor.blocks() {
-        gaps.push(format!(
-            "[defaults].egress_plaintext = \"{floor}\" 가 이 세션에서는 한 번도 발동하지 않음. \
-             평문 판정은 --egress-proxy 위에서만 성립하므로 지금은 평문 차단이 강제되지 않음"
+        gaps.push(tr!(
+            format!(
+                "[defaults].egress_plaintext = \"{floor}\" 가 이 세션에서는 한 번도 발동하지 않음. \
+                 평문 판정은 --egress-proxy 위에서만 성립하므로 지금은 평문 차단이 강제되지 않음"
+            ),
+            format!(
+                "[defaults].egress_plaintext = \"{floor}\" never fires in this session; \
+                 plaintext detection only exists on top of --egress-proxy, so plaintext \
+                 blocking is not enforced right now"
+            )
         ));
     }
     let protocol_rules: Vec<&str> = policy
@@ -474,10 +631,17 @@ fn egress_observation_gaps(policy: &Policy, proxy: Option<std::net::SocketAddr>)
         .map(|r| r.id.as_str())
         .collect();
     if !protocol_rules.is_empty() {
-        gaps.push(format!(
-            "protocol을 지정한 egress 규칙 {}개가 이 세션에서 죽어 있음: {}",
-            protocol_rules.len(),
-            protocol_rules.join(", ")
+        gaps.push(tr!(
+            format!(
+                "protocol을 지정한 egress 규칙 {}개가 이 세션에서 죽어 있음: {}",
+                protocol_rules.len(),
+                protocol_rules.join(", ")
+            ),
+            format!(
+                "{} egress rule(s) with a protocol condition are dead in this session: {}",
+                protocol_rules.len(),
+                protocol_rules.join(", ")
+            )
         ));
     }
     gaps
@@ -499,38 +663,116 @@ fn print_banner(
     let effective = airlock_broker::effective_mediation(mediation);
     eprintln!("\x1b[1;36mairlock\x1b[0m {}", env!("CARGO_PKG_VERSION"));
     eprintln!(
-        "  정책     {} ({} 규칙, 다이제스트 {short})",
-        policy.name(),
-        policy.rule_count()
+        "{}",
+        tr!(
+            format!(
+                "  정책     {} ({} 규칙, 다이제스트 {short})",
+                policy.name(),
+                policy.rule_count()
+            ),
+            format!(
+                "  policy     {} ({} rules, digest {short})",
+                policy.name(),
+                policy.rule_count()
+            )
+        )
     );
-    eprintln!("  강제     {}", enforcer.describe());
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  강제     {}", enforcer.describe()),
+            format!("  enforce    {}", enforcer.describe())
+        )
+    );
     if effective == mediation {
-        eprintln!("  중계     {}", effective.as_str());
+        eprintln!(
+            "{}",
+            tr!(
+                format!("  중계     {}", effective.as_str()),
+                format!("  mediation  {}", effective.as_str())
+            )
+        );
     } else {
         // 요청값과 적용값이 다르면 둘을 같이 보여 줍니다. 요청값만 보여 주면
         // 배너가 실제보다 강한 보증을 하는 것이 됩니다
         eprintln!(
-            "  중계     {} (요청 {})",
-            effective.as_str(),
-            mediation.as_str()
+            "{}",
+            tr!(
+                format!(
+                    "  중계     {} (요청 {})",
+                    effective.as_str(),
+                    mediation.as_str()
+                ),
+                format!(
+                    "  mediation  {} (requested {})",
+                    effective.as_str(),
+                    mediation.as_str()
+                )
+            )
         );
     }
-    eprintln!("  작업공간 {}", workspace.display());
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  작업공간 {}", workspace.display()),
+            format!("  workspace  {}", workspace.display())
+        )
+    );
     match proxy {
-        Some(addr) => eprintln!("  아웃바운드 {addr} 경유. 호스트 정책이 강제됨"),
-        None => eprintln!("  아웃바운드 프록시 없음. 호스트 규칙은 의도 선언에 그침"),
+        Some(addr) => eprintln!(
+            "{}",
+            tr!(
+                format!("  아웃바운드 {addr} 경유. 호스트 정책이 강제됨"),
+                format!("  egress     via {addr}; host policy is enforced")
+            )
+        ),
+        None => eprintln!(
+            "{}",
+            tr!(
+                "  아웃바운드 프록시 없음. 호스트 규칙은 의도 선언에 그침",
+                "  egress     no proxy; host rules remain declarations of intent"
+            )
+        ),
     }
-    eprintln!("  승인     {}", approver.describe());
-    eprintln!("  감사     {}", session_dir.display());
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  승인     {}", approver.describe()),
+            format!("  approval   {}", approver.describe())
+        )
+    );
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  감사     {}", session_dir.display()),
+            format!("  audit      {}", session_dir.display())
+        )
+    );
     let anchors = airlock_broker::anchor_dir_for(session_dir, anchor_dir);
     if anchor_dir.is_some() {
-        eprintln!("  앵커     {}", anchors.display());
+        eprintln!(
+            "{}",
+            tr!(
+                format!("  앵커     {}", anchors.display()),
+                format!("  anchors    {}", anchors.display())
+            )
+        );
     } else {
         // 같은 트리에 두면 체인을 다시 계산할 수 있는 주체가 앵커도 같은 비용으로 다시
         // 계산합니다. 분리하지 않았다는 사실을 배너가 감추면 없는 보증을 믿게 됩니다
         eprintln!(
-            "  앵커     {} (감사 루트와 같은 트리. 재계산 탐지력 없음, --anchor-dir로 분리할 것)",
-            anchors.display()
+            "{}",
+            tr!(
+                format!(
+                    "  앵커     {} (감사 루트와 같은 트리. 재계산 탐지력 없음, --anchor-dir로 분리할 것)",
+                    anchors.display()
+                ),
+                format!(
+                    "  anchors    {} (same tree as the audit root; no recomputation \
+                     detection, separate it with --anchor-dir)",
+                    anchors.display()
+                )
+            )
         );
     }
     for gap in enforcer
@@ -539,7 +781,13 @@ fn print_banner(
         .chain(airlock_broker::mediation_gaps(mediation))
         .chain(egress_observation_gaps(policy, proxy))
     {
-        eprintln!("  \x1b[33m한계\x1b[0m     {gap}");
+        eprintln!(
+            "{}",
+            tr!(
+                format!("  \x1b[33m한계\x1b[0m     {gap}"),
+                format!("  \x1b[33mlimit\x1b[0m      {gap}")
+            )
+        );
     }
     eprintln!();
 }
@@ -547,32 +795,101 @@ fn print_banner(
 fn print_summary(report: &airlock_broker::RunReport) {
     let short: String = report.head_hash.to_hex().chars().take(12).collect();
     eprintln!();
-    eprintln!("\x1b[1;36mairlock\x1b[0m 세션 종료");
-    eprintln!("  강제     {}", report.enforcement);
-    eprintln!("  중계     {}", report.mediation.as_str());
+    eprintln!(
+        "\x1b[1;36mairlock\x1b[0m {}",
+        tr!("세션 종료", "session ended")
+    );
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  강제     {}", report.enforcement),
+            format!("  enforce    {}", report.enforcement)
+        )
+    );
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  중계     {}", report.mediation.as_str()),
+            format!("  mediation  {}", report.mediation.as_str())
+        )
+    );
     if let Some(signal) = report.signal {
-        eprintln!("  종료     시그널 {signal}");
+        eprintln!(
+            "{}",
+            tr!(
+                format!("  종료     시그널 {signal}"),
+                format!("  exit       signal {signal}")
+            )
+        );
     }
-    eprintln!("  승인요청 {}", report.asked);
-    eprintln!("  차단     {}", report.denied);
-    eprintln!("  체인헤드 {short}");
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  승인요청 {}", report.asked),
+            format!("  asked      {}", report.asked)
+        )
+    );
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  차단     {}", report.denied),
+            format!("  denied     {}", report.denied)
+        )
+    );
+    eprintln!(
+        "{}",
+        tr!(
+            format!("  체인헤드 {short}"),
+            format!("  chain head {short}")
+        )
+    );
     match report.anchor.failure() {
-        None => eprintln!("  앵커     {}", report.anchor.path().display()),
+        None => eprintln!(
+            "{}",
+            tr!(
+                format!("  앵커     {}", report.anchor.path().display()),
+                format!("  anchors    {}", report.anchor.path().display())
+            )
+        ),
         // 앵커 없는 세션은 감사 보증이 약해진 세션입니다. 자식은 이미 끝났으므로 종료
         // 코드를 덮지는 않지만, 조용히 넘기면 사용자가 그 사실을 영영 모릅니다
         Some(why) => {
             eprintln!(
-                "  \x1b[1;31m앵커 실패\x1b[0m {} : {why}",
-                report.anchor.path().display()
+                "{}",
+                tr!(
+                    format!(
+                        "  \x1b[1;31m앵커 실패\x1b[0m {} : {why}",
+                        report.anchor.path().display()
+                    ),
+                    format!(
+                        "  \x1b[1;31manchor failure\x1b[0m {} : {why}",
+                        report.anchor.path().display()
+                    )
+                )
             );
             eprintln!(
-                "  \x1b[1;31m경고\x1b[0m     이 세션은 상위 앵커에 남지 않았음. \
-                 세션 통째 삭제와 체인 재계산을 탐지할 수 없음"
+                "{}",
+                tr!(
+                    "  \x1b[1;31m경고\x1b[0m     이 세션은 상위 앵커에 남지 않았음. \
+                     세션 통째 삭제와 체인 재계산을 탐지할 수 없음",
+                    "  \x1b[1;31mwarning\x1b[0m    this session was not recorded in the \
+                     anchors; whole-session deletion and chain recomputation cannot be \
+                     detected"
+                )
             );
         }
     }
     eprintln!(
-        "  검증     airlock audit verify {}",
-        report.audit_dir.display()
+        "{}",
+        tr!(
+            format!(
+                "  검증     airlock audit verify {}",
+                report.audit_dir.display()
+            ),
+            format!(
+                "  verify     airlock audit verify {}",
+                report.audit_dir.display()
+            )
+        )
     );
 }

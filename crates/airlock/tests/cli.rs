@@ -66,6 +66,7 @@ fn airlock(s: &Scratch, cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(cwd)
         .env("HOME", &home)
+        .env("AIRLOCK_LANG", "ko")
         .env_remove("AIRLOCK_AUDIT_DIR")
         .env_remove("XDG_DATA_HOME")
         .output()

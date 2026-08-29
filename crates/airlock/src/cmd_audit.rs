@@ -5,6 +5,7 @@ use airlock_audit::{
     verify_dir,
 };
 use airlock_canonical::display::sanitize;
+use airlock_i18n::tr;
 
 use crate::paths;
 use crate::render;
@@ -12,70 +13,133 @@ use crate::report::{Report, range_of};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AuditCommand {
-    #[command(about = "해시체인 무결성을 검증함")]
+    #[command(about = tr!("해시체인 무결성을 검증함", "verify hash chain integrity"))]
     Verify {
-        #[arg(value_name = "DIR", help = "세션 디렉토리. 생략하면 가장 최근 세션")]
+        #[arg(
+            value_name = "DIR",
+            help = tr!(
+                "세션 디렉토리. 생략하면 가장 최근 세션",
+                "session directory; defaults to the most recent session"
+            )
+        )]
         dir: Option<PathBuf>,
-        #[arg(long, help = "모든 세션을 검증함")]
+        #[arg(long, help = tr!("모든 세션을 검증함", "verify every session"))]
         all: bool,
         #[arg(
             long,
             value_name = "DIR",
-            help = "세션 상위 앵커(anchors.jsonl)가 있는 디렉토리. \
+            help = tr!(
+                "세션 상위 앵커(anchors.jsonl)가 있는 디렉토리. \
                     airlock run --anchor-dir 로 분리했다면 같은 값을 넘겨야 함. \
-                    생략하면 감사 루트"
+                    생략하면 감사 루트",
+                "directory holding the session anchors (anchors.jsonl); if it was \
+                    separated with airlock run --anchor-dir, pass the same value; \
+                    defaults to the audit root"
+            )
         )]
         anchor_dir: Option<PathBuf>,
     },
-    #[command(about = "감사 엔트리를 사람이 읽는 형태로 출력함")]
+    #[command(
+        about = tr!(
+            "감사 엔트리를 사람이 읽는 형태로 출력함",
+            "print audit entries in a human-readable form"
+        )
+    )]
     Show {
         #[arg(value_name = "DIR")]
         dir: Option<PathBuf>,
-        #[arg(long, default_value_t = 50, help = "출력할 최대 엔트리 수")]
+        #[arg(
+            long,
+            default_value_t = 50,
+            help = tr!("출력할 최대 엔트리 수", "maximum number of entries to print")
+        )]
         limit: usize,
-        #[arg(long, help = "차단과 승인 요청만 보여줌")]
+        #[arg(
+            long,
+            help = tr!("차단과 승인 요청만 보여줌", "show only denials and asks")
+        )]
         decisions_only: bool,
     },
-    #[command(about = "세션 목록을 보여줌")]
+    #[command(about = tr!("세션 목록을 보여줌", "list sessions"))]
     List,
 
     #[command(
-        about = "매일 이상여부 점검 보고를 만듦",
-        long_about = "범위 안의 모든 세션을 검증하고 결정·승인·아웃바운드를 집계함. \
+        about = tr!(
+            "매일 이상여부 점검 보고를 만듦",
+            "produce the daily anomaly check report"
+        ),
+        long_about = tr!(
+            "범위 안의 모든 세션을 검증하고 결정·승인·아웃바운드를 집계함. \
 이상이 하나라도 있으면 종료 코드가 비영이므로 cron 이나 launchd 에 그대로 걸 수 있음. \
 종료 코드는 0 이상 없음, 2 증거 이상(무결성·앵커·읽기 실패), 3 운영 이상(미응답 ask 등), \
-64 인자 오류, 70 내부 오류임"
+64 인자 오류, 70 내부 오류임",
+            "verifies every session in range and aggregates decisions, approvals, and \
+outbound traffic. any anomaly makes the exit code non-zero, so it can be wired into \
+cron or launchd as-is. exit codes: 0 no anomalies, 2 evidence anomaly (integrity, \
+anchors, read failure), 3 operational anomaly (unanswered ask and the like), 64 usage \
+error, 70 internal error"
+        )
     )]
     Report {
-        #[arg(long, value_name = "YYYY-MM-DD", help = "이 날짜 00:00:00 UTC 부터")]
+        #[arg(
+            long,
+            value_name = "YYYY-MM-DD",
+            help = tr!("이 날짜 00:00:00 UTC 부터", "from 00:00:00 UTC on this date")
+        )]
         since: Option<String>,
         #[arg(
             long,
             value_name = "YYYY-MM-DD",
-            help = "이 날짜 23:59:59 UTC 까지 (그 날을 통째로 포함함)"
+            help = tr!(
+                "이 날짜 23:59:59 UTC 까지 (그 날을 통째로 포함함)",
+                "until 23:59:59 UTC on this date (covers that whole day)"
+            )
         )]
         until: Option<String>,
-        #[arg(long, help = "SIEM 과 스크립트가 먹을 수 있는 JSON 으로 출력함")]
+        #[arg(
+            long,
+            help = tr!(
+                "SIEM 과 스크립트가 먹을 수 있는 JSON 으로 출력함",
+                "print JSON that SIEMs and scripts can consume"
+            )
+        )]
         json: bool,
         #[arg(
             long,
             value_name = "DIR",
-            help = "앵커(anchors.jsonl)와 확인 기록(reviews.jsonl)이 있는 디렉토리. \
-                    생략하면 감사 루트"
+            help = tr!(
+                "앵커(anchors.jsonl)와 확인 기록(reviews.jsonl)이 있는 디렉토리. \
+                    생략하면 감사 루트",
+                "directory holding the anchors (anchors.jsonl) and the review records \
+                    (reviews.jsonl); defaults to the audit root"
+            )
         )]
         anchor_dir: Option<PathBuf>,
         #[arg(
             long,
-            help = "사람 신원 없는 자동 승인을 이상으로 셈. 기본값은 표시만 함"
+            help = tr!(
+                "사람 신원 없는 자동 승인을 이상으로 셈. 기본값은 표시만 함",
+                "count automatic approvals without a human identity as anomalies; by \
+                    default they are only displayed"
+            )
         )]
         strict_approval: bool,
     },
 
     #[command(
-        about = "책임자가 점검했다는 사실을 기록함",
-        long_about = "리포트를 다시 계산해 그 범위와 다이제스트를 확인 체인에 남김. \
+        about = tr!(
+            "책임자가 점검했다는 사실을 기록함",
+            "record that a responsible person reviewed the report"
+        ),
+        long_about = tr!(
+            "리포트를 다시 계산해 그 범위와 다이제스트를 확인 체인에 남김. \
 확인자 uid 와 euid 는 커널에서 직접 읽고 터미널은 관측된 값만 남김. \
-종료 코드는 리포트와 같으며 기록 자체가 실패하면 70 임"
+종료 코드는 리포트와 같으며 기록 자체가 실패하면 70 임",
+            "recomputes the report and records its range and digest in the review chain. \
+the reviewer uid and euid are read straight from the kernel and the terminal is \
+recorded only as observed. the exit code matches the report; 70 if the recording \
+itself fails"
+        )
     )]
     Ack {
         #[arg(long, value_name = "YYYY-MM-DD")]
@@ -84,9 +148,19 @@ pub enum AuditCommand {
         until: Option<String>,
         #[arg(long, value_name = "DIR")]
         anchor_dir: Option<PathBuf>,
-        #[arg(long, value_name = "TEXT", help = "확인자가 남기는 메모")]
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = tr!("확인자가 남기는 메모", "note left by the reviewer")
+        )]
         note: Option<String>,
-        #[arg(long, help = "자동 승인을 이상으로 세고 그 판정을 기록함")]
+        #[arg(
+            long,
+            help = tr!(
+                "자동 승인을 이상으로 세고 그 판정을 기록함",
+                "count automatic approvals as anomalies and record that verdict"
+            )
+        )]
         strict_approval: bool,
     },
 }
@@ -104,7 +178,13 @@ pub fn exec(cmd: AuditCommand, audit_root_override: Option<PathBuf>) -> i32 {
             if all {
                 let sessions = paths::all_sessions(&root);
                 if sessions.is_empty() {
-                    eprintln!("airlock: {}에 세션이 없음", root.display());
+                    eprintln!(
+                        "{}",
+                        tr!(
+                            format!("airlock: {}에 세션이 없음", root.display()),
+                            format!("airlock: no sessions under {}", root.display())
+                        )
+                    );
                     return 1;
                 }
                 let mut worst = chain;
@@ -175,7 +255,13 @@ fn report(
             Ok(text) => println!("{text}"),
             Err(e) => {
                 // 직렬화가 실패하면 보고가 없는 것이므로 통과로 끝내지 않습니다
-                eprintln!("airlock: 보고를 JSON 으로 만들지 못함: {e}");
+                eprintln!(
+                    "{}",
+                    tr!(
+                        format!("airlock: 보고를 JSON 으로 만들지 못함: {e}"),
+                        format!("airlock: failed to render the report as JSON: {e}")
+                    )
+                );
                 return 70;
             }
         }
@@ -220,14 +306,26 @@ fn ack(
     let mut log = match ReviewLog::open(&anchors) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("airlock: 확인 기록을 열지 못함: {e}");
+            eprintln!(
+                "{}",
+                tr!(
+                    format!("airlock: 확인 기록을 열지 못함: {e}"),
+                    format!("airlock: failed to open the review record: {e}")
+                )
+            );
             return 70;
         }
     };
     let entry = match log.append(&subject, verdict, note.as_deref()) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("airlock: 확인 기록을 남기지 못함: {e}");
+            eprintln!(
+                "{}",
+                tr!(
+                    format!("airlock: 확인 기록을 남기지 못함: {e}"),
+                    format!("airlock: failed to append the review record: {e}")
+                )
+            );
             return 70;
         }
     };
@@ -235,40 +333,105 @@ fn ack(
     // 방금 쓴 줄이 정말 이 범위와 이 리포트를 가리키는지 다시 봅니다. 기록과 대상이
     // 어긋난 채로 성공을 보고하면 그 도장이 알리바이가 됩니다
     if let Err(why) = airlock_audit::check_review(&entry, &subject) {
-        eprintln!("airlock: 확인 기록이 리포트와 어긋남: {why}");
+        eprintln!(
+            "{}",
+            tr!(
+                format!("airlock: 확인 기록이 리포트와 어긋남: {why}"),
+                format!("airlock: the review record does not match the report: {why}")
+            )
+        );
         return 70;
     }
 
     let tty = match &entry.reviewer_tty {
         Some(t) => sanitize(t),
-        None => "\x1b[33m미관측\x1b[0m".to_string(),
+        None => tr!("\x1b[33m미관측\x1b[0m", "\x1b[33munobserved\x1b[0m").to_string(),
     };
     println!(
-        "\x1b[1;36mairlock\x1b[0m 확인 기록 seq {} {}",
-        entry.seq,
-        log.path().display()
+        "{}",
+        tr!(
+            format!(
+                "\x1b[1;36mairlock\x1b[0m 확인 기록 seq {} {}",
+                entry.seq,
+                log.path().display()
+            ),
+            format!(
+                "\x1b[1;36mairlock\x1b[0m review record seq {} {}",
+                entry.seq,
+                log.path().display()
+            )
+        )
     );
     println!(
-        "  확인자   uid={} euid={} tty={tty}",
-        entry.reviewer_uid, entry.reviewer_euid
+        "{}",
+        tr!(
+            format!(
+                "  확인자   uid={} euid={} tty={tty}",
+                entry.reviewer_uid, entry.reviewer_euid
+            ),
+            format!(
+                "  reviewer  uid={} euid={} tty={tty}",
+                entry.reviewer_uid, entry.reviewer_euid
+            )
+        )
     );
-    println!("  시각     {}", render::short_time(entry.ts));
     println!(
-        "  범위     {} 세션 {}개",
-        match (&entry.since, &entry.until) {
-            (None, None) => "전체".to_string(),
-            (Some(a), None) => format!("{} 이후", sanitize(a)),
-            (None, Some(b)) => format!("{} 까지", sanitize(b)),
-            (Some(a), Some(b)) => format!("{} .. {}", sanitize(a), sanitize(b)),
-        },
-        entry.sessions.len()
+        "{}",
+        tr!(
+            format!("  시각     {}", render::short_time(entry.ts)),
+            format!("  time      {}", render::short_time(entry.ts))
+        )
     );
-    println!("  다이제스트 {}", entry.report_digest);
-    println!("  판정     {}", verdict.label());
+    let range_text = match (&entry.since, &entry.until) {
+        (None, None) => tr!("전체", "all").to_string(),
+        (Some(a), None) => tr!(
+            format!("{} 이후", sanitize(a)),
+            format!("since {}", sanitize(a))
+        ),
+        (None, Some(b)) => tr!(
+            format!("{} 까지", sanitize(b)),
+            format!("until {}", sanitize(b))
+        ),
+        (Some(a), Some(b)) => format!("{} .. {}", sanitize(a), sanitize(b)),
+    };
+    println!(
+        "{}",
+        tr!(
+            format!("  범위     {} 세션 {}개", range_text, entry.sessions.len()),
+            format!(
+                "  range     {} ({} sessions)",
+                range_text,
+                entry.sessions.len()
+            )
+        )
+    );
+    println!(
+        "{}",
+        tr!(
+            format!("  다이제스트 {}", entry.report_digest),
+            format!("  digest    {}", entry.report_digest)
+        )
+    );
+    println!(
+        "{}",
+        tr!(
+            format!("  판정     {}", verdict.label()),
+            format!("  verdict   {}", verdict.label())
+        )
+    );
     if !built.anomalies.is_empty() {
         println!(
-            "  \x1b[1;31m이상 {}건\x1b[0m 확인 기록에 이상으로 남았음. airlock audit report 로 내용을 볼 것",
-            built.anomalies.len()
+            "{}",
+            tr!(
+                format!(
+                    "  \x1b[1;31m이상 {}건\x1b[0m 확인 기록에 이상으로 남았음. airlock audit report 로 내용을 볼 것",
+                    built.anomalies.len()
+                ),
+                format!(
+                    "  \x1b[1;31m{} anomalies\x1b[0m recorded as anomalous in the review record; see airlock audit report for details",
+                    built.anomalies.len()
+                )
+            )
         );
     }
     built.exit_code()
@@ -280,7 +443,13 @@ fn resolve_dir(dir: Option<PathBuf>, root: &Path) -> Option<PathBuf> {
         None => match paths::latest_session(root) {
             Some(d) => Some(d),
             None => {
-                eprintln!("airlock: {}에 세션이 없음", root.display());
+                eprintln!(
+                    "{}",
+                    tr!(
+                        format!("airlock: {}에 세션이 없음", root.display()),
+                        format!("airlock: no sessions under {}", root.display())
+                    )
+                );
                 None
             }
         },
@@ -300,28 +469,68 @@ fn report_anchor_chain(anchors: &Path) -> i32 {
     match verify_anchors(anchors) {
         Ok(report) => {
             println!(
-                "\x1b[32m앵커 확인\x1b[0m {} ({} 줄, 세션 {}개, head seq {})",
-                anchors.join(airlock_audit::ANCHOR_FILE).display(),
-                report.entries,
-                report.sessions,
-                report.head_seq
+                "{}",
+                tr!(
+                    format!(
+                        "\x1b[32m앵커 확인\x1b[0m {} ({} 줄, 세션 {}개, head seq {})",
+                        anchors.join(airlock_audit::ANCHOR_FILE).display(),
+                        report.entries,
+                        report.sessions,
+                        report.head_seq
+                    ),
+                    format!(
+                        "\x1b[32manchors ok\x1b[0m {} ({} lines, {} sessions, head seq {})",
+                        anchors.join(airlock_audit::ANCHOR_FILE).display(),
+                        report.entries,
+                        report.sessions,
+                        report.head_seq
+                    )
+                )
             );
             for w in &report.warnings {
-                println!("  \x1b[33m경고\x1b[0m {w}");
+                println!(
+                    "{}",
+                    tr!(
+                        format!("  \x1b[33m경고\x1b[0m {w}"),
+                        format!("  \x1b[33mwarning\x1b[0m {w}")
+                    )
+                );
             }
             0
         }
         Err(AnchorFailure::FileAbsent) => {
             println!(
-                "\x1b[33m앵커 탐지불가\x1b[0m {}",
-                anchors.join(airlock_audit::ANCHOR_FILE).display()
+                "{}",
+                tr!(
+                    format!(
+                        "\x1b[33m앵커 탐지불가\x1b[0m {}",
+                        anchors.join(airlock_audit::ANCHOR_FILE).display()
+                    ),
+                    format!(
+                        "\x1b[33manchors undetectable\x1b[0m {}",
+                        anchors.join(airlock_audit::ANCHOR_FILE).display()
+                    )
+                )
             );
             println!("  {}", AnchorFailure::FileAbsent);
-            println!("  세션 통째 삭제와 체인 재계산을 이 검증으로는 알 수 없음. 통과가 아님");
+            println!(
+                "{}",
+                tr!(
+                    "  세션 통째 삭제와 체인 재계산을 이 검증으로는 알 수 없음. 통과가 아님",
+                    "  whole-session deletion and chain recomputation cannot be detected \
+                     by this verification; not a pass"
+                )
+            );
             0
         }
         Err(failure) => {
-            println!("\x1b[1;31m앵커 실패\x1b[0m {}", anchors.display());
+            println!(
+                "{}",
+                tr!(
+                    format!("\x1b[1;31m앵커 실패\x1b[0m {}", anchors.display()),
+                    format!("\x1b[1;31manchor failure\x1b[0m {}", anchors.display())
+                )
+            );
             println!("  {failure}");
             2
         }
@@ -336,20 +545,37 @@ fn report_anchor_chain(anchors: &Path) -> i32 {
 fn report_session_anchor(anchors: &Path, report: &airlock_audit::VerifyReport) -> i32 {
     match check_session(anchors, &report.session, report.head_seq, &report.head_hash) {
         Ok(AnchorCheck::Matches { anchor_seq }) => {
-            println!("  앵커     seq {anchor_seq}에서 head 일치");
+            println!(
+                "{}",
+                tr!(
+                    format!("  앵커     seq {anchor_seq}에서 head 일치"),
+                    format!("  anchors    head matches at seq {anchor_seq}")
+                )
+            );
             0
         }
         // 앵커 줄이 없는 세션은 통과가 아니라 탐지 불가입니다. 이 세션이 통째로
         // 지워졌어도 알아낼 방법이 없다는 뜻이므로 그대로 적습니다
         Ok(AnchorCheck::Missing) => {
             println!(
-                "  \x1b[33m앵커\x1b[0m     이 세션의 앵커 줄이 없음. 탐지 불가이며 통과가 아님"
+                "{}",
+                tr!(
+                    "  \x1b[33m앵커\x1b[0m     이 세션의 앵커 줄이 없음. 탐지 불가이며 통과가 아님",
+                    "  \x1b[33manchors\x1b[0m    this session has no anchor line; \
+                     undetectable, which is not a pass"
+                )
             );
             0
         }
         Err(AnchorFailure::FileAbsent) => 0,
         Err(failure) => {
-            println!("  \x1b[1;31m앵커 불일치\x1b[0m {failure}");
+            println!(
+                "{}",
+                tr!(
+                    format!("  \x1b[1;31m앵커 불일치\x1b[0m {failure}"),
+                    format!("  \x1b[1;31manchor mismatch\x1b[0m {failure}")
+                )
+            );
             2
         }
     }
@@ -359,24 +585,55 @@ fn verify_one(dir: &Path, anchors: &Path) -> i32 {
     match verify_dir(dir) {
         Ok(report) => {
             println!(
-                "\x1b[32m무결성 확인\x1b[0m {} ({} 엔트리, head seq {})",
-                dir.display(),
-                report.entries,
-                report.head_seq
+                "{}",
+                tr!(
+                    format!(
+                        "\x1b[32m무결성 확인\x1b[0m {} ({} 엔트리, head seq {})",
+                        dir.display(),
+                        report.entries,
+                        report.head_seq
+                    ),
+                    format!(
+                        "\x1b[32mintegrity ok\x1b[0m {} ({} entries, head seq {})",
+                        dir.display(),
+                        report.entries,
+                        report.head_seq
+                    )
+                )
             );
-            println!("  세션     {}", report.session);
-            println!("  체인헤드 {}", report.head_hash);
+            println!(
+                "{}",
+                tr!(
+                    format!("  세션     {}", report.session),
+                    format!("  session    {}", report.session)
+                )
+            );
+            println!(
+                "{}",
+                tr!(
+                    format!("  체인헤드 {}", report.head_hash),
+                    format!("  chain head {}", report.head_hash)
+                )
+            );
             for w in &report.warnings {
                 let label = match w {
-                    Warning::ObserveOnlyEntries { .. } => "\x1b[33m강제없음\x1b[0m",
-                    _ => "\x1b[33m경고\x1b[0m",
+                    Warning::ObserveOnlyEntries { .. } => {
+                        tr!("\x1b[33m강제없음\x1b[0m", "\x1b[33munenforced\x1b[0m")
+                    }
+                    _ => tr!("\x1b[33m경고\x1b[0m", "\x1b[33mwarning\x1b[0m"),
                 };
                 println!("  {label} {w}");
             }
             report_session_anchor(anchors, &report)
         }
         Err(failure) => {
-            println!("\x1b[1;31m무결성 실패\x1b[0m {}", dir.display());
+            println!(
+                "{}",
+                tr!(
+                    format!("\x1b[1;31m무결성 실패\x1b[0m {}", dir.display()),
+                    format!("\x1b[1;31mintegrity failure\x1b[0m {}", dir.display())
+                )
+            );
             println!("  {failure}");
             2
         }
@@ -402,11 +659,18 @@ fn decision_color(entry: &Entry) -> &'static str {
 /// `tty` - 승인 프롬프트가 나간 터미널 장치 경로
 fn approver(uid: Option<u32>, tty: Option<&str>) -> String {
     match (uid, tty) {
-        (None, None) => "\x1b[33m승인자없음(사람 확인 아님)\x1b[0m".to_string(),
+        (None, None) => tr!(
+            "\x1b[33m승인자없음(사람 확인 아님)\x1b[0m",
+            "\x1b[33mno approver (not a human confirmation)\x1b[0m"
+        )
+        .to_string(),
         (uid, tty) => {
             let uid = uid.map_or_else(|| "?".to_string(), |u| u.to_string());
             let tty = tty.map_or_else(|| "?".to_string(), sanitize);
-            format!("승인자 uid={uid} tty={tty}")
+            tr!(
+                format!("승인자 uid={uid} tty={tty}"),
+                format!("approver uid={uid} tty={tty}")
+            )
         }
     }
 }
@@ -425,20 +689,29 @@ fn describe_event(event: &Event) -> String {
             let source = policy_source
                 .as_deref()
                 .map(sanitize)
-                .unwrap_or_else(|| "내장 베이스라인".to_string());
+                .unwrap_or_else(|| tr!("내장 베이스라인", "built-in baseline").to_string());
             let sync = if *fsync_per_entry {
                 ""
             } else {
-                " [fsync 없음]"
+                tr!(" [fsync 없음]", " [no fsync]")
             };
             // 중계 수준을 함께 보여 줍니다. exec 엔트리가 없는 체인이 "아무 일도 없었음"
             // 인지 "중계가 꺼져 있어 보이지 않았음"인지 구분되어야 합니다
-            format!(
-                "세션 시작 정책={source} 다이제스트={short} 중계={}{sync} argv={argv:?}",
-                mediation.as_str()
+            tr!(
+                format!(
+                    "세션 시작 정책={source} 다이제스트={short} 중계={}{sync} argv={argv:?}",
+                    mediation.as_str()
+                ),
+                format!(
+                    "session start policy={source} digest={short} mediation={}{sync} argv={argv:?}",
+                    mediation.as_str()
+                )
             )
         }
-        Event::SessionEnd { status } => format!("세션 종료 {status:?}"),
+        Event::SessionEnd { status } => tr!(
+            format!("세션 종료 {status:?}"),
+            format!("session end {status:?}")
+        ),
         Event::FileAccess {
             path_requested,
             path_resolved,
@@ -447,17 +720,29 @@ fn describe_event(event: &Event) -> String {
             let requested = sanitize(path_requested);
             let resolved = sanitize(path_resolved);
             if requested == resolved {
-                format!("파일 {mode} {requested}")
+                tr!(
+                    format!("파일 {mode} {requested}"),
+                    format!("file {mode} {requested}")
+                )
             } else {
-                format!("파일 {mode} {requested} \x1b[35m-> {resolved}\x1b[0m")
+                tr!(
+                    format!("파일 {mode} {requested} \x1b[35m-> {resolved}\x1b[0m"),
+                    format!("file {mode} {requested} \x1b[35m-> {resolved}\x1b[0m")
+                )
             }
         }
-        Event::Exec { program, argv, .. } => format!("실행 {} {argv:?}", sanitize(program)),
+        Event::Exec { program, argv, .. } => tr!(
+            format!("실행 {} {argv:?}", sanitize(program)),
+            format!("exec {} {argv:?}", sanitize(program))
+        ),
         Event::Egress {
             host,
             port,
             protocol,
-        } => format!("아웃바운드 {protocol} {}:{port}", sanitize(host)),
+        } => tr!(
+            format!("아웃바운드 {protocol} {}:{port}", sanitize(host)),
+            format!("egress {protocol} {}:{port}", sanitize(host))
+        ),
         Event::EgressSummary {
             host,
             port,
@@ -465,12 +750,21 @@ fn describe_event(event: &Event) -> String {
             bytes_out,
             bytes_in,
             duration_ms,
-        } => format!(
-            "아웃바운드 종료 {protocol} {}:{port} 반출 {} 수신 {} {}",
-            sanitize(host),
-            render::human_bytes(*bytes_out),
-            render::human_bytes(*bytes_in),
-            render::human_millis(*duration_ms)
+        } => tr!(
+            format!(
+                "아웃바운드 종료 {protocol} {}:{port} 반출 {} 수신 {} {}",
+                sanitize(host),
+                render::human_bytes(*bytes_out),
+                render::human_bytes(*bytes_in),
+                render::human_millis(*duration_ms)
+            ),
+            format!(
+                "egress closed {protocol} {}:{port} sent {} received {} {}",
+                sanitize(host),
+                render::human_bytes(*bytes_out),
+                render::human_bytes(*bytes_in),
+                render::human_millis(*duration_ms)
+            )
         ),
         Event::Approval {
             for_seq,
@@ -479,7 +773,10 @@ fn describe_event(event: &Event) -> String {
             approver_uid,
             approver_tty,
         } => {
-            let mut s = format!("승인응답 seq={for_seq} {granted}");
+            let mut s = tr!(
+                format!("승인응답 seq={for_seq} {granted}"),
+                format!("approval response seq={for_seq} {granted}")
+            );
             s.push(' ');
             s.push_str(&approver(*approver_uid, approver_tty.as_deref()));
             if let Some(n) = note {
@@ -489,7 +786,10 @@ fn describe_event(event: &Event) -> String {
         }
         Event::PolicyReload { policy_digest, .. } => {
             let short: String = policy_digest.to_hex().chars().take(12).collect();
-            format!("정책 재적용 다이제스트={short}")
+            tr!(
+                format!("정책 재적용 다이제스트={short}"),
+                format!("policy reload digest={short}")
+            )
         }
     }
 }
@@ -509,20 +809,43 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
     if let Some(p) = &problem {
         // 경고와 엔트리를 같은 스트림에 둡니다. 리다이렉트나 페이저로 경고만 사라지면
         // 조용히 뚫린 것과 같습니다
-        println!("\x1b[1;31mairlock 경고\x1b[0m {p}");
+        println!(
+            "{}",
+            tr!(
+                format!("\x1b[1;31mairlock 경고\x1b[0m {p}"),
+                format!("\x1b[1;31mairlock warning\x1b[0m {p}")
+            )
+        );
     }
 
     if let Err(failure) = &integrity {
         println!(
-            "\x1b[1;31m╔══ 무결성 실패 ═══════════════════════════════════\x1b[0m\n\
-             \x1b[1;31m║\x1b[0m {failure}\n\
-             \x1b[1;31m║\x1b[0m 아래 내용은 검증되지 않았으므로 증거로 쓸 수 없음\n\
-             \x1b[1;31m╚═════════════════════════════════════════════════\x1b[0m"
+            "{}",
+            tr!(
+                format!(
+                    "\x1b[1;31m╔══ 무결성 실패 ═══════════════════════════════════\x1b[0m\n\
+                     \x1b[1;31m║\x1b[0m {failure}\n\
+                     \x1b[1;31m║\x1b[0m 아래 내용은 검증되지 않았으므로 증거로 쓸 수 없음\n\
+                     \x1b[1;31m╚═════════════════════════════════════════════════\x1b[0m"
+                ),
+                format!(
+                    "\x1b[1;31m╔══ integrity failure ═════════════════════════════\x1b[0m\n\
+                     \x1b[1;31m║\x1b[0m {failure}\n\
+                     \x1b[1;31m║\x1b[0m the content below is unverified and cannot be used as evidence\n\
+                     \x1b[1;31m╚═════════════════════════════════════════════════\x1b[0m"
+                )
+            )
         );
     }
 
     if entries.is_empty() {
-        eprintln!("airlock: 읽을 수 있는 엔트리가 없음. airlock audit verify로 확인할 것");
+        eprintln!(
+            "{}",
+            tr!(
+                "airlock: 읽을 수 있는 엔트리가 없음. airlock audit verify로 확인할 것",
+                "airlock: no readable entries; check with airlock audit verify"
+            )
+        );
         return 1;
     }
 
@@ -547,7 +870,13 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
     };
 
     if skipped > 0 {
-        println!("\x1b[2m앞선 {skipped}개 엔트리 생략. --limit로 조절\x1b[0m");
+        println!(
+            "{}",
+            tr!(
+                format!("\x1b[2m앞선 {skipped}개 엔트리 생략. --limit로 조절\x1b[0m"),
+                format!("\x1b[2m{skipped} earlier entries omitted; adjust with --limit\x1b[0m")
+            )
+        );
     }
 
     for e in window {
@@ -560,7 +889,7 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
             .rule
             .as_deref()
             .map(sanitize)
-            .unwrap_or_else(|| "기본값".to_string());
+            .unwrap_or_else(|| tr!("기본값", "default").to_string());
         println!(
             "{:>5} {time}Z {color}{:<6}\x1b[0m {:<9} {} \x1b[2m[{rule}]\x1b[0m",
             e.seq,
@@ -576,7 +905,15 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
         .count();
     if observed > 0 {
         println!(
-            "\n\x1b[33m주의\x1b[0m {observed}개 엔트리가 observe 모드임. 기록되었지만 강제되지 않음"
+            "{}",
+            tr!(
+                format!(
+                    "\n\x1b[33m주의\x1b[0m {observed}개 엔트리가 observe 모드임. 기록되었지만 강제되지 않음"
+                ),
+                format!(
+                    "\n\x1b[33mnote\x1b[0m {observed} entries are in observe mode; recorded but not enforced"
+                )
+            )
         );
     }
 
@@ -590,10 +927,22 @@ fn show(dir: &Path, limit: usize, decisions_only: bool) -> i32 {
 fn list(root: &Path) -> i32 {
     let sessions = paths::all_sessions(root);
     if sessions.is_empty() {
-        println!("{}에 세션이 없음", root.display());
+        println!(
+            "{}",
+            tr!(
+                format!("{}에 세션이 없음", root.display()),
+                format!("no sessions under {}", root.display())
+            )
+        );
         return 0;
     }
-    println!("{} 아래 {}개 세션", root.display(), sessions.len());
+    println!(
+        "{}",
+        tr!(
+            format!("{} 아래 {}개 세션", root.display(), sessions.len()),
+            format!("{} sessions under {}", sessions.len(), root.display())
+        )
+    );
     for s in sessions.iter().rev() {
         let name = s.file_name().unwrap_or_default().to_string_lossy();
         let status = match verify_dir(s) {
@@ -603,12 +952,18 @@ fn list(root: &Path) -> i32 {
                     .iter()
                     .any(|w| matches!(w, Warning::ObserveOnlyEntries { .. }));
                 if unenforced {
-                    format!("\x1b[33mobserve\x1b[0m {} 엔트리", r.entries)
+                    tr!(
+                        format!("\x1b[33mobserve\x1b[0m {} 엔트리", r.entries),
+                        format!("\x1b[33mobserve\x1b[0m {} entries", r.entries)
+                    )
                 } else {
-                    format!("\x1b[32m정상\x1b[0m   {} 엔트리", r.entries)
+                    tr!(
+                        format!("\x1b[32m정상\x1b[0m   {} 엔트리", r.entries),
+                        format!("\x1b[32mok\x1b[0m      {} entries", r.entries)
+                    )
                 }
             }
-            Err(_) => "\x1b[31m손상\x1b[0m".to_string(),
+            Err(_) => tr!("\x1b[31m손상\x1b[0m", "\x1b[31mdamaged\x1b[0m").to_string(),
         };
         println!("  {name}  {status}");
     }

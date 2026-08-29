@@ -28,6 +28,7 @@ use airlock_audit::{
 };
 use airlock_canonical::Encoder;
 use airlock_canonical::display::sanitize;
+use airlock_i18n::tr;
 
 use crate::paths;
 
@@ -75,8 +76,8 @@ impl Severity {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Evidence => "증거",
-            Self::Operational => "운영",
+            Self::Evidence => tr!("증거", "evidence"),
+            Self::Operational => tr!("운영", "operational"),
         }
     }
 }
@@ -197,23 +198,39 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 pub fn range_of(since: Option<&str>, until: Option<&str>) -> Result<Range, String> {
     let from = match since {
         None => 0,
-        Some(s) => parse_date(s)
-            .ok_or_else(|| format!("--since `{}` 를 YYYY-MM-DD 로 읽을 수 없음", sanitize(s)))?,
+        Some(s) => parse_date(s).ok_or_else(|| {
+            tr!(
+                format!("--since `{}` 를 YYYY-MM-DD 로 읽을 수 없음", sanitize(s)),
+                format!("--since `{}` cannot be read as YYYY-MM-DD", sanitize(s))
+            )
+        })?,
     };
     let to = match until {
         None => u64::MAX,
         Some(s) => {
             let start = parse_date(s).ok_or_else(|| {
-                format!("--until `{}` 를 YYYY-MM-DD 로 읽을 수 없음", sanitize(s))
+                tr!(
+                    format!("--until `{}` 를 YYYY-MM-DD 로 읽을 수 없음", sanitize(s)),
+                    format!("--until `{}` cannot be read as YYYY-MM-DD", sanitize(s))
+                )
             })?;
             start
                 .checked_add(NANOS_PER_DAY)
                 .and_then(|v| v.checked_sub(1))
-                .ok_or_else(|| format!("--until `{}` 가 표현 범위를 넘음", sanitize(s)))?
+                .ok_or_else(|| {
+                    tr!(
+                        format!("--until `{}` 가 표현 범위를 넘음", sanitize(s)),
+                        format!("--until `{}` exceeds the representable range", sanitize(s))
+                    )
+                })?
         }
     };
     if from > to {
-        return Err("--since 가 --until 보다 뒤임. 아무 세션도 덮지 않는 범위임".to_string());
+        return Err(tr!(
+            "--since 가 --until 보다 뒤임. 아무 세션도 덮지 않는 범위임",
+            "--since is after --until; the range covers no sessions"
+        )
+        .to_string());
     }
     Ok(Range { from, to })
 }
@@ -466,11 +483,20 @@ impl Report {
                     severity: Severity::Evidence,
                     kind: "session_missing",
                     session: Some(a.session.to_hex()),
-                    detail: format!(
-                        "앵커 seq {}가 가리키는 세션의 디렉토리가 {} 아래에 없음. \
-                         세션 통째 삭제이거나 앵커 루트가 다른 감사 루트의 것임",
-                        a.seq,
-                        root.display()
+                    detail: tr!(
+                        format!(
+                            "앵커 seq {}가 가리키는 세션의 디렉토리가 {} 아래에 없음. \
+                             세션 통째 삭제이거나 앵커 루트가 다른 감사 루트의 것임",
+                            a.seq,
+                            root.display()
+                        ),
+                        format!(
+                            "the directory for the session anchor seq {} points to is not \
+                             under {}; either whole-session deletion or the anchor root \
+                             belongs to a different audit root",
+                            a.seq,
+                            root.display()
+                        )
                     ),
                 });
             }
@@ -645,9 +671,16 @@ fn read_chain(anchor_dir: &Path, anomalies: &mut Vec<Anomaly>) -> (ChainState, V
                 severity: Severity::Evidence,
                 kind: "anchor_absent",
                 session: None,
-                detail: format!(
-                    "{} 없음. 세션 통째 삭제와 체인 재계산을 탐지할 수 없음. 통과가 아님",
-                    anchor_dir.join(airlock_audit::ANCHOR_FILE).display()
+                detail: tr!(
+                    format!(
+                        "{} 없음. 세션 통째 삭제와 체인 재계산을 탐지할 수 없음. 통과가 아님",
+                        anchor_dir.join(airlock_audit::ANCHOR_FILE).display()
+                    ),
+                    format!(
+                        "{} absent; whole-session deletion and chain recomputation cannot \
+                         be detected, which is not a pass",
+                        anchor_dir.join(airlock_audit::ANCHOR_FILE).display()
+                    )
                 ),
             });
             (ChainState::Absent, Vec::new())
@@ -747,7 +780,10 @@ fn build_session(
                 severity: Severity::Evidence,
                 kind: "session_unreadable",
                 session: Some(name.clone()),
-                detail: format!("세션을 읽지 못함: {e}"),
+                detail: tr!(
+                    format!("세션을 읽지 못함: {e}"),
+                    format!("failed to read the session: {e}")
+                ),
             });
             return Some(SessionReport {
                 dir: dir.to_path_buf(),
@@ -795,7 +831,12 @@ fn build_session(
                         severity: Severity::Operational,
                         kind: "unanswered_ask",
                         session: Some(name.clone()),
-                        detail: format!("seq {seq}의 ask에 답이 없음. 승인 없이 끝난 요청임"),
+                        detail: tr!(
+                            format!("seq {seq}의 ask에 답이 없음. 승인 없이 끝난 요청임"),
+                            format!(
+                                "the ask at seq {seq} has no answer; a request that ended without approval"
+                            )
+                        ),
                     });
                 }
             }
@@ -835,9 +876,12 @@ fn build_session(
                     severity: Severity::Evidence,
                     kind: "anchor_missing",
                     session: Some(name.clone()),
-                    detail:
-                        "이 세션의 앵커 줄이 없음. 삭제와 재계산을 탐지할 수 없으며 통과가 아님"
-                            .to_string(),
+                    detail: tr!(
+                        "이 세션의 앵커 줄이 없음. 삭제와 재계산을 탐지할 수 없으며 통과가 아님",
+                        "this session has no anchor line; deletion and recomputation \
+                         cannot be detected, which is not a pass"
+                    )
+                    .to_string(),
                 });
                 AnchorState::Missing
             }
@@ -953,9 +997,16 @@ fn build_session(
             severity: Severity::Operational,
             kind: "automatic_approval",
             session: Some(name.clone()),
-            detail: format!(
-                "{}건이 사람 신원 없이 허용됨. --yes 자동 승인이거나 신원을 관측하지 못한 채널임",
-                approvals.auto_granted
+            detail: tr!(
+                format!(
+                    "{}건이 사람 신원 없이 허용됨. --yes 자동 승인이거나 신원을 관측하지 못한 채널임",
+                    approvals.auto_granted
+                ),
+                format!(
+                    "{} granted without a human identity; either --yes automatic approval \
+                     or a channel that could not observe identity",
+                    approvals.auto_granted
+                )
             ),
         });
     }
