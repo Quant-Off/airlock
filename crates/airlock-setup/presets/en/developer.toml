@@ -1,0 +1,49 @@
+# The developer convenience form. Only secrets are blocked and the rest passes through.
+# The built-in baseline keeps catching secrets and persistence paths.
+#
+# defaults.file = "allow" below is the policy layer's verdict. The kernel enforcement
+# profile defaults to deny, so outside the workspace and system paths nothing opens unless
+# a rule states it. That is, ordinary files outside the workspace are blocked under
+# airlock run and are read as the policy decides only under --observe. The kernel being
+# narrower than the policy is safe, but paths you actually need to read must be written as allow rules.
+
+version = 1
+name = "developer"
+
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+# Same as the default, but stated explicitly. A preset is a document that shows the spec to humans.
+# Even with file set to allow, plaintext outbound cannot cross this floor.
+egress_plaintext = "deny"
+
+# System paths are dropped to read-only
+[[rules]]
+id = "system-readonly"
+kind = "file"
+path = ["/usr/**", "/System/**", "/bin/**", "/sbin/**", "/Library/**"]
+mode = ["read", "metadata", "exec"]
+action = "allow"
+
+[[rules]]
+id = "system-write-guard"
+kind = "file"
+path = ["/usr/**", "/System/**", "/bin/**", "/sbin/**", "/Library/**"]
+mode = ["write", "create", "delete"]
+action = "ask"
+
+# Force push is hard to undo
+[[rules]]
+id = "git-force-push"
+kind = "exec"
+program = "git"
+argv_contains = ["push", "--force"]
+action = "ask"
+
+[[rules]]
+id = "llm-api"
+kind = "egress"
+host = "api.foollm.com"
+port = 443
+action = "allow"

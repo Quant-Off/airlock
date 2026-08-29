@@ -30,7 +30,7 @@ fi
 echo "없음"
 
 echo "== 정책 프리셋 검증 =="
-for p in examples/policy/*.toml; do
+for p in examples/policy/*.toml examples/policy/en/*.toml; do
   echo "-- $p"
   cargo run -q -p airlock -- policy check --policy "$p"
 done
@@ -41,9 +41,10 @@ echo "== 배포 메타데이터 =="
 # 매니페스트 자체를 검사합니다
 cargo metadata --no-deps --format-version 1 | python3 scripts/metadata-check.py
 
-# 의존이 없는 리프는 실제 패키징까지 검사할 수 있습니다
-cargo package -p airlock-canonical --allow-dirty -q >/dev/null
-echo "airlock-canonical 패키징 통과"
+# 의존이 없는 리프는 실제 패키징까지 검사할 수 있습니다. 워크스페이스 내부 의존이
+# 하나라도 있으면 그 크레이트가 crates.io 에 오르기 전까지 색인을 찾지 못합니다
+cargo package -p airlock-i18n --allow-dirty -q >/dev/null
+echo "airlock-i18n 패키징 통과"
 
 echo
 echo "전부 통과"

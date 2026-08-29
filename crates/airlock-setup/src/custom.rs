@@ -1,14 +1,26 @@
+use airlock_i18n::Locale;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
-const HEADER: &str = "\
+const HEADER_KO: &str = "\
 # airlock setup 대화형 직접 설정으로 생성한 정책입니다.
 # 규격은 docs/policy-dsl.md, 작성 가이드는 docs/policy-guide.md를 참고하세요.
 ";
 
-const EGRESS_CAVEAT: &str = "\
+const HEADER_EN: &str = "\
+# airlock setup generated this policy through the interactive custom flow.
+# See docs/policy-dsl.md for the format and docs/policy-guide.md for guidance.
+";
+
+const EGRESS_CAVEAT_KO: &str = "\
 # 주의! 호스트 단위 egress 규칙은 airlock run --egress-proxy로 실행할 때만
 # 강제됩니다. macOS Seatbelt와 Linux Landlock은 호스트를 구분하지 못합니다
 # (docs/egress-proxy.md).
+";
+
+const EGRESS_CAVEAT_EN: &str = "\
+# Watch out! Host-level egress rules are only enforced when running with
+# airlock run --egress-proxy. macOS Seatbelt and Linux Landlock cannot
+# tell hosts apart (docs/egress-proxy.md).
 ";
 
 const TOOLCHAIN_PATHS: &[&str] = &[
@@ -38,7 +50,7 @@ pub struct CustomAnswers {
     pub egress_hosts: Vec<(String, u16)>,
 }
 
-pub fn render(answers: &CustomAnswers) -> String {
+pub fn render(answers: &CustomAnswers, locale: Locale) -> String {
     let mut doc = DocumentMut::new();
     doc["version"] = value(1);
     doc["name"] = value(answers.name.as_str());
@@ -71,9 +83,15 @@ pub fn render(answers: &CustomAnswers) -> String {
     }
     doc["rules"] = Item::ArrayOfTables(rules);
 
-    let mut out = String::from(HEADER);
+    let mut out = String::from(match locale {
+        Locale::Ko => HEADER_KO,
+        Locale::En => HEADER_EN,
+    });
     if !answers.egress_hosts.is_empty() {
-        out.push_str(EGRESS_CAVEAT);
+        out.push_str(match locale {
+            Locale::Ko => EGRESS_CAVEAT_KO,
+            Locale::En => EGRESS_CAVEAT_EN,
+        });
     }
     out.push('\n');
     out.push_str(&doc.to_string());
@@ -161,7 +179,7 @@ mod tests {
 
     #[test]
     fn rendered_policy_loads() {
-        let rendered = render(&answers());
+        let rendered = render(&answers(), Locale::Ko);
         let ctx = LoadContext::new("/home/tester", "/home/tester/.local/share/airlock");
         let policy = Policy::load_str(&rendered, &ctx).expect("load");
         assert_eq!(policy.name(), "my-project");
@@ -169,7 +187,7 @@ mod tests {
 
     #[test]
     fn contains_expected_rules_and_header() {
-        let rendered = render(&answers());
+        let rendered = render(&answers(), Locale::Ko);
         assert!(rendered.starts_with("# airlock setup"));
         assert!(rendered.contains("--egress-proxy"));
         assert!(rendered.contains(r#"path = "~/proj/demo/**""#));
@@ -189,11 +207,28 @@ mod tests {
             egress_default: "ask".into(),
             ..answers()
         };
-        let rendered = render(&a);
+        let rendered = render(&a, Locale::Ko);
         assert!(!rendered.contains("toolchain-read"));
         assert!(!rendered.contains("--egress-proxy"));
         let ctx = LoadContext::new("/home/tester", "/home/tester/.local/share/airlock");
         Policy::load_str(&rendered, &ctx).expect("load");
+    }
+
+    #[test]
+    fn english_locale_renders_english_comments_and_same_policy() {
+        let ctx = LoadContext::new("/home/tester", "/home/tester/.local/share/airlock");
+        let ko = render(&answers(), Locale::Ko);
+        let en = render(&answers(), Locale::En);
+        assert!(en.starts_with("# airlock setup"));
+        assert!(en.contains("# Watch out!"));
+        assert!(!en.contains("주의"));
+        let ko_policy = Policy::load_str(&ko, &ctx).expect("ko");
+        let en_policy = Policy::load_str(&en, &ctx).expect("en");
+        assert_eq!(
+            ko_policy.digest(),
+            en_policy.digest(),
+            "로케일이 정책 의미를 바꾸면 안 됨"
+        );
     }
 
     #[test]
