@@ -6,6 +6,7 @@ use airlock_audit::{
     ANCHOR_FILE, AnchorLog, AuditLog, Decision, Enforcement, Event, GenesisInfo, Granted,
     Mediation, Record,
 };
+use airlock_i18n::tr;
 use airlock_policy::{Action, Evaluation, FileMode, MatchedRule, Policy, Tier};
 
 use crate::approve::{ApprovalRequest, Approver};
@@ -251,33 +252,54 @@ pub fn mediation_gaps(requested: Mediation) -> Vec<String> {
     let mut gaps = Vec::new();
 
     if effective != requested {
-        gaps.push(format!(
-            "이 플랫폼에는 런타임 중계 기구가 없어 --mediate {}가 적용되지 않음. \
-             감사 로그에는 중계 수준 {}가 기록됨",
-            requested.as_str(),
-            effective.as_str()
+        gaps.push(tr!(
+            format!(
+                "이 플랫폼에는 런타임 중계 기구가 없어 --mediate {}가 적용되지 않음. \
+                 감사 로그에는 중계 수준 {}가 기록됨",
+                requested.as_str(),
+                effective.as_str()
+            ),
+            format!(
+                "this platform has no runtime mediation mechanism, so --mediate {} does \
+                 not apply; the audit log records mediation level {}",
+                requested.as_str(),
+                effective.as_str()
+            )
         ));
     }
 
     match effective {
         Mediation::Off => gaps.push(
-            "중계가 꺼져 있어 자식 프로세스의 exec·연결·파일 열기가 감사에 남지 않음. \
-             체인에는 세션 단위 기록만 있음"
-                .to_string(),
+            tr!(
+                "중계가 꺼져 있어 자식 프로세스의 exec·연결·파일 열기가 감사에 남지 않음. \
+                 체인에는 세션 단위 기록만 있음",
+                "mediation is off, so the child's execs, connections, and file opens are \
+                 not audited; the chain only has session-level records"
+            )
+            .to_string(),
         ),
         Mediation::ExecNet => gaps.push(
-            "파일 열기는 중계하지 않음. 파일 접근은 커널 강제만 받고 감사에는 남지 않음 \
-             (--mediate full로 켤 수 있으나 느려짐)"
-                .to_string(),
+            tr!(
+                "파일 열기는 중계하지 않음. 파일 접근은 커널 강제만 받고 감사에는 남지 않음 \
+                 (--mediate full로 켤 수 있으나 느려짐)",
+                "file opens are not mediated; file access is only kernel-enforced and is \
+                 not audited (--mediate full can enable it, at a slowdown)"
+            )
+            .to_string(),
         ),
         Mediation::Full => {}
     }
 
     if effective.observes() {
         gaps.push(
-            "중계 층이 읽은 경로와 커널이 실제로 여는 대상은 다를 수 있음(TOCTOU). \
-             실제 경계는 커널 강제 층이며 중계는 기록과 승인 채널임"
-                .to_string(),
+            tr!(
+                "중계 층이 읽은 경로와 커널이 실제로 여는 대상은 다를 수 있음(TOCTOU). \
+                 실제 경계는 커널 강제 층이며 중계는 기록과 승인 채널임",
+                "the path the mediation layer read and what the kernel actually opens can \
+                 differ (TOCTOU); the real boundary is the kernel enforcement layer, and \
+                 mediation is a recording and approval channel"
+            )
+            .to_string(),
         );
     }
     gaps
@@ -330,7 +352,7 @@ impl Session {
         config: &SessionConfig,
     ) -> Result<Self> {
         let session_id = audit::SessionId::generate().map_err(|source| BrokerError::Io {
-            what: "세션 식별자 생성".to_string(),
+            what: tr!("세션 식별자 생성", "session identifier generation").to_string(),
             source,
         })?;
 
@@ -516,11 +538,11 @@ impl Session {
         let eval = self.policy.evaluate_file(path, mode, &cwd);
         let (requested, resolved) = self.resolve(&eval);
 
-        let mut request = ApprovalRequest::new("파일 접근 시도")
-            .fact("요청 경로", requested.clone())
-            .fact("모드", mode.as_str());
+        let mut request = ApprovalRequest::new(tr!("파일 접근 시도", "file access attempt"))
+            .fact(tr!("요청 경로", "requested path"), requested.clone())
+            .fact(tr!("모드", "mode"), mode.as_str());
         if requested != resolved {
-            request = request.fact("해소 경로", resolved.clone());
+            request = request.fact(tr!("해소 경로", "resolved path"), resolved.clone());
         }
 
         let event = Event::FileAccess {
@@ -542,12 +564,12 @@ impl Session {
         let eval = self.policy.evaluate_exec(program, argv, &cwd);
         let (requested, resolved) = self.resolve(&eval);
 
-        let mut request = ApprovalRequest::new("프로세스 실행 시도")
-            .fact("프로그램", requested.clone())
+        let mut request = ApprovalRequest::new(tr!("프로세스 실행 시도", "process exec attempt"))
+            .fact(tr!("프로그램", "program"), requested.clone())
             .fact("argv", format!("{argv:?}"))
             .fact("cwd", cwd.to_string_lossy().into_owned());
         if requested != resolved {
-            request = request.fact("해소 경로", resolved.clone());
+            request = request.fact(tr!("해소 경로", "resolved path"), resolved.clone());
         }
 
         let event = Event::Exec {
@@ -580,7 +602,13 @@ impl Session {
                     tier: Tier::SelfProtect,
                     action: Action::Allow,
                     pattern: format!("{host}:{port}"),
-                    reason: Some("브로커 egress 프록시 채널. 목적지 판정은 프록시가 함".into()),
+                    reason: Some(
+                        tr!(
+                            "브로커 egress 프록시 채널. 목적지 판정은 프록시가 함",
+                            "broker egress proxy channel; destination decisions are made by the proxy"
+                        )
+                        .into(),
+                    ),
                 }),
                 path: None,
             }
@@ -594,10 +622,11 @@ impl Session {
                 self.bytes_out_to(host, port),
             )
         };
-        let request = ApprovalRequest::new("아웃바운드 연결 시도")
-            .fact("호스트", host.to_string())
-            .fact("포트", port.to_string())
-            .fact("프로토콜", protocol.as_str());
+        let request =
+            ApprovalRequest::new(tr!("아웃바운드 연결 시도", "outbound connection attempt"))
+                .fact(tr!("호스트", "host"), host.to_string())
+                .fact(tr!("포트", "port"), port.to_string())
+                .fact(tr!("프로토콜", "protocol"), protocol.as_str());
 
         let event = Event::Egress {
             host: host.to_string(),
@@ -725,7 +754,11 @@ impl Session {
         let Some(seq) = head_seq else {
             return AnchorOutcome::Failed {
                 path,
-                why: "세션 체인이 비어 있어 앵커할 head 가 없음".to_string(),
+                why: tr!(
+                    "세션 체인이 비어 있어 앵커할 head 가 없음",
+                    "the session chain is empty, so there is no head to anchor"
+                )
+                .to_string(),
             };
         };
         let session = self.log.session();
@@ -736,7 +769,10 @@ impl Session {
             Err(e) => {
                 return AnchorOutcome::Failed {
                     path,
-                    why: format!("앵커 잠금을 잡지 못함: {e}"),
+                    why: tr!(
+                        format!("앵커 잠금을 잡지 못함: {e}"),
+                        format!("failed to take the anchor lock: {e}")
+                    ),
                 };
             }
         };
@@ -1003,7 +1039,10 @@ pub fn run(
     let (supervisor, child_end) = start_supervisor(channel, &shared);
 
     let spawned = cmd.spawn().map_err(|source| BrokerError::Io {
-        what: format!("{} 실행", resolved.display()),
+        what: tr!(
+            format!("{} 실행", resolved.display()),
+            format!("running {}", resolved.display())
+        ),
         source,
     });
 
@@ -1014,7 +1053,10 @@ pub fn run(
     let mut child = spawned?;
 
     let status = child.wait().map_err(|source| BrokerError::Io {
-        what: format!("{} 대기", resolved.display()),
+        what: tr!(
+            format!("{} 대기", resolved.display()),
+            format!("waiting for {}", resolved.display())
+        ),
         source,
     })?;
 
@@ -1085,7 +1127,16 @@ fn setup_mediation(cmd: &mut Command, level: Mediation) -> Option<crate::notify:
         Ok(c) => c,
         Err(e) => {
             // 중계를 조용히 끄면 감사 로그가 실제보다 완전해 보입니다
-            eprintln!("airlock: 경고 런타임 중계를 켤 수 없음: {e}. 세션 단위 기록만 남음");
+            eprintln!(
+                "{}",
+                tr!(
+                    format!("airlock: 경고 런타임 중계를 켤 수 없음: {e}. 세션 단위 기록만 남음"),
+                    format!(
+                        "airlock: warning: cannot enable runtime mediation: {e}; only \
+                         session-level records remain"
+                    )
+                )
+            );
             return None;
         }
     };
@@ -1126,7 +1177,13 @@ fn start_supervisor(
         Err(e) => {
             // 자식이 필터를 걸지 못했거나 먼저 죽었습니다. 감사가 실제보다 완전해
             // 보이지 않도록 사실을 알립니다
-            eprintln!("airlock: 경고 중계 listener를 받지 못함: {e}");
+            eprintln!(
+                "{}",
+                tr!(
+                    format!("airlock: 경고 중계 listener를 받지 못함: {e}"),
+                    format!("airlock: warning: failed to receive the mediation listener: {e}")
+                )
+            );
         }
     });
     (Some((stop, handle)), Some(child_end))

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use airlock_audit::Granted;
 use airlock_canonical::display::sanitize;
+use airlock_i18n::tr;
 use airlock_policy::MatchedRule;
 
 /// 사람 응답을 기다리는 기본 상한.
@@ -95,9 +96,16 @@ impl Approver for RefuseAll {
 
     fn describe(&self) -> String {
         if self.why.is_empty() {
-            "비대화형 (모든 ask 거부)".to_string()
+            tr!(
+                "비대화형 (모든 ask 거부)",
+                "non-interactive (refuses every ask)"
+            )
+            .to_string()
         } else {
-            format!("비대화형 (모든 ask 거부): {}", self.why)
+            tr!(
+                format!("비대화형 (모든 ask 거부): {}", self.why),
+                format!("non-interactive (refuses every ask): {}", self.why)
+            )
         }
     }
 }
@@ -111,11 +119,21 @@ impl Approver for ApproveAll {
     }
 
     fn describe(&self) -> String {
-        "자동 승인 (사람 판단 없음)".to_string()
+        tr!(
+            "자동 승인 (사람 판단 없음)",
+            "automatic approval (no human judgment)"
+        )
+        .to_string()
     }
 
     fn note(&self) -> Option<String> {
-        Some("자동 승인. 사람이 검토하지 않음".to_string())
+        Some(
+            tr!(
+                "자동 승인. 사람이 검토하지 않음",
+                "automatic approval; not reviewed by a human"
+            )
+            .to_string(),
+        )
     }
 }
 
@@ -191,7 +209,10 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
 
 fn render(request: &ApprovalRequest) -> String {
     let mut out = String::new();
-    out.push_str("\n\x1b[1;33m┌─ airlock 승인 요청 ─────────────────────────────\x1b[0m\n");
+    out.push_str(tr!(
+        "\n\x1b[1;33m┌─ airlock 승인 요청 ─────────────────────────────\x1b[0m\n",
+        "\n\x1b[1;33m┌─ airlock approval request ──────────────────────\x1b[0m\n"
+    ));
     out.push_str(&format!(
         "\x1b[1;33m│\x1b[0m {}\n",
         sanitize(&request.headline)
@@ -212,27 +233,30 @@ fn render(request: &ApprovalRequest) -> String {
         ));
     }
     if let Some(rule) = &request.rule {
-        let pad = " ".repeat(width.saturating_sub(2));
+        let label = tr!("규칙", "rule");
+        let pad = " ".repeat(width.saturating_sub(label.chars().count()));
         out.push_str(&format!(
-            "\x1b[1;33m│\x1b[0m 규칙{pad}  {} ({} tier, {})\n",
+            "\x1b[1;33m│\x1b[0m {label}{pad}  {} ({} tier, {})\n",
             sanitize(&rule.id),
             rule.tier,
             sanitize(&rule.pattern)
         ));
         if let Some(reason) = &rule.reason {
-            let pad = " ".repeat(width.saturating_sub(2));
+            let label = tr!("근거", "reason");
+            let pad = " ".repeat(width.saturating_sub(label.chars().count()));
             out.push_str(&format!(
-                "\x1b[1;33m│\x1b[0m 근거{pad}  {}\n",
+                "\x1b[1;33m│\x1b[0m {label}{pad}  {}\n",
                 sanitize(reason)
             ));
         }
     }
     out.push_str("\x1b[1;33m│\x1b[0m\n");
-    out.push_str(
+    out.push_str(tr!(
         "\x1b[1;33m│\x1b[0m \x1b[2m위 내용은 브로커가 직접 관측한 사실이며 에이전트가 제공한 설명이 아님\x1b[0m\n",
-    );
+        "\x1b[1;33m│\x1b[0m \x1b[2mthe content above is what the broker directly observed, not a description provided by the agent\x1b[0m\n",
+    ));
     out.push_str("\x1b[1;33m└─────────────────────────────────────────────────\x1b[0m\n");
-    out.push_str("허용하겠습니까? [y/N] ");
+    out.push_str(tr!("허용하겠습니까? [y/N] ", "allow? [y/N] "));
     out
 }
 
@@ -284,7 +308,13 @@ impl Approver for TtyApprover {
             return Granted::Refused;
         };
         if !wait_readable(read_side.as_raw_fd(), self.timeout) {
-            let _ = tty.write_all("\x1b[31m시간 초과 거부\x1b[0m\n\n".as_bytes());
+            let _ = tty.write_all(
+                tr!(
+                    "\x1b[31m시간 초과 거부\x1b[0m\n\n",
+                    "\x1b[31mrefused on timeout\x1b[0m\n\n"
+                )
+                .as_bytes(),
+            );
             return Granted::TimedOut;
         }
         let mut reader = BufReader::new(read_side);
@@ -296,9 +326,9 @@ impl Approver for TtyApprover {
                 let granted = matches!(answer.as_str(), "y" | "yes");
                 let _ = tty.write_all(
                     if granted {
-                        "\x1b[32m허용\x1b[0m\n\n"
+                        tr!("\x1b[32m허용\x1b[0m\n\n", "\x1b[32mallowed\x1b[0m\n\n")
                     } else {
-                        "\x1b[31m거부\x1b[0m\n\n"
+                        tr!("\x1b[31m거부\x1b[0m\n\n", "\x1b[31mrefused\x1b[0m\n\n")
                     }
                     .as_bytes(),
                 );
@@ -313,9 +343,15 @@ impl Approver for TtyApprover {
     }
 
     fn describe(&self) -> String {
-        format!(
-            "/dev/tty 인라인 프롬프트 (응답 상한 {}초, 초과 시 거부)",
-            self.timeout.as_secs()
+        tr!(
+            format!(
+                "/dev/tty 인라인 프롬프트 (응답 상한 {}초, 초과 시 거부)",
+                self.timeout.as_secs()
+            ),
+            format!(
+                "/dev/tty inline prompt (response limit {}s, refused past that)",
+                self.timeout.as_secs()
+            )
         )
     }
 

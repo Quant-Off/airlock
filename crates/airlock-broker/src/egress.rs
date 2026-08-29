@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use airlock_audit::Protocol as AuditProtocol;
+use airlock_i18n::tr;
 use airlock_proxy::{Decision, EgressGate, Protocol};
 
 use crate::session::{Actor, Session};
@@ -71,7 +72,16 @@ impl EgressGate for SessionGate {
     ) {
         let Ok(mut session) = self.session.lock() else {
             eprintln!(
-                "airlock: 경고 세션 잠금이 오염되어 {host}:{port} 의 반출 {bytes_out} 바이트를 기록하지 못함"
+                "{}",
+                tr!(
+                    format!(
+                        "airlock: 경고 세션 잠금이 오염되어 {host}:{port} 의 반출 {bytes_out} 바이트를 기록하지 못함"
+                    ),
+                    format!(
+                        "airlock: warning: the session lock is poisoned; failed to record \
+                         {bytes_out} outbound bytes for {host}:{port}"
+                    )
+                )
             );
             return;
         };
@@ -85,7 +95,16 @@ impl EgressGate for SessionGate {
             Actor::Unknown,
         ) {
             eprintln!(
-                "airlock: 경고 {host}:{port} 의 반출 {bytes_out} 바이트를 감사에 남기지 못함: {e}"
+                "{}",
+                tr!(
+                    format!(
+                        "airlock: 경고 {host}:{port} 의 반출 {bytes_out} 바이트를 감사에 남기지 못함: {e}"
+                    ),
+                    format!(
+                        "airlock: warning: failed to record {bytes_out} outbound bytes for \
+                         {host}:{port} in the audit log: {e}"
+                    )
+                )
             );
         }
     }

@@ -15,6 +15,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use airlock_i18n::tr;
 use airlock_policy::rule::{Matcher, ProgramMatch};
 use airlock_policy::{Action, FileMode, ModeSet, Policy};
 
@@ -223,16 +224,25 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     let exec_whitelist = exec_whitelist_mode(policy);
 
     out.push_str("(version 1)\n");
-    out.push_str(";; airlock 생성 프로파일. deny-default이며 마지막 규칙이 이김\n");
+    out.push_str(tr!(
+        ";; airlock 생성 프로파일. deny-default이며 마지막 규칙이 이김\n",
+        ";; airlock-generated profile; deny-default, the last rule wins\n"
+    ));
     out.push_str("(deny default)\n");
     out.push_str("(deny file-write* (with no-report))\n\n");
 
-    out.push_str(";; --- 프로세스 기본 동작 ---\n");
+    out.push_str(tr!(
+        ";; --- 프로세스 기본 동작 ---\n",
+        ";; --- process basics ---\n"
+    ));
     out.push_str("(allow process-fork)\n");
     if exec_whitelist {
         // 무조건 개방을 걷어내면 exec 이 블랙리스트에서 화이트리스트로 뒤집힙니다.
         // 허용은 아래 정책 allow 절에서 경로마다 하나씩 나갑니다
-        out.push_str(";; exec 은 정책 allow 절에서 경로별로만 열림. 무조건 개방 없음\n");
+        out.push_str(tr!(
+            ";; exec 은 정책 allow 절에서 경로별로만 열림. 무조건 개방 없음\n",
+            ";; exec opens only per path in the policy allow section; no unconditional opening\n"
+        ));
     } else {
         out.push_str("(allow process-exec*)\n");
     }
@@ -243,18 +253,33 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     // mach 서비스는 통째로 열되 정책 밖 유출 통로로 알려진 것부터 되막습니다. 목록을
     // 화이트리스트로 뒤집으면 개발 툴체인이 버전마다 깨지므로 deny 를 뒤에 둡니다
     out.push_str("(allow mach-lookup)\n");
-    out.push_str(";; 클립보드는 정책 모델 밖의 읽기 쓰기 통로임\n");
+    out.push_str(tr!(
+        ";; 클립보드는 정책 모델 밖의 읽기 쓰기 통로임\n",
+        ";; the clipboard is a read-write channel outside the policy model\n"
+    ));
     out.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
     out.push_str("(deny mach-lookup (global-name \"com.apple.pboard\"))\n\n");
 
-    out.push_str(";; --- 경로 해석 ---\n");
-    out.push_str(";; 루트 노드 자체를 읽지 못하면 어떤 절대 경로도 해석되지 않아\n");
-    out.push_str(";; dyld가 라이브러리를 찾기 전에 프로세스가 죽음\n");
+    out.push_str(tr!(
+        ";; --- 경로 해석 ---\n",
+        ";; --- path resolution ---\n"
+    ));
+    out.push_str(tr!(
+        ";; 루트 노드 자체를 읽지 못하면 어떤 절대 경로도 해석되지 않아\n",
+        ";; without read on the root node itself no absolute path resolves,\n"
+    ));
+    out.push_str(tr!(
+        ";; dyld가 라이브러리를 찾기 전에 프로세스가 죽음\n",
+        ";; and the process dies before dyld finds its libraries\n"
+    ));
     out.push_str("(allow file-read* (literal \"/\"))\n");
-    out.push_str(";; 조상 디렉토리 탐색용. 아래 차단 규칙이 뒤에서 덮음\n");
+    out.push_str(tr!(
+        ";; 조상 디렉토리 탐색용. 아래 차단 규칙이 뒤에서 덮음\n",
+        ";; for ancestor directory traversal; the deny rules below override it\n"
+    ));
     out.push_str("(allow file-read-metadata)\n\n");
 
-    out.push_str(";; --- 시스템 읽기 ---\n");
+    out.push_str(tr!(";; --- 시스템 읽기 ---\n", ";; --- system reads ---\n"));
     for p in SYSTEM_READ_SUBPATHS {
         out.push_str(&format!(
             "(allow file-read* (subpath {}))\n",
@@ -263,7 +288,10 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     }
     out.push('\n');
 
-    out.push_str(";; --- 장치 노드 읽기 쓰기 ---\n");
+    out.push_str(tr!(
+        ";; --- 장치 노드 읽기 쓰기 ---\n",
+        ";; --- device node read-write ---\n"
+    ));
     for p in DEV_RW_LITERALS {
         out.push_str(&format!(
             "(allow file-read* file-write* (literal {}))\n",
@@ -273,7 +301,10 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     out.push('\n');
 
     if !opts.temp_dirs.is_empty() {
-        out.push_str(";; --- 임시 디렉토리 ---\n");
+        out.push_str(tr!(
+            ";; --- 임시 디렉토리 ---\n",
+            ";; --- temp directories ---\n"
+        ));
         for dir in &opts.temp_dirs {
             match sbpl::subpath(dir) {
                 Some(t) => {
@@ -286,7 +317,7 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
     }
 
     if let Some(ws) = &opts.workspace {
-        out.push_str(";; --- 작업 공간 ---\n");
+        out.push_str(tr!(";; --- 작업 공간 ---\n", ";; --- workspace ---\n"));
         match sbpl::subpath(ws) {
             Some(t) => out.push_str(&format!(
                 "(allow file-read* file-write* {})\n\n",
@@ -296,12 +327,18 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
         }
     }
 
-    out.push_str(";; --- 네트워크 ---\n");
+    out.push_str(tr!(";; --- 네트워크 ---\n", ";; --- network ---\n"));
     if let Some(proxy) = opts.proxy.filter(|_| opts.allow_network) {
         // 아웃바운드가 프록시 하나로 좁혀지므로 호스트 규칙은 여기서 처음으로
         // 실제 경계를 갖습니다. 판정은 프록시가 하고 커널은 우회를 막습니다
-        out.push_str(";; 아웃바운드를 egress 프록시 하나로 좁힘\n");
-        out.push_str(";; 호스트 판정은 프록시가 하고 커널은 다른 출구를 막음\n");
+        out.push_str(tr!(
+            ";; 아웃바운드를 egress 프록시 하나로 좁힘\n",
+            ";; outbound narrowed to the single egress proxy\n"
+        ));
+        out.push_str(tr!(
+            ";; 호스트 판정은 프록시가 하고 커널은 다른 출구를 막음\n",
+            ";; the proxy decides hosts and the kernel blocks other exits\n"
+        ));
         out.push_str(&format!(
             "(allow network-outbound (remote ip {}))\n",
             sbpl::quote(&format!("localhost:{}", proxy.port()))
@@ -309,20 +346,38 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
         // 유닉스 소켓까지 막으면 시스템 라이브러리가 대부분 동작하지 않습니다
         out.push_str("(allow network-outbound (remote unix))\n\n");
     } else if network_allowed(policy, opts) {
-        out.push_str(";; 주의 호스트 단위 제어는 Seatbelt로 표현할 수 없음\n");
-        out.push_str(";; egress 정책은 프록시 층에서 강제함\n");
+        out.push_str(tr!(
+            ";; 주의 호스트 단위 제어는 Seatbelt로 표현할 수 없음\n",
+            ";; note: per-host control cannot be expressed in Seatbelt\n"
+        ));
+        out.push_str(tr!(
+            ";; egress 정책은 프록시 층에서 강제함\n",
+            ";; egress policy is enforced at the proxy layer\n"
+        ));
         out.push_str("(allow network-outbound)\n");
         out.push_str("(allow network-bind (local ip))\n\n");
         // 아웃바운드가 열린 채로는 egress 제한 규칙 중 어느 것도 커널이 판정하지 못합니다
         for rule in restrictive_egress_ids(policy) {
-            untranslatable.push(format!("{rule} (호스트·포트 egress)"));
+            untranslatable.push(tr!(
+                format!("{rule} (호스트·포트 egress)"),
+                format!("{rule} (host/port egress)")
+            ));
         }
     } else {
-        out.push_str(";; 정책에 egress allow 규칙이 없어 아웃바운드를 통째로 차단함\n");
-        out.push_str(";; deny-default 프로파일이므로 규칙을 방출하지 않는 것이 곧 차단임\n\n");
+        out.push_str(tr!(
+            ";; 정책에 egress allow 규칙이 없어 아웃바운드를 통째로 차단함\n",
+            ";; no egress allow rules in the policy, so outbound is blocked entirely\n"
+        ));
+        out.push_str(tr!(
+            ";; deny-default 프로파일이므로 규칙을 방출하지 않는 것이 곧 차단임\n\n",
+            ";; in a deny-default profile, emitting no rule is itself the block\n\n"
+        ));
     }
 
-    out.push_str(";; --- 정책 allow 규칙 ---\n");
+    out.push_str(tr!(
+        ";; --- 정책 allow 규칙 ---\n",
+        ";; --- policy allow rules ---\n"
+    ));
     emit_file_rules(policy, &mut out, &mut untranslatable, |a| {
         a == Action::Allow
     });
@@ -330,7 +385,10 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
         emit_exec_allow(policy, opts, &mut out, &mut untranslatable, &mut exec_allow);
     }
 
-    out.push_str("\n;; --- 정책 차단 규칙. 마지막에 두어 어떤 allow도 덮지 못하게 함 ---\n");
+    out.push_str(tr!(
+        "\n;; --- 정책 차단 규칙. 마지막에 두어 어떤 allow도 덮지 못하게 함 ---\n",
+        "\n;; --- policy deny rules; kept last so no allow can override them ---\n"
+    ));
     emit_file_rules(policy, &mut out, &mut untranslatable, |a| {
         matches!(a, Action::Deny | Action::Forbid | Action::Ask)
     });
@@ -399,7 +457,10 @@ fn emit_exec_allow(
     untranslatable: &mut Vec<String>,
     emitted: &mut Vec<String>,
 ) {
-    out.push_str(";; --- exec 화이트리스트. 여기 없는 프로그램은 커널이 거부함 ---\n");
+    out.push_str(tr!(
+        ";; --- exec 화이트리스트. 여기 없는 프로그램은 커널이 거부함 ---\n",
+        ";; --- exec whitelist; programs not listed here are refused by the kernel ---\n"
+    ));
 
     let mut emit = |target: &sbpl::Target, id: &str, out: &mut String| {
         let rendered = target.render();
@@ -413,9 +474,15 @@ fn emit_exec_allow(
     if let Some(program) = &opts.program {
         match sbpl::literal(program) {
             Some(t) => emit(&t, "airlock:top-level", out),
-            None => untranslatable.push(format!(
-                "최상위 프로그램 {} (경로가 UTF-8이 아니라 SBPL 대상으로 옮길 수 없음)",
-                program.display()
+            None => untranslatable.push(tr!(
+                format!(
+                    "최상위 프로그램 {} (경로가 UTF-8이 아니라 SBPL 대상으로 옮길 수 없음)",
+                    program.display()
+                ),
+                format!(
+                    "top-level program {} (path is not UTF-8, cannot be turned into an SBPL target)",
+                    program.display()
+                )
             )),
         }
     }
@@ -451,9 +518,15 @@ fn exec_allow_targets(
             Some(ProgramMatch::Path(pattern)) => {
                 let targets = sbpl::target_for(pattern).into_iter().collect::<Vec<_>>();
                 if targets.is_empty() {
-                    untranslatable.push(format!(
-                        "{} (exec allow 경로 패턴을 SBPL 대상으로 옮길 수 없음)",
-                        comment(id)
+                    untranslatable.push(tr!(
+                        format!(
+                            "{} (exec allow 경로 패턴을 SBPL 대상으로 옮길 수 없음)",
+                            comment(id)
+                        ),
+                        format!(
+                            "{} (exec allow path pattern cannot be turned into an SBPL target)",
+                            comment(id)
+                        )
                     ));
                 }
                 targets
@@ -461,18 +534,31 @@ fn exec_allow_targets(
             Some(ProgramMatch::Basename(name)) => {
                 let found = resolve_in_path(name);
                 if found.is_empty() {
-                    untranslatable.push(format!(
-                        "{} (program = \"{}\" 을 PATH 에서 찾지 못해 exec 허용에 넣지 않았음)",
-                        comment(id),
-                        comment(name)
+                    untranslatable.push(tr!(
+                        format!(
+                            "{} (program = \"{}\" 을 PATH 에서 찾지 못해 exec 허용에 넣지 않았음)",
+                            comment(id),
+                            comment(name)
+                        ),
+                        format!(
+                            "{} (program = \"{}\" was not found in PATH, so it was left out of the exec allow list)",
+                            comment(id),
+                            comment(name)
+                        )
                     ));
                 }
                 found.iter().filter_map(|p| sbpl::literal(p)).collect()
             }
             None => {
-                untranslatable.push(format!(
-                    "{} (프로그램 조건이 없는 exec allow 는 대상을 특정할 수 없음)",
-                    comment(id)
+                untranslatable.push(tr!(
+                    format!(
+                        "{} (프로그램 조건이 없는 exec allow 는 대상을 특정할 수 없음)",
+                        comment(id)
+                    ),
+                    format!(
+                        "{} (an exec allow without a program condition cannot pin down its target)",
+                        comment(id)
+                    )
                 ));
                 Vec::new()
             }
@@ -482,10 +568,17 @@ fn exec_allow_targets(
             for pattern in paths {
                 match sbpl::target_for(pattern) {
                     Some(t) => out.push(t),
-                    None => untranslatable.push(format!(
-                        "{} {} (exec 허용 경로를 SBPL 대상으로 옮길 수 없음)",
-                        comment(id),
-                        comment(pattern.raw())
+                    None => untranslatable.push(tr!(
+                        format!(
+                            "{} {} (exec 허용 경로를 SBPL 대상으로 옮길 수 없음)",
+                            comment(id),
+                            comment(pattern.raw())
+                        ),
+                        format!(
+                            "{} {} (exec allow path cannot be turned into an SBPL target)",
+                            comment(id),
+                            comment(pattern.raw())
+                        )
                     )),
                 }
             }
@@ -544,21 +637,30 @@ fn exec_targets(matcher: &Matcher) -> std::result::Result<Vec<sbpl::Target>, &'s
         argv_pattern,
     } = matcher
     else {
-        return Err("exec 규칙이 아님");
+        return Err(tr!("exec 규칙이 아님", "not an exec rule"));
     };
     if !argv_contains.is_empty() || argv_pattern.is_some() {
         // argv를 보고 좁힌 규칙을 프로그램 경로만으로 옮기면 정책보다 넓게 막습니다
-        return Err("argv 조건은 Seatbelt가 볼 수 없어 표현 불가");
+        return Err(tr!(
+            "argv 조건은 Seatbelt가 볼 수 없어 표현 불가",
+            "argv conditions are invisible to Seatbelt and cannot be expressed"
+        ));
     }
     let Some(pm) = program else {
-        return Err("프로그램 조건이 없어 실행 대상을 특정할 수 없음");
+        return Err(tr!(
+            "프로그램 조건이 없어 실행 대상을 특정할 수 없음",
+            "no program condition, so the exec target cannot be pinned down"
+        ));
     };
     let targets = match pm {
         ProgramMatch::Basename(name) => sbpl::basename_targets(name),
         ProgramMatch::Path(pattern) => sbpl::targets_for(pattern),
     };
     if targets.is_empty() {
-        return Err("경로 패턴을 SBPL 대상으로 옮길 수 없음");
+        return Err(tr!(
+            "경로 패턴을 SBPL 대상으로 옮길 수 없음",
+            "the path pattern cannot be turned into an SBPL target"
+        ));
     }
     Ok(targets)
 }
@@ -624,7 +726,10 @@ fn emit_file_rules(
 }
 
 pub fn ask_rules_are_denied_note() -> &'static str {
-    "Seatbelt는 사람 승인을 표현할 수 없으므로 ask 파일 규칙은 프로파일에서 deny로 내려감"
+    tr!(
+        "Seatbelt는 사람 승인을 표현할 수 없으므로 ask 파일 규칙은 프로파일에서 deny로 내려감",
+        "Seatbelt cannot express human approval, so ask file rules degrade to deny in the profile"
+    )
 }
 
 /// 화이트리스트 모드에서 `ask` exec 규칙이 어떻게 되는지.
@@ -632,13 +737,23 @@ pub fn ask_rules_are_denied_note() -> &'static str {
 /// 허용 목록에 넣지 않으므로 커널이 실행을 거부합니다. 방출하지 않는다는 기구는 같지만
 /// 결과가 반대이므로 배너 문구도 달라야 합니다
 pub fn exec_ask_whitelist_note() -> &'static str {
-    "ask exec 규칙은 화이트리스트에 넣지 않으므로 커널이 실행을 거부함. macOS 에는 중계 층이 \
-     없어 사람에게 물을 방법이 없으며, 최상위 exec 하나만 브로커가 spawn 전에 물음"
+    tr!(
+        "ask exec 규칙은 화이트리스트에 넣지 않으므로 커널이 실행을 거부함. macOS 에는 중계 층이 \
+         없어 사람에게 물을 방법이 없으며, 최상위 exec 하나만 브로커가 spawn 전에 물음",
+        "ask exec rules are not put on the whitelist, so the kernel refuses those execs; \
+         macOS has no mediation layer to ask a human through, and only the top-level exec \
+         is asked by the broker before spawn"
+    )
 }
 
 pub fn exec_ask_note() -> &'static str {
-    "ask exec 규칙은 커널에서 강제되지 않음. macOS 에서 답을 받을 수 있는 ask 는 브로커가 \
-     spawn 전에 묻는 최상위 exec 하나뿐이라, deny 로 내리면 승인된 실행까지 막히기 때문임"
+    tr!(
+        "ask exec 규칙은 커널에서 강제되지 않음. macOS 에서 답을 받을 수 있는 ask 는 브로커가 \
+         spawn 전에 묻는 최상위 exec 하나뿐이라, deny 로 내리면 승인된 실행까지 막히기 때문임",
+        "ask exec rules are not kernel-enforced; on macOS the only ask that can receive an \
+         answer is the top-level exec the broker asks before spawn, so degrading them to \
+         deny would block even approved execs"
+    )
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 use airlock_audit::Enforcement;
+use airlock_i18n::tr;
 use airlock_policy::Policy;
 
 use crate::error::Result;
@@ -44,7 +45,11 @@ impl Enforcer for ObserveEnforcer {
     }
 
     fn describe(&self) -> String {
-        "observe (강제 없음, 기록만)".to_string()
+        tr!(
+            "observe (강제 없음, 기록만)",
+            "observe (no enforcement, record only)"
+        )
+        .to_string()
     }
 
     fn prepare(&mut self, _policy: &Policy) -> Result<()> {
@@ -57,8 +62,16 @@ impl Enforcer for ObserveEnforcer {
 
     fn gaps(&self) -> Vec<String> {
         vec![
-            "커널 강제 없음, 정책 위반이 기록되지만 차단되지 않음".to_string(),
-            "브로커를 경유하지 않는 직접 파일 접근은 관측되지 않음".to_string(),
+            tr!(
+                "커널 강제 없음, 정책 위반이 기록되지만 차단되지 않음",
+                "no kernel enforcement; policy violations are recorded but not blocked"
+            )
+            .to_string(),
+            tr!(
+                "브로커를 경유하지 않는 직접 파일 접근은 관측되지 않음",
+                "direct file access that does not pass through the broker is not observed"
+            )
+            .to_string(),
         ]
     }
 }

@@ -10,6 +10,7 @@ description = "Airlock의 OS 강제 층. Linux Landlock과 seccomp, macOS Seatbe
 [dependencies]
 airlock-audit.workspace = true
 airlock-canonical.workspace = true
+airlock-i18n.workspace = true
 airlock-policy.workspace = true
 airlock-proxy.workspace = true
 libc.workspace = true
