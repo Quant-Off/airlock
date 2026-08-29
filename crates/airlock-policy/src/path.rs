@@ -2,6 +2,8 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use airlock_i18n::tr;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedPath {
     pub requested: PathBuf,
@@ -68,16 +70,25 @@ pub fn read_trusted(path: &Path) -> Result<String, crate::error::LoadError> {
     if meta.uid() != uid {
         return Err(crate::error::LoadError::UntrustedFile {
             path: path.to_path_buf(),
-            why: format!("uid {}의 소유임. 호출자는 uid {uid}", meta.uid()),
+            why: tr!(
+                format!("uid {}의 소유임. 호출자는 uid {uid}", meta.uid()),
+                format!("owned by uid {}; the caller is uid {uid}", meta.uid())
+            ),
         });
     }
     // 022. 그룹이나 그 밖의 사용자가 쓸 수 있으면 그들이 곧 정책 작성자입니다
     if meta.mode() & 0o022 != 0 {
         return Err(crate::error::LoadError::UntrustedFile {
             path: path.to_path_buf(),
-            why: format!(
-                "권한이 {:04o}로 다른 사용자가 쓸 수 있음",
-                meta.mode() & 0o7777
+            why: tr!(
+                format!(
+                    "권한이 {:04o}로 다른 사용자가 쓸 수 있음",
+                    meta.mode() & 0o7777
+                ),
+                format!(
+                    "mode {:04o} lets other users write to it",
+                    meta.mode() & 0o7777
+                )
             ),
         });
     }

@@ -34,6 +34,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use airlock_canonical::Encoder;
+use airlock_i18n::tr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -300,39 +301,98 @@ impl fmt::Display for AnchorFailure {
         match self {
             Self::FileAbsent => write!(
                 f,
-                "{ANCHOR_FILE} 없음. 세션 삭제와 체인 재계산을 탐지할 수 없음. 앵커 삭제 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "{ANCHOR_FILE} 없음. 세션 삭제와 체인 재계산을 탐지할 수 없음. 앵커 삭제 의심"
+                    ),
+                    format!(
+                        "{ANCHOR_FILE} missing; session deletion and chain recomputation cannot be detected. Suspected anchor deletion"
+                    )
+                )
             ),
-            Self::ChainEmpty => write!(f, "앵커 체인이 비어 있음"),
-            Self::MalformedLine { line, detail } => {
-                write!(f, "앵커 {line}번째 줄 파싱 실패: {detail}")
+            Self::ChainEmpty => {
+                f.write_str(tr!("앵커 체인이 비어 있음", "the anchor chain is empty"))
             }
-            Self::TruncatedFinalLine { line } => {
-                write!(f, "앵커 {line}번째 줄이 개행 없이 잘림. 쓰기 중 중단 의심")
-            }
+            Self::MalformedLine { line, detail } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("앵커 {line}번째 줄 파싱 실패: {detail}"),
+                    format!("failed to parse anchor line {line}: {detail}")
+                )
+            ),
+            Self::TruncatedFinalLine { line } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("앵커 {line}번째 줄이 개행 없이 잘림. 쓰기 중 중단 의심"),
+                    format!(
+                        "anchor line {line} is truncated without a newline; suspected interruption mid-write"
+                    )
+                )
+            ),
             Self::BlankLine { line } => write!(
                 f,
-                "앵커 {line}번째 줄이 비어 있음. 앵커가 아닌 줄이 끼어들었음"
+                "{}",
+                tr!(
+                    format!("앵커 {line}번째 줄이 비어 있음. 앵커가 아닌 줄이 끼어들었음"),
+                    format!("anchor line {line} is blank; a non-anchor line crept in")
+                )
             ),
             Self::FormatVersionUnsupported { seq, got } => write!(
                 f,
-                "앵커 seq {seq}의 포맷이 v{got}. 이 검증자는 v{ANCHOR_VERSION}만 안다. 변조가 아니라 옛 포맷일 수 있으니 그 버전의 airlock으로 검증할 것"
-            ),
-            Self::GenesisPrevNotZero { got } => {
-                write!(f, "첫 앵커의 prev가 0이 아님: {got}")
-            }
-            Self::SeqGap { expected, got } => {
-                write!(
-                    f,
-                    "앵커 seq 빈틈. {expected} 기대, {got} 발견. 앵커 줄 삭제 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 seq {seq}의 포맷이 v{got}. 이 검증자는 v{ANCHOR_VERSION}만 안다. 변조가 아니라 옛 포맷일 수 있으니 그 버전의 airlock으로 검증할 것"
+                    ),
+                    format!(
+                        "anchor seq {seq} has format v{got}; this verifier only knows v{ANCHOR_VERSION}. It may be an old format rather than tampering, so verify with that version of airlock"
+                    )
                 )
-            }
+            ),
+            Self::GenesisPrevNotZero { got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("첫 앵커의 prev가 0이 아님: {got}"),
+                    format!("the first anchor's prev is not zero: {got}")
+                )
+            ),
+            Self::SeqGap { expected, got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("앵커 seq 빈틈. {expected} 기대, {got} 발견. 앵커 줄 삭제 의심"),
+                    format!(
+                        "anchor seq gap; expected {expected}, found {got}. Suspected anchor line deletion"
+                    )
+                )
+            ),
             Self::PrevMismatch { seq, expected, got } => write!(
                 f,
-                "앵커 seq {seq}의 prev 불일치. {expected} 기대, {got} 발견. 삭제·삽입·재배치 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 seq {seq}의 prev 불일치. {expected} 기대, {got} 발견. 삭제·삽입·재배치 의심"
+                    ),
+                    format!(
+                        "anchor seq {seq} prev mismatch; expected {expected}, found {got}. Suspected deletion, insertion, or reordering"
+                    )
+                )
             ),
             Self::HashMismatch { seq, expected, got } => write!(
                 f,
-                "앵커 seq {seq}의 hash 불일치. 재계산 {expected}, 기록 {got}. 내용 변조 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 seq {seq}의 hash 불일치. 재계산 {expected}, 기록 {got}. 내용 변조 의심"
+                    ),
+                    format!(
+                        "anchor seq {seq} hash mismatch; recomputed {expected}, recorded {got}. Suspected content tampering"
+                    )
+                )
             ),
             Self::SessionDuplicated {
                 seq,
@@ -340,7 +400,15 @@ impl fmt::Display for AnchorFailure {
                 first_seq,
             } => write!(
                 f,
-                "앵커 seq {seq}가 세션 {session}을 같은 head_seq로 다시 기록함 (처음은 seq {first_seq}). 앵커 줄 복제 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 seq {seq}가 세션 {session}을 같은 head_seq로 다시 기록함 (처음은 seq {first_seq}). 앵커 줄 복제 의심"
+                    ),
+                    format!(
+                        "anchor seq {seq} records session {session} again with the same head_seq (first at seq {first_seq}); suspected anchor line duplication"
+                    )
+                )
             ),
             Self::HeadSeqRegressed {
                 seq,
@@ -349,7 +417,15 @@ impl fmt::Display for AnchorFailure {
                 got,
             } => write!(
                 f,
-                "앵커 seq {seq}에서 세션 {session}의 head_seq가 되감김 ({previous} -> {got}). 세션 체인은 자라기만 하므로 잘라내기 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 seq {seq}에서 세션 {session}의 head_seq가 되감김 ({previous} -> {got}). 세션 체인은 자라기만 하므로 잘라내기 의심"
+                    ),
+                    format!(
+                        "head_seq of session {session} regressed at anchor seq {seq} ({previous} -> {got}); a session chain only grows, so truncation is suspected"
+                    )
+                )
             ),
             Self::SessionHeadMismatch {
                 session,
@@ -362,12 +438,28 @@ impl fmt::Display for AnchorFailure {
                 if chain_head_seq > anchor_head_seq {
                     write!(
                         f,
-                        "세션 {session}의 체인이 앵커보다 김. 앵커(seq {anchor_seq})는 head {anchor_head_seq}, 체인은 head {chain_head_seq}. 앵커 이후 덧붙이기 의심"
+                        "{}",
+                        tr!(
+                            format!(
+                                "세션 {session}의 체인이 앵커보다 김. 앵커(seq {anchor_seq})는 head {anchor_head_seq}, 체인은 head {chain_head_seq}. 앵커 이후 덧붙이기 의심"
+                            ),
+                            format!(
+                                "the chain of session {session} is longer than the anchor; the anchor (seq {anchor_seq}) says head {anchor_head_seq}, the chain says head {chain_head_seq}. Suspected append after anchoring"
+                            )
+                        )
                     )
                 } else {
                     write!(
                         f,
-                        "세션 {session}의 head가 앵커와 다름. 앵커(seq {anchor_seq})는 {anchor_head_seq}/{anchor_head_hash}, 체인은 {chain_head_seq}/{chain_head_hash}. 체인 재계산 의심"
+                        "{}",
+                        tr!(
+                            format!(
+                                "세션 {session}의 head가 앵커와 다름. 앵커(seq {anchor_seq})는 {anchor_head_seq}/{anchor_head_hash}, 체인은 {chain_head_seq}/{chain_head_hash}. 체인 재계산 의심"
+                            ),
+                            format!(
+                                "the head of session {session} differs from the anchor; the anchor (seq {anchor_seq}) says {anchor_head_seq}/{anchor_head_hash}, the chain says {chain_head_seq}/{chain_head_hash}. Suspected chain recomputation"
+                            )
+                        )
                     )
                 }
             }
@@ -389,11 +481,25 @@ impl fmt::Display for AnchorWarning {
         match self {
             Self::ClockWentBackwards { seq, prev_ts, ts } => write!(
                 f,
-                "앵커 seq {seq}에서 벽시계가 역행 ({prev_ts} -> {ts}). 시각 조정 가능성"
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 seq {seq}에서 벽시계가 역행 ({prev_ts} -> {ts}). 시각 조정 가능성"
+                    ),
+                    format!(
+                        "wall clock went backwards at anchor seq {seq} ({prev_ts} -> {ts}); possible clock adjustment"
+                    )
+                )
             ),
             Self::SessionReanchored { session, count } => write!(
                 f,
-                "세션 {session}이 {count}번 앵커됨. 중간 체크포인트로 판단"
+                "{}",
+                tr!(
+                    format!("세션 {session}이 {count}번 앵커됨. 중간 체크포인트로 판단"),
+                    format!(
+                        "session {session} anchored {count} times; judged to be intermediate checkpoints"
+                    )
+                )
             ),
         }
     }

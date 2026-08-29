@@ -2,6 +2,7 @@ use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use airlock_i18n::tr;
 use unicode_normalization::UnicodeNormalization;
 
 const MAX_DOUBLE_STARS: usize = 4;
@@ -19,20 +20,47 @@ pub enum PatternError {
 impl fmt::Display for PatternError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => write!(f, "빈 패턴"),
+            Self::Empty => f.write_str(tr!("빈 패턴", "empty pattern")),
             Self::NotAbsolute(p) => write!(
                 f,
-                "`{p}`는 절대 경로가 아님. `/`, `~/`, `**/` 중 하나로 시작해야 함"
+                "{}",
+                tr!(
+                    format!("`{p}`는 절대 경로가 아님. `/`, `~/`, `**/` 중 하나로 시작해야 함"),
+                    format!("`{p}` is not absolute; it must start with one of `/`, `~/`, `**/`")
+                )
             ),
-            Self::UserHome(p) => write!(f, "`{p}`의 `~user` 형태는 v1에서 지원하지 않음"),
-            Self::DotSegment(p) => write!(f, "`{p}`에 `.` 또는 `..` 세그먼트가 있음"),
+            Self::UserHome(p) => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("`{p}`의 `~user` 형태는 v1에서 지원하지 않음"),
+                    format!("the `~user` form in `{p}` is not supported in v1")
+                )
+            ),
+            Self::DotSegment(p) => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("`{p}`에 `.` 또는 `..` 세그먼트가 있음"),
+                    format!("`{p}` contains a `.` or `..` segment")
+                )
+            ),
             Self::EmbeddedDoubleStar(p) => write!(
                 f,
-                "`{p}`의 `**`는 세그먼트 전체여야 함. 세그먼트 일부로 쓸 수 없음"
+                "{}",
+                tr!(
+                    format!("`{p}`의 `**`는 세그먼트 전체여야 함. 세그먼트 일부로 쓸 수 없음"),
+                    format!("`**` in `{p}` must be a whole segment; it cannot be part of one")
+                )
             ),
-            Self::TooManyDoubleStars(p) => {
-                write!(f, "`{p}`의 `**`가 {MAX_DOUBLE_STARS}개를 넘음")
-            }
+            Self::TooManyDoubleStars(p) => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("`{p}`의 `**`가 {MAX_DOUBLE_STARS}개를 넘음"),
+                    format!("`{p}` has more than {MAX_DOUBLE_STARS} `**` segments")
+                )
+            ),
         }
     }
 }

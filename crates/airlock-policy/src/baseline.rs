@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use airlock_i18n::tr;
+
 use crate::glob::{Pattern, PatternError, TextPattern};
 use crate::model::{Action, FileMode, ModeSet, Tier};
 use crate::rule::{Matcher, ProgramMatch, Rule};
@@ -323,7 +325,13 @@ pub fn self_protect(paths: &SelfProtectPaths) -> Vec<Rule> {
         id: "self:audit-log".to_string(),
         tier: Tier::SelfProtect,
         action: Action::Deny,
-        reason: Some("감사 로그가 기록 대상에게 쓰기 가능하면 증거가 아님".to_string()),
+        reason: Some(
+            tr!(
+                "감사 로그가 기록 대상에게 쓰기 가능하면 증거가 아님",
+                "an audit log writable by its subject is not evidence"
+            )
+            .to_string(),
+        ),
         overrides: None,
         matcher: Matcher::File {
             paths: vec![
@@ -341,7 +349,13 @@ pub fn self_protect(paths: &SelfProtectPaths) -> Vec<Rule> {
             id: "self:policy-file".to_string(),
             tier: Tier::SelfProtect,
             action: Action::Deny,
-            reason: Some("정책 파일을 대상이 고칠 수 있으면 강제가 아님".to_string()),
+            reason: Some(
+                tr!(
+                    "정책 파일을 대상이 고칠 수 있으면 강제가 아님",
+                    "a policy file its subject can edit is not enforcement"
+                )
+                .to_string(),
+            ),
             overrides: None,
             matcher: Matcher::File {
                 paths: paths
@@ -359,7 +373,13 @@ pub fn self_protect(paths: &SelfProtectPaths) -> Vec<Rule> {
             id: "self:binary".to_string(),
             tier: Tier::SelfProtect,
             action: Action::Deny,
-            reason: Some("브로커 바이너리 교체는 TCB 교체임".to_string()),
+            reason: Some(
+                tr!(
+                    "브로커 바이너리 교체는 TCB 교체임",
+                    "replacing the broker binary replaces the TCB"
+                )
+                .to_string(),
+            ),
             overrides: None,
             matcher: Matcher::File {
                 paths: vec![Pattern::literal(binary)],

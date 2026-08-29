@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use airlock_i18n::tr;
 use serde::{Deserialize, Serialize};
 
 use crate::entry::{Entry, Record};
@@ -245,18 +246,24 @@ pub fn read_entries_lossy(dir: impl AsRef<Path>) -> Result<(Vec<Entry>, Option<S
         if line.trim().is_empty() {
             // 검증기는 빈 줄을 치명적 오류로 봅니다(docs/audit-format.md 8절). 뷰어가
             // 조용히 건너뛰면 같은 파일을 두 리더가 다르게 읽어 절단 탐지에 구멍이 납니다
-            problem = Some(format!(
-                "{}번째 줄이 비어 있음. 엔트리가 아닌 줄이 끼어들었음",
-                idx.saturating_add(1)
+            problem = Some(tr!(
+                format!(
+                    "{}번째 줄이 비어 있음. 엔트리가 아닌 줄이 끼어들었음",
+                    idx.saturating_add(1)
+                ),
+                format!(
+                    "line {} is blank; a non-entry line crept in",
+                    idx.saturating_add(1)
+                )
             ));
             break;
         }
         match serde_json::from_str::<Entry>(&line) {
             Ok(entry) => entries.push(entry),
             Err(e) => {
-                problem = Some(format!(
-                    "{}번째 줄부터 읽을 수 없음: {e}",
-                    idx.saturating_add(1)
+                problem = Some(tr!(
+                    format!("{}번째 줄부터 읽을 수 없음: {e}", idx.saturating_add(1)),
+                    format!("cannot read from line {}: {e}", idx.saturating_add(1))
                 ));
                 break;
             }

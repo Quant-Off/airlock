@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use airlock_i18n::tr;
 use serde::Deserialize;
 
 use crate::error::LoadError;
@@ -204,7 +205,10 @@ pub fn to_rule(raw: RawRule, home: &Path) -> Result<Rule, LoadError> {
             if program.is_none() && argv_contains.is_empty() && argv_pattern.is_none() {
                 return Err(LoadError::MissingField {
                     id: id.clone(),
-                    field: "program 또는 argv_contains 또는 argv_pattern",
+                    field: tr!(
+                        "program 또는 argv_contains 또는 argv_pattern",
+                        "program or argv_contains or argv_pattern"
+                    ),
                 });
             }
             Matcher::Exec {

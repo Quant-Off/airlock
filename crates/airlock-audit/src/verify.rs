@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use airlock_i18n::tr;
+
 use crate::entry::Entry;
 use crate::error::Error;
 use crate::event::Event;
@@ -82,78 +84,172 @@ pub enum Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ChainEmpty => write!(f, "체인이 비어 있음"),
+            Self::ChainEmpty => f.write_str(tr!("체인이 비어 있음", "the chain is empty")),
             Self::FormatVersionUnsupported { seq, got } => write!(
                 f,
-                "seq {seq}의 포맷이 v{got}. 이 검증자는 v{}만 안다. 변조가 아니라 옛 포맷일 수 있으니 그 버전의 airlock으로 검증할 것",
-                crate::FORMAT_VERSION
+                "{}",
+                tr!(
+                    format!(
+                        "seq {seq}의 포맷이 v{got}. 이 검증자는 v{}만 안다. 변조가 아니라 옛 포맷일 수 있으니 그 버전의 airlock으로 검증할 것",
+                        crate::FORMAT_VERSION
+                    ),
+                    format!(
+                        "seq {seq} has format v{got}; this verifier only knows v{}. It may be an old format rather than tampering, so verify with that version of airlock",
+                        crate::FORMAT_VERSION
+                    )
+                )
             ),
-            Self::MalformedLine { line, detail } => {
-                write!(f, "{line}번째 줄 파싱 실패: {detail}")
-            }
-            Self::TruncatedFinalLine { line } => {
-                write!(f, "{line}번째 줄이 개행 없이 잘림. 쓰기 중 중단 의심")
-            }
-            Self::GenesisPrevNotZero { got } => {
-                write!(f, "genesis의 prev가 0이 아님: {got}")
-            }
-            Self::GenesisNotSessionStart { got } => {
-                write!(f, "genesis 이벤트가 session_start가 아님: {got}")
-            }
-            Self::SeqGap { expected, got } => {
-                write!(f, "seq 빈틈. {expected} 기대, {got} 발견")
-            }
+            Self::MalformedLine { line, detail } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("{line}번째 줄 파싱 실패: {detail}"),
+                    format!("failed to parse line {line}: {detail}")
+                )
+            ),
+            Self::TruncatedFinalLine { line } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("{line}번째 줄이 개행 없이 잘림. 쓰기 중 중단 의심"),
+                    format!(
+                        "line {line} is truncated without a newline; suspected interruption mid-write"
+                    )
+                )
+            ),
+            Self::GenesisPrevNotZero { got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("genesis의 prev가 0이 아님: {got}"),
+                    format!("genesis prev is not zero: {got}")
+                )
+            ),
+            Self::GenesisNotSessionStart { got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("genesis 이벤트가 session_start가 아님: {got}"),
+                    format!("genesis event is not session_start: {got}")
+                )
+            ),
+            Self::SeqGap { expected, got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("seq 빈틈. {expected} 기대, {got} 발견"),
+                    format!("seq gap; expected {expected}, found {got}")
+                )
+            ),
             Self::SessionMismatch { seq, expected, got } => write!(
                 f,
-                "seq {seq}의 session이 체인과 다름. {expected} 기대, {got} 발견"
+                "{}",
+                tr!(
+                    format!("seq {seq}의 session이 체인과 다름. {expected} 기대, {got} 발견"),
+                    format!(
+                        "session of seq {seq} differs from the chain; expected {expected}, found {got}"
+                    )
+                )
             ),
             Self::PrevMismatch { seq, expected, got } => write!(
                 f,
-                "seq {seq}의 prev 불일치. {expected} 기대, {got} 발견. 삭제·삽입·재배치 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "seq {seq}의 prev 불일치. {expected} 기대, {got} 발견. 삭제·삽입·재배치 의심"
+                    ),
+                    format!(
+                        "seq {seq} prev mismatch; expected {expected}, found {got}. Suspected deletion, insertion, or reordering"
+                    )
+                )
             ),
             Self::HashMismatch { seq, expected, got } => write!(
                 f,
-                "seq {seq}의 hash 불일치. 재계산 {expected}, 기록 {got}. 내용 변조 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "seq {seq}의 hash 불일치. 재계산 {expected}, 기록 {got}. 내용 변조 의심"
+                    ),
+                    format!(
+                        "seq {seq} hash mismatch; recomputed {expected}, recorded {got}. Suspected content tampering"
+                    )
+                )
             ),
-            Self::ApprovalTargetMissing { seq, for_seq } => {
-                write!(f, "seq {seq} approval이 존재하지 않는 seq {for_seq}를 참조")
-            }
-            Self::ApprovalTargetNotAsk { seq, for_seq } => {
-                write!(f, "seq {seq} approval의 대상 seq {for_seq}가 ask가 아님")
-            }
+            Self::ApprovalTargetMissing { seq, for_seq } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("seq {seq} approval이 존재하지 않는 seq {for_seq}를 참조"),
+                    format!("seq {seq} approval references nonexistent seq {for_seq}")
+                )
+            ),
+            Self::ApprovalTargetNotAsk { seq, for_seq } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("seq {seq} approval의 대상 seq {for_seq}가 ask가 아님"),
+                    format!("seq {seq} approval targets seq {for_seq}, which is not an ask")
+                )
+            ),
             Self::HeadMismatch {
                 head,
                 chain_seq,
                 chain_hash,
             } => write!(
                 f,
-                "앵커 불일치. head는 seq {} hash {}, 체인은 seq {chain_seq} hash {chain_hash}. 잘라내기 의심",
-                head.seq, head.hash
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 불일치. head는 seq {} hash {}, 체인은 seq {chain_seq} hash {chain_hash}. 잘라내기 의심",
+                        head.seq, head.hash
+                    ),
+                    format!(
+                        "anchor mismatch; head says seq {} hash {}, the chain says seq {chain_seq} hash {chain_hash}. Suspected truncation",
+                        head.seq, head.hash
+                    )
+                )
             ),
             Self::HeadSessionMismatch {
                 head_session,
                 chain_session,
             } => write!(
                 f,
-                "앵커 session 불일치. head {head_session}, 체인 {chain_session}"
+                "{}",
+                tr!(
+                    format!("앵커 session 불일치. head {head_session}, 체인 {chain_session}"),
+                    format!("anchor session mismatch; head {head_session}, chain {chain_session}")
+                )
             ),
-            Self::HeadAbsent => write!(
-                f,
-                "head.json 없음. 앵커 없이는 잘라내기를 탐지할 수 없음. 앵커 삭제 의심"
-            ),
+            Self::HeadAbsent => f.write_str(tr!(
+                "head.json 없음. 앵커 없이는 잘라내기를 탐지할 수 없음. 앵커 삭제 의심",
+                "head.json missing; truncation cannot be detected without the anchor. Suspected anchor deletion"
+            )),
             Self::HeadUnreadable { detail } => write!(
                 f,
-                "head.json을 읽을 수 없음: {detail}. 앵커 없이는 잘라내기를 탐지할 수 없음"
-            ),
-            Self::HeadVersionUnsupported { got } => {
-                write!(f, "head.json version {got}는 지원하지 않음. 1이어야 함")
-            }
-            Self::BlankLine { line } => {
-                write!(
-                    f,
-                    "{line}번째 줄이 비어 있음. 엔트리가 아닌 줄이 끼어들었음"
+                "{}",
+                tr!(
+                    format!("head.json을 읽을 수 없음: {detail}. 앵커 없이는 잘라내기를 탐지할 수 없음"),
+                    format!(
+                        "cannot read head.json: {detail}; truncation cannot be detected without the anchor"
+                    )
                 )
-            }
+            ),
+            Self::HeadVersionUnsupported { got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("head.json version {got}는 지원하지 않음. 1이어야 함"),
+                    format!("head.json version {got} is not supported; it must be 1")
+                )
+            ),
+            Self::BlankLine { line } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("{line}번째 줄이 비어 있음. 엔트리가 아닌 줄이 끼어들었음"),
+                    format!("line {line} is blank; a non-entry line crept in")
+                )
+            ),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -176,26 +272,61 @@ impl fmt::Display for Warning {
         match self {
             Self::ClockWentBackwards { seq, prev_ts, ts } => write!(
                 f,
-                "seq {seq}에서 벽시계가 역행 ({prev_ts} -> {ts}). 시각 조정 가능성"
+                "{}",
+                tr!(
+                    format!("seq {seq}에서 벽시계가 역행 ({prev_ts} -> {ts}). 시각 조정 가능성"),
+                    format!(
+                        "wall clock went backwards at seq {seq} ({prev_ts} -> {ts}); possible clock adjustment"
+                    )
+                )
             ),
             Self::HeadLagsByOne {
                 head_seq,
                 chain_seq,
             } => write!(
                 f,
-                "앵커가 한 칸 뒤처짐 (head {head_seq}, 체인 {chain_seq}). 크래시 잔여로 판단"
+                "{}",
+                tr!(
+                    format!(
+                        "앵커가 한 칸 뒤처짐 (head {head_seq}, 체인 {chain_seq}). 크래시 잔여로 판단"
+                    ),
+                    format!(
+                        "the anchor lags by one (head {head_seq}, chain {chain_seq}); judged to be crash residue"
+                    )
+                )
             ),
-            Self::DuplicateApproval { seq, for_seq } => {
-                write!(f, "seq {seq}가 이미 응답된 seq {for_seq}를 다시 승인")
-            }
-            Self::UnansweredAsk { seq } => {
-                write!(f, "seq {seq}의 ask에 대한 approval 엔트리가 없음")
-            }
+            Self::DuplicateApproval { seq, for_seq } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("seq {seq}가 이미 응답된 seq {for_seq}를 다시 승인"),
+                    format!("seq {seq} approves already-answered seq {for_seq} again")
+                )
+            ),
+            Self::UnansweredAsk { seq } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("seq {seq}의 ask에 대한 approval 엔트리가 없음"),
+                    format!("no approval entry for the ask at seq {seq}")
+                )
+            ),
             Self::ObserveOnlyEntries { count } => write!(
                 f,
-                "{count}개 엔트리가 observe 모드에서 기록됨. 강제되지 않은 관찰 기록임"
+                "{}",
+                tr!(
+                    format!(
+                        "{count}개 엔트리가 observe 모드에서 기록됨. 강제되지 않은 관찰 기록임"
+                    ),
+                    format!(
+                        "{count} entries were recorded in observe mode; they are unenforced observations"
+                    )
+                )
             ),
-            Self::HeadMissing => write!(f, "head.json 없음. 잘라내기를 탐지할 수 없음"),
+            Self::HeadMissing => f.write_str(tr!(
+                "head.json 없음. 잘라내기를 탐지할 수 없음",
+                "head.json missing; truncation cannot be detected"
+            )),
         }
     }
 }

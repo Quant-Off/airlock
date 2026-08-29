@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use airlock_i18n::tr;
+
 use crate::baseline::{self, SelfProtectPaths};
 use crate::digest;
 use crate::dsl;
@@ -249,9 +251,16 @@ impl Policy {
         let reserved: Vec<(&str, &'static str)> = base
             .rules
             .iter()
-            .map(|r| (r.id.as_str(), "베이스라인"))
-            .chain(self_protect.iter().map(|r| (r.id.as_str(), "자기보호")))
-            .chain(std::iter::once((PLAINTEXT_FLOOR_ID, "평문 바닥")))
+            .map(|r| (r.id.as_str(), tr!("베이스라인", "baseline")))
+            .chain(
+                self_protect
+                    .iter()
+                    .map(|r| (r.id.as_str(), tr!("자기보호", "self-protect"))),
+            )
+            .chain(std::iter::once((
+                PLAINTEXT_FLOOR_ID,
+                tr!("평문 바닥", "plaintext floor"),
+            )))
             .collect();
 
         let mut seen: HashSet<&str> = HashSet::new();
@@ -676,9 +685,14 @@ fn quota_rule(
         action,
         pattern: format!("{host}:{port} [max_bytes_out={limit} used={used}] <- {origin}"),
         reason: Some(
-            "이 목적지로 누적 반출한 바이트가 max_bytes_out 을 넘음. 바이트 수는 연결이 끝나야 \
-             알 수 있으므로 한도를 넘긴 그 연결 자체는 막지 못했고 이번 연결부터 막힘"
-                .to_string(),
+            tr!(
+                "이 목적지로 누적 반출한 바이트가 max_bytes_out 을 넘음. 바이트 수는 연결이 끝나야 \
+             알 수 있으므로 한도를 넘긴 그 연결 자체는 막지 못했고 이번 연결부터 막힘",
+                "cumulative bytes sent to this destination exceeded max_bytes_out; byte counts \
+             are only known when a connection ends, so the connection that crossed the limit \
+             could not be blocked and blocking starts with this one"
+            )
+            .to_string(),
         ),
     }
 }
@@ -709,9 +723,13 @@ fn plaintext_floor_rule(
         action,
         pattern,
         reason: Some(
-            "평문 아웃바운드는 [defaults].egress_plaintext 가 정한 바닥을 넘지 못함. \
-             열려면 그 규칙에 protocol = \"http\" 를 명시할 것"
-                .to_string(),
+            tr!(
+                "평문 아웃바운드는 [defaults].egress_plaintext 가 정한 바닥을 넘지 못함. \
+             열려면 그 규칙에 protocol = \"http\" 를 명시할 것",
+                "plaintext outbound cannot pass the floor set by [defaults].egress_plaintext; \
+             to open it, state protocol = \"http\" on that rule"
+            )
+            .to_string(),
         ),
     }
 }
