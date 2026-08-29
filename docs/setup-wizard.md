@@ -9,13 +9,16 @@
 
 대화형 UI 의존성(cliclack, console, toml_edit)은 `airlock-setup`에만 둔다. 강제 층(`airlock-broker`)과 정책 엔진(`airlock-policy`)의 의존성 트리에는 UI 의존성이 절대 들어가지 않는다. TCB 경계를 `cargo tree`로 감사할 수 있게 유지하기 위함이다.
 
+이 경계 때문에 `airlock-i18n`에는 의존이 하나도 없다. 그 크레이트는 브로커와 정책 엔진이 모두 쓰므로 TOML 파서 하나만 들여도 UI 의존성이 TCB 트리로 새어 든다. 구성 파일에서 `locale` 키 하나만 읽고 쓰는 최소 스캐너를 직접 둔 이유다 ([i18n.md](i18n.md)).
+
 ## 흐름
 
-1. 시작 방식 선택 (claude-code / strict / developer 프리셋 또는 직접 설정)
-2. 작업 공간 경로 입력 (기본값 cwd, 절대 경로 또는 `~` 경로만 허용, 홈 전체면 경고)
-3. 출력 경로 결정 (기본 `./airlock.toml`, 기존 파일은 명시적 확인 없이 덮어쓰지 않음)
-4. 생성 후 `Policy::load_str`로 검증. 검증을 통과하기 전에는 파일을 쓰지 않는다
-5. 요약과 함께 바로 실행할 `airlock run` 명령을 안내
+1. 출력 언어 선택 (한국어 / English). 답하는 즉시 나머지 질문이 그 언어로 나가고 선택이 `~/.config/airlock/config.toml`에 저장된다 ([i18n.md](i18n.md)). 저장 실패는 경고로만 남는다
+2. 시작 방식 선택 (claude-code / strict / developer 프리셋 또는 직접 설정)
+3. 작업 공간 경로 입력 (기본값 cwd, 절대 경로 또는 `~` 경로만 허용, 홈 전체면 경고)
+4. 출력 경로 결정 (기본 `./airlock.toml`, 기존 파일은 명시적 확인 없이 덮어쓰지 않음)
+5. 생성 후 `Policy::load_str`로 검증. 검증을 통과하기 전에는 파일을 쓰지 않는다
+6. 요약과 함께 바로 실행할 `airlock run` 명령을 안내
 
 ### 직접 설정
 
@@ -31,6 +34,8 @@
 ## 프리셋
 
 `examples/policy/*.toml`이 원본이다. crates.io 패키징이 패키지 루트 밖 파일을 담지 못하므로 `crates/airlock-setup/presets/`에 사본을 두고, 두 벌이 어긋나면 테스트(`presets_stay_in_sync_with_examples`)가 실패한다.
+
+영문 프리셋은 `examples/policy/en/*.toml`이 원본이고 사본은 `presets/en/`이다. 주석만 다르고 정책 의미는 한국어판과 같아야 하며, 다이제스트 동등성 테스트(`en_presets_only_differ_in_comments`)가 이를 강제한다. 마법사는 선택된 로케일의 프리셋에서 출발한다 ([i18n.md](i18n.md)).
 
 프리셋의 주석은 단순 설명이 아니라 보안 근거(Seatbelt egress 한계 등)를 담고 있다. 그래서 생성은 serde 직렬화가 아니라 toml_edit 기반이다. 프리셋 원문에서 출발해 값만 바꾸므로 주석이 그대로 보존된다. 현재 치환 지점은 `id = "workspace"` 규칙의 `path` 하나다.
 

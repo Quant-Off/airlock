@@ -44,6 +44,8 @@ $ cp examples/policy/strict.toml airlock.toml
 
 The semantics of the policy system are written up in [policy-dsl.md](docs/policy-dsl.md).
 
+All human-facing output is available in Korean (default) and English. `airlock setup` asks for the language first and saves the choice to `~/.config/airlock/config.toml`; `AIRLOCK_LANG=en` overrides it per run. English preset variants live in `examples/policy/en/`. Details in [i18n.md](docs/i18n.md).
+
 Enforcing host level egress policy for real requires `--egress-proxy`. Without this flag, the host list in a policy is only a declaration of intent.
 
 ```bash
