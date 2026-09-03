@@ -1,5 +1,7 @@
 use std::fmt;
 
+use airlock_i18n::tr;
+
 #[derive(Debug)]
 pub enum SetupError {
     NoTty,
@@ -12,11 +14,39 @@ pub enum SetupError {
 impl fmt::Display for SetupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoTty => write!(f, "대화형 터미널(TTY)에서만 실행할 수 있음"),
-            Self::UnknownPreset(id) => write!(f, "알 수 없는 프리셋: {id}"),
-            Self::Io(e) => write!(f, "입출력 오류: {e}"),
-            Self::Toml(e) => write!(f, "프리셋 TOML 오류: {e}"),
-            Self::Policy(e) => write!(f, "정책 검증 실패: {e}"),
+            Self::NoTty => f.write_str(tr!(
+                "대화형 터미널(TTY)에서만 실행할 수 있음",
+                "can only run on an interactive terminal (TTY)"
+            )),
+            Self::UnknownPreset(id) => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("알 수 없는 프리셋: {id}"),
+                    format!("unknown preset: {id}")
+                )
+            ),
+            Self::Io(e) => write!(
+                f,
+                "{}",
+                tr!(format!("입출력 오류: {e}"), format!("I/O error: {e}"))
+            ),
+            Self::Toml(e) => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("프리셋 TOML 오류: {e}"),
+                    format!("preset TOML error: {e}")
+                )
+            ),
+            Self::Policy(e) => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("정책 검증 실패: {e}"),
+                    format!("policy validation failed: {e}")
+                )
+            ),
         }
     }
 }

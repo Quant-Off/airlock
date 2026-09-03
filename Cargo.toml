@@ -16,6 +16,7 @@ repository = "https://github.com/Quant-Off/airlock"
 airlock-audit = { path = "crates/airlock-audit", version = "0.1.0" }
 airlock-broker = { path = "crates/airlock-broker", version = "0.1.0" }
 airlock-canonical = { path = "crates/airlock-canonical", version = "0.1.0" }
+airlock-i18n = { path = "crates/airlock-i18n", version = "0.1.0" }
 airlock-policy = { path = "crates/airlock-policy", version = "0.1.0" }
 airlock-proxy = { path = "crates/airlock-proxy", version = "0.1.0" }
 airlock-setup = { path = "crates/airlock-setup", version = "0.1.0" }

@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use airlock_audit::Enforcement;
+use airlock_i18n::tr;
 use airlock_policy::glob::Pattern;
 use airlock_policy::rule::{Matcher, ProgramMatch};
 use airlock_policy::{Action, FileMode, Policy};
@@ -568,22 +569,44 @@ fn build_plan(policy: &Policy, opts: &ProfileOptions) -> Plan {
     let exec_trees = plan_exec_allow(policy, opts, &mut walker, &mut plan);
 
     for dir in walker.exhausted.iter().take(5) {
-        plan.gaps.push(format!(
-            "{} 아래는 검사 예산({WALK_BUDGET} 항목)을 넘겨 허용하지 않았음. 필요하면 작업 공간을 좁혀야 함",
-            dir.display()
+        plan.gaps.push(tr!(
+            format!(
+                "{} 아래는 검사 예산({WALK_BUDGET} 항목)을 넘겨 허용하지 않았음. 필요하면 작업 공간을 좁혀야 함",
+                dir.display()
+            ),
+            format!(
+                "everything under {} was left ungranted because the walk budget \
+                 ({WALK_BUDGET} entries) was exceeded; narrow the workspace if needed",
+                dir.display()
+            )
         ));
     }
     for dir in walker.unreadable.iter().take(5) {
-        plan.gaps.push(format!(
-            "{} 는 나열할 수 없어 하위를 검사하지 못했음. 통째로 허용하지 않았으므로 그 아래는 열리지 않음",
-            dir.display()
+        plan.gaps.push(tr!(
+            format!(
+                "{} 는 나열할 수 없어 하위를 검사하지 못했음. 통째로 허용하지 않았으므로 그 아래는 열리지 않음",
+                dir.display()
+            ),
+            format!(
+                "{} could not be listed, so its contents were not examined; it was not \
+                 granted wholesale, so nothing under it opens",
+                dir.display()
+            )
         ));
     }
     if walker.links > 0 {
-        plan.gaps.push(format!(
-            "심볼릭 링크 {}개를 허용 계획에서 제외했음. 규칙이 inode 에 걸리므로 \
-             링크가 가리키는 대상이 따로 허용되지 않으면 링크로도 열리지 않음",
-            walker.links
+        plan.gaps.push(tr!(
+            format!(
+                "심볼릭 링크 {}개를 허용 계획에서 제외했음. 규칙이 inode 에 걸리므로 \
+                 링크가 가리키는 대상이 따로 허용되지 않으면 링크로도 열리지 않음",
+                walker.links
+            ),
+            format!(
+                "{} symbolic links were left out of the grant plan; rules attach to \
+                 inodes, so unless a link's target is granted separately it does not \
+                 open through the link either",
+                walker.links
+            )
         ));
     }
 
@@ -629,39 +652,71 @@ fn exec_allow_targets(policy: &Policy, gaps: &mut Vec<String>) -> Vec<PathBuf> {
                 Matcher::Exec { program, .. } => match program {
                     Some(ProgramMatch::Path(pattern)) => match concrete_target(pattern) {
                         Some(p) => out.push(p),
-                        None => gaps.push(format!(
-                            "exec allow 규칙 {} 의 경로 패턴 {} 은 inode 규칙으로 옮길 수 없어 \
-                             실행 허용에 넣지 않았음. 이 규칙이 가리키는 프로그램은 커널이 거부함",
-                            rule.id,
-                            pattern.raw()
+                        None => gaps.push(tr!(
+                            format!(
+                                "exec allow 규칙 {} 의 경로 패턴 {} 은 inode 규칙으로 옮길 수 없어 \
+                                 실행 허용에 넣지 않았음. 이 규칙이 가리키는 프로그램은 커널이 거부함",
+                                rule.id,
+                                pattern.raw()
+                            ),
+                            format!(
+                                "exec allow rule {} has path pattern {} that cannot become an \
+                                 inode rule, so it was left out of the exec grants; the kernel \
+                                 refuses the program this rule points to",
+                                rule.id,
+                                pattern.raw()
+                            )
                         )),
                     },
                     Some(ProgramMatch::Basename(name)) => {
                         let found = profile::resolve_in_path(name);
                         if found.is_empty() {
-                            gaps.push(format!(
-                                "exec allow 규칙 {} 의 program = \"{name}\" 을 PATH 에서 찾지 \
-                                 못해 실행 허용에 넣지 않았음. 이 프로그램은 커널이 거부함",
-                                rule.id
+                            gaps.push(tr!(
+                                format!(
+                                    "exec allow 규칙 {} 의 program = \"{name}\" 을 PATH 에서 찾지 \
+                                     못해 실행 허용에 넣지 않았음. 이 프로그램은 커널이 거부함",
+                                    rule.id
+                                ),
+                                format!(
+                                    "exec allow rule {} has program = \"{name}\" which was not \
+                                     found in PATH, so it was left out of the exec grants; the \
+                                     kernel refuses this program",
+                                    rule.id
+                                )
                             ));
                         }
                         out.extend(found);
                     }
-                    None => gaps.push(format!(
-                        "exec allow 규칙 {} 에 프로그램 조건이 없어 실행 대상을 특정할 수 없음. \
-                         실행 허용에 넣지 않았음",
-                        rule.id
+                    None => gaps.push(tr!(
+                        format!(
+                            "exec allow 규칙 {} 에 프로그램 조건이 없어 실행 대상을 특정할 수 없음. \
+                             실행 허용에 넣지 않았음",
+                            rule.id
+                        ),
+                        format!(
+                            "exec allow rule {} has no program condition, so the exec target \
+                             cannot be pinned down; it was left out of the exec grants",
+                            rule.id
+                        )
                     )),
                 },
                 Matcher::File { paths, modes } if modes.contains(FileMode::Exec) => {
                     for pattern in paths {
                         match concrete_target(pattern) {
                             Some(p) => out.push(p),
-                            None => gaps.push(format!(
-                                "규칙 {} 의 경로 {} 는 exec 모드를 허용하지만 inode 규칙으로 \
-                                 옮길 수 없어 실행 허용에 넣지 않았음",
-                                rule.id,
-                                pattern.raw()
+                            None => gaps.push(tr!(
+                                format!(
+                                    "규칙 {} 의 경로 {} 는 exec 모드를 허용하지만 inode 규칙으로 \
+                                     옮길 수 없어 실행 허용에 넣지 않았음",
+                                    rule.id,
+                                    pattern.raw()
+                                ),
+                                format!(
+                                    "rule {} allows exec mode on path {}, but it cannot become \
+                                     an inode rule and was left out of the exec grants",
+                                    rule.id,
+                                    pattern.raw()
+                                )
                             )),
                         }
                     }
@@ -717,16 +772,27 @@ fn plan_exec_allow(
         .filter(|p| Path::new(p).exists())
         .collect();
     if !runtime.is_empty() {
-        plan.gaps.push(format!(
-            "동적 링커에 Execute 가 필요해 {} 를 실행 허용에 함께 넣었음. 그 아래의 실행 \
-             파일은 정책이 따로 허용하지 않아도 실행됨",
-            runtime.join(", ")
+        plan.gaps.push(tr!(
+            format!(
+                "동적 링커에 Execute 가 필요해 {} 를 실행 허용에 함께 넣었음. 그 아래의 실행 \
+                 파일은 정책이 따로 허용하지 않아도 실행됨",
+                runtime.join(", ")
+            ),
+            format!(
+                "the dynamic linker needs Execute, so {} were added to the exec grants; \
+                 executables under them run even without a separate policy allow",
+                runtime.join(", ")
+            )
         ));
     }
     plan.gaps.push(
-        "mmap(PROT_EXEC) 은 Landlock 이 매개하지 않음. 읽을 수 있는 파일을 실행 가능하게 \
-         매핑해 그 안으로 뛰는 경로는 화이트리스트 밖임"
-            .to_string(),
+        tr!(
+            "mmap(PROT_EXEC) 은 Landlock 이 매개하지 않음. 읽을 수 있는 파일을 실행 가능하게 \
+             매핑해 그 안으로 뛰는 경로는 화이트리스트 밖임",
+            "mmap(PROT_EXEC) is not mediated by Landlock; mapping a readable file as \
+             executable and jumping into it is outside the whitelist"
+        )
+        .to_string(),
     );
 
     trees
@@ -787,10 +853,18 @@ fn plan_exec_gap(policy: &Policy, trees: &[PathBuf], plan: &mut Plan) {
         }
         ids.sort_unstable();
         ids.dedup();
-        plan.gaps.push(format!(
-            "[defaults].exec = \"allow\" 라 exec 화이트리스트를 걸지 않았음. 읽을 수 있는 \
-             파일은 전부 실행할 수 있으며 아래 규칙은 중계 층이 관측할 뿐임: {}",
-            ids.join(", ")
+        plan.gaps.push(tr!(
+            format!(
+                "[defaults].exec = \"allow\" 라 exec 화이트리스트를 걸지 않았음. 읽을 수 있는 \
+                 파일은 전부 실행할 수 있으며 아래 규칙은 중계 층이 관측할 뿐임: {}",
+                ids.join(", ")
+            ),
+            format!(
+                "[defaults].exec = \"allow\", so no exec whitelist was applied; every \
+                 readable file can be executed, and the rules below are only observed by \
+                 the mediation layer: {}",
+                ids.join(", ")
+            )
         ));
         return;
     }
@@ -798,10 +872,18 @@ fn plan_exec_gap(policy: &Policy, trees: &[PathBuf], plan: &mut Plan) {
     argv_ids.sort_unstable();
     argv_ids.dedup();
     if !argv_ids.is_empty() {
-        plan.gaps.push(format!(
-            "argv 조건은 커널이 볼 수 없어 프로그램 경로 단위로만 강제됨. 아래 규칙의 \
-             argv 판정은 중계 층에만 있음: {}",
-            argv_ids.join(", ")
+        plan.gaps.push(tr!(
+            format!(
+                "argv 조건은 커널이 볼 수 없어 프로그램 경로 단위로만 강제됨. 아래 규칙의 \
+                 argv 판정은 중계 층에만 있음: {}",
+                argv_ids.join(", ")
+            ),
+            format!(
+                "argv conditions are invisible to the kernel, so enforcement is per \
+                 program path only; the argv decisions of these rules exist only in the \
+                 mediation layer: {}",
+                argv_ids.join(", ")
+            )
         ));
     }
 
@@ -819,11 +901,20 @@ fn plan_exec_gap(policy: &Policy, trees: &[PathBuf], plan: &mut Plan) {
     inside.sort_unstable();
     inside.dedup();
     let listed: Vec<String> = trees.iter().map(|t| t.display().to_string()).collect();
-    plan.gaps.push(format!(
-        "실행 허용이 트리로 걸린 곳({}) 안의 exec 제한 규칙은 커널에서 걸러지지 않음. \
-         Landlock 은 허용한 트리에서 일부만 빼는 것을 표현할 수 없음: {}",
-        listed.join(", "),
-        inside.join(", ")
+    plan.gaps.push(tr!(
+        format!(
+            "실행 허용이 트리로 걸린 곳({}) 안의 exec 제한 규칙은 커널에서 걸러지지 않음. \
+             Landlock 은 허용한 트리에서 일부만 빼는 것을 표현할 수 없음: {}",
+            listed.join(", "),
+            inside.join(", ")
+        ),
+        format!(
+            "exec restriction rules inside tree-granted exec roots ({}) are not filtered \
+             by the kernel; Landlock cannot express carving a part out of a granted \
+             tree: {}",
+            listed.join(", "),
+            inside.join(", ")
+        )
     ));
 }
 
@@ -869,9 +960,14 @@ fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
         // 연결하는 것을 막지 못하므로, 이 백엔드만으로는 프록시가 유일한 출구가
         // 되지 않습니다. netns 로 자식의 경로 자체를 끊는 것이 다음 단계입니다
         plan.gaps.push(
-            "egress 프록시가 켜졌으나 Landlock 은 포트까지만 강제함. 자식이 같은 포트로 \
-             다른 호스트에 직접 연결하면 프록시를 건너뜀. network namespace 격리가 필요함"
-                .to_string(),
+            tr!(
+                "egress 프록시가 켜졌으나 Landlock 은 포트까지만 강제함. 자식이 같은 포트로 \
+                 다른 호스트에 직접 연결하면 프록시를 건너뜀. network namespace 격리가 필요함",
+                "the egress proxy is on, but Landlock only enforces down to the port; a \
+                 child connecting directly to another host on the same port bypasses the \
+                 proxy; network namespace isolation is needed"
+            )
+            .to_string(),
         );
         return;
     }
@@ -925,33 +1021,60 @@ fn plan_network(policy: &Policy, opts: &ProfileOptions, plan: &mut Plan) {
         // 포트를 적지 않은 allow 가 하나라도 있으면 TCP 제한 자체를 걸지 않습니다.
         // 이때 "포트까지는 강제한다"고 알리면 사실과 정반대가 됩니다
         plan.gaps.push(
-            "포트를 특정하지 않은 egress allow 규칙이 있어 아웃바운드를 통째로 열었음. \
-             포트 제한도 걸리지 않으므로 규칙마다 port 를 적어야 함"
-                .to_string(),
+            tr!(
+                "포트를 특정하지 않은 egress allow 규칙이 있어 아웃바운드를 통째로 열었음. \
+                 포트 제한도 걸리지 않으므로 규칙마다 port 를 적어야 함",
+                "an egress allow rule without a specific port opened outbound entirely; \
+                 not even port limits apply, so every rule should state a port"
+            )
+            .to_string(),
         );
     }
 
     if !host_scoped.is_empty() && !plan.unrestricted_net {
-        plan.gaps.push(format!(
-            "호스트 단위 egress 규칙은 Landlock으로 강제되지 않음. 포트까지만 강제하며 \
-             호스트 판정은 프록시 층이 필요함: {}",
-            host_scoped.join(", ")
+        plan.gaps.push(tr!(
+            format!(
+                "호스트 단위 egress 규칙은 Landlock으로 강제되지 않음. 포트까지만 강제하며 \
+                 호스트 판정은 프록시 층이 필요함: {}",
+                host_scoped.join(", ")
+            ),
+            format!(
+                "per-host egress rules are not enforced by Landlock; enforcement stops at \
+                 the port, and host decisions need the proxy layer: {}",
+                host_scoped.join(", ")
+            )
         ));
     }
 
     if !protocol_scoped.is_empty() {
-        plan.gaps.push(format!(
-            "protocol 조건이 붙은 egress allow 규칙의 포트가 커널에서는 조건 없이 열림. \
-             Landlock 은 프로토콜을 보지 못하므로 규칙보다 넓게 걸림: {}",
-            protocol_scoped.join(", ")
+        plan.gaps.push(tr!(
+            format!(
+                "protocol 조건이 붙은 egress allow 규칙의 포트가 커널에서는 조건 없이 열림. \
+                 Landlock 은 프로토콜을 보지 못하므로 규칙보다 넓게 걸림: {}",
+                protocol_scoped.join(", ")
+            ),
+            format!(
+                "ports from egress allow rules with a protocol condition open \
+                 unconditionally in the kernel; Landlock cannot see the protocol, so the \
+                 grant is wider than the rule: {}",
+                protocol_scoped.join(", ")
+            )
         ));
     }
 
     if !quota_scoped.is_empty() {
-        plan.gaps.push(format!(
-            "max_bytes_out 은 커널이 강제하지 않음. 반출 바이트는 프록시 층만 세고, 한도를 \
-             넘긴 그 연결 자체는 막지 못하며 다음 연결부터 막힘: {}",
-            quota_scoped.join(", ")
+        plan.gaps.push(tr!(
+            format!(
+                "max_bytes_out 은 커널이 강제하지 않음. 반출 바이트는 프록시 층만 세고, 한도를 \
+                 넘긴 그 연결 자체는 막지 못하며 다음 연결부터 막힘: {}",
+                quota_scoped.join(", ")
+            ),
+            format!(
+                "max_bytes_out is not kernel-enforced; only the proxy layer counts \
+                 outbound bytes, the connection that crosses the limit is not itself \
+                 blocked, and blocking starts from the next connection: {}",
+                quota_scoped.join(", ")
+            )
         ));
     }
 }
@@ -1069,10 +1192,13 @@ fn open_rule_target(target: &PlanPath) -> Option<OwnedFd> {
 /// `pre_exec` 문맥에서 부르므로 할당 없이 정적 바이트열만 fd 2로 씁니다.
 /// `write`는 async-signal-safe 하며 실패는 무시합니다
 fn warn_partial() {
-    const MSG: &str =
-        "airlock: 경고 커널이 Landlock 규칙을 부분만 적용했음. 일부 접근 종류가 강제되지 않음\n";
+    let msg: &'static str = tr!(
+        "airlock: 경고 커널이 Landlock 규칙을 부분만 적용했음. 일부 접근 종류가 강제되지 않음\n",
+        "airlock: warning: the kernel applied the Landlock rules only partially; some \
+         access kinds are not enforced\n"
+    );
     unsafe {
-        libc::write(2, MSG.as_ptr().cast(), MSG.len());
+        libc::write(2, msg.as_ptr().cast(), msg.len());
     }
 }
 
@@ -1146,11 +1272,20 @@ impl Enforcer for LandlockEnforcer {
 
     fn describe(&self) -> String {
         match self.abi {
-            ABI::Unsupported => "landlock (커널 미지원)".to_string(),
-            abi => format!(
-                "landlock (ABI v{}, 규칙 {}개)",
-                abi as u32,
-                self.rule_count()
+            ABI::Unsupported => {
+                tr!("landlock (커널 미지원)", "landlock (kernel unsupported)").to_string()
+            }
+            abi => tr!(
+                format!(
+                    "landlock (ABI v{}, 규칙 {}개)",
+                    abi as u32,
+                    self.rule_count()
+                ),
+                format!(
+                    "landlock (ABI v{}, {} rules)",
+                    abi as u32,
+                    self.rule_count()
+                )
             ),
         }
     }
@@ -1163,7 +1298,11 @@ impl Enforcer for LandlockEnforcer {
         if self.abi == ABI::Unsupported {
             return Err(BrokerError::EnforcerUnavailable {
                 name: "landlock",
-                why: "커널이 Landlock을 지원하지 않음. Linux 5.13 이상이 필요함".to_string(),
+                why: tr!(
+                    "커널이 Landlock을 지원하지 않음. Linux 5.13 이상이 필요함",
+                    "the kernel does not support Landlock; Linux 5.13 or later is required"
+                )
+                .to_string(),
             });
         }
         let plan = build_plan(policy, &self.options);
@@ -1176,7 +1315,11 @@ impl Enforcer for LandlockEnforcer {
         let Some(mut plan) = self.plan.clone() else {
             return Err(BrokerError::EnforcerUnavailable {
                 name: "landlock",
-                why: "prepare가 먼저 호출되지 않았음".to_string(),
+                why: tr!(
+                    "prepare가 먼저 호출되지 않았음",
+                    "prepare was not called first"
+                )
+                .to_string(),
             });
         };
         // 최상위 프로그램은 언제나 실행 허용에 들어가야 합니다. 빠지면 커널이 첫
@@ -1191,10 +1334,16 @@ impl Enforcer for LandlockEnforcer {
             if plan.exec_paths.is_empty() {
                 return Err(BrokerError::EnforcerUnavailable {
                     name: "landlock",
-                    why: "[defaults].exec 이 allow 가 아니어서 exec 을 화이트리스트로 거는데 \
-                          실행 허용 경로가 하나도 없음. 최상위 프로그램을 해소하지 못했거나 \
-                          정책에 exec allow 규칙이 없음. 이대로 걸면 프로세스가 뜨지 못함"
-                        .to_string(),
+                    why: tr!(
+                        "[defaults].exec 이 allow 가 아니어서 exec 을 화이트리스트로 거는데 \
+                         실행 허용 경로가 하나도 없음. 최상위 프로그램을 해소하지 못했거나 \
+                         정책에 exec allow 규칙이 없음. 이대로 걸면 프로세스가 뜨지 못함",
+                        "[defaults].exec is not allow, so exec is whitelisted, but there is \
+                         not a single exec-granted path; the top-level program could not be \
+                         resolved, or the policy has no exec allow rules; applying this \
+                         would keep the process from starting"
+                    )
+                    .to_string(),
                 });
             }
         }
@@ -1210,9 +1359,10 @@ impl Enforcer for LandlockEnforcer {
             cmd.pre_exec(move || {
                 let status = apply(&plan, abi)?;
                 if status == RulesetStatus::NotEnforced {
-                    return Err(std::io::Error::other(
+                    return Err(std::io::Error::other(tr!(
                         "Landlock 규칙이 적용되지 않았음. 강제 없이 실행하지 않음",
-                    ));
+                        "Landlock rules were not applied; refusing to run without enforcement"
+                    )));
                 }
                 if status != RulesetStatus::FullyEnforced {
                     warn_partial();
@@ -1225,21 +1375,41 @@ impl Enforcer for LandlockEnforcer {
 
     fn gaps(&self) -> Vec<String> {
         let mut gaps = vec![
-            "ask 규칙은 커널에서 표현할 수 없으므로 Landlock 계획에서 deny로 내려감".to_string(),
-            "Landlock이 커널에서 거부한 접근 자체는 감사 로그에 남지 않음. \
-             체인에는 중계 층이 관측한 것만 기록됨"
-                .to_string(),
+            tr!(
+                "ask 규칙은 커널에서 표현할 수 없으므로 Landlock 계획에서 deny로 내려감",
+                "ask rules cannot be expressed in the kernel, so the Landlock plan \
+                 degrades them to deny"
+            )
+            .to_string(),
+            tr!(
+                "Landlock이 커널에서 거부한 접근 자체는 감사 로그에 남지 않음. \
+                 체인에는 중계 층이 관측한 것만 기록됨",
+                "accesses Landlock refused in the kernel are themselves absent from the \
+                 audit log; the chain records only what the mediation layer observed"
+            )
+            .to_string(),
         ];
         if self.abi < ABI::V4 {
-            gaps.push(format!(
-                "ABI v{}는 TCP 포트 규칙을 지원하지 않음(v4 필요). 아웃바운드가 강제되지 않음",
-                self.abi as u32
+            gaps.push(tr!(
+                format!(
+                    "ABI v{}는 TCP 포트 규칙을 지원하지 않음(v4 필요). 아웃바운드가 강제되지 않음",
+                    self.abi as u32
+                ),
+                format!(
+                    "ABI v{} does not support TCP port rules (v4 required); outbound is \
+                     not enforced",
+                    self.abi as u32
+                )
             ));
         }
         gaps.push(
-            "UDP는 Landlock ABI v10부터이며 크레이트가 아직 노출하지 않음. \
-             UDP 아웃바운드는 강제되지 않음"
-                .to_string(),
+            tr!(
+                "UDP는 Landlock ABI v10부터이며 크레이트가 아직 노출하지 않음. \
+                 UDP 아웃바운드는 강제되지 않음",
+                "UDP arrives with Landlock ABI v10 and the crate does not expose it yet; \
+                 UDP outbound is not enforced"
+            )
+            .to_string(),
         );
         gaps.extend(self.gaps.iter().cloned());
         gaps

@@ -1,3 +1,5 @@
+use airlock_i18n::tr;
+
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 pub fn encode(bytes: &[u8]) -> String {
@@ -19,11 +21,20 @@ pub enum HexError {
 impl core::fmt::Display for HexError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::OddLength => write!(f, "hex 문자열 길이가 홀수"),
-            Self::BadDigit => write!(f, "hex가 아닌 문자 포함"),
-            Self::WrongLength { expected, got } => {
-                write!(f, "hex 길이 불일치: {expected}바이트 기대, {got}바이트")
+            Self::OddLength => {
+                f.write_str(tr!("hex 문자열 길이가 홀수", "hex string has odd length"))
             }
+            Self::BadDigit => {
+                f.write_str(tr!("hex가 아닌 문자 포함", "contains a non-hex character"))
+            }
+            Self::WrongLength { expected, got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("hex 길이 불일치: {expected}바이트 기대, {got}바이트"),
+                    format!("hex length mismatch: expected {expected} bytes, got {got}")
+                )
+            ),
         }
     }
 }

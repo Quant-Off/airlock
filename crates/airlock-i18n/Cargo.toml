@@ -1,0 +1,15 @@
+[package]
+name = "airlock-i18n"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "airlock 출력 로케일 결정과 메시지 선택"
+
+# 의존이 없습니다. 이 크레이트는 브로커와 정책 엔진의 의존성 트리에 들어가므로
+# UI 의존성이나 파서를 끌어오면 TCB 경계가 넓어집니다 (docs/setup-wizard.md)
+[dependencies]
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@
 ## 가이드
 
 - [setup-wizard.md](setup-wizard.md) 대화형 설정 마법사 `airlock setup`의 구조와 흐름
+- [i18n.md](i18n.md) 출력 로케일 (한국어·영문), 결정 순서와 다이제스트 결합
 
 ## 규격
 

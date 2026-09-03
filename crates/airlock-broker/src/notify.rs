@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use airlock_audit::Protocol;
+use airlock_i18n::tr;
 use airlock_policy::FileMode;
 
 use crate::session::{Actor, Session};
@@ -282,7 +283,12 @@ unsafe fn install_filter(prog: &[SockFilter]) -> std::io::Result<RawFd> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    RawFd::try_from(fd).map_err(|_| std::io::Error::other("listener fd가 범위를 벗어남"))
+    RawFd::try_from(fd).map_err(|_| {
+        std::io::Error::other(tr!(
+            "listener fd가 범위를 벗어남",
+            "listener fd out of range"
+        ))
+    })
 }
 
 /// SCM_RIGHTS로 fd 하나를 보냅니다.
@@ -307,7 +313,10 @@ unsafe fn send_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
         if cmsg.is_null() {
-            return Err(std::io::Error::other("cmsg 헤더를 만들 수 없음"));
+            return Err(std::io::Error::other(tr!(
+                "cmsg 헤더를 만들 수 없음",
+                "cannot build the cmsg header"
+            )));
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -349,12 +358,18 @@ unsafe fn recv_fd(sock: RawFd) -> std::io::Result<OwnedFd> {
             || (*cmsg).cmsg_level != libc::SOL_SOCKET
             || (*cmsg).cmsg_type != libc::SCM_RIGHTS
         {
-            return Err(std::io::Error::other("listener fd를 받지 못함"));
+            return Err(std::io::Error::other(tr!(
+                "listener fd를 받지 못함",
+                "did not receive the listener fd"
+            )));
         }
         let mut fd: RawFd = -1;
         std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg).cast::<RawFd>(), &raw mut fd, 1);
         if fd < 0 {
-            return Err(std::io::Error::other("받은 fd가 유효하지 않음"));
+            return Err(std::io::Error::other(tr!(
+                "받은 fd가 유효하지 않음",
+                "the received fd is not valid"
+            )));
         }
         Ok(OwnedFd::from_raw_fd(fd))
     }
@@ -683,8 +698,19 @@ const MAX_ARGV: usize = 256;
 ///
 /// 감사 로그는 "관측된 사실"을 주장하므로, 부분값을 전부인 것처럼 남길 수 없습니다.
 /// 정책 평가도 이 잘린 목록으로 이루어졌음을 사후에 알 수 있어야 합니다
-const ARGV_TRUNCATED: &str = "…airlock: argv가 상한에서 잘림";
-const ARGV_UNREADABLE: &str = "…airlock: argv 원소를 읽지 못해 여기서 멈춤";
+fn argv_truncated() -> &'static str {
+    tr!(
+        "…airlock: argv가 상한에서 잘림",
+        "…airlock: argv truncated at the limit"
+    )
+}
+
+fn argv_unreadable() -> &'static str {
+    tr!(
+        "…airlock: argv 원소를 읽지 못해 여기서 멈춤",
+        "…airlock: stopped here because an argv element could not be read"
+    )
+}
 
 fn read_argv(pid: u32, addr: u64) -> Vec<String> {
     let mut out = Vec::new();
@@ -705,7 +731,7 @@ fn read_argv(pid: u32, addr: u64) -> Vec<String> {
         // 포인터 배열을 한 칸씩 읽습니다. 실패하면 거기서 멈춥니다
         let n = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
         if n != 8 {
-            out.push(ARGV_UNREADABLE.to_string());
+            out.push(argv_unreadable().to_string());
             break;
         }
         if slot == 0 {
@@ -714,13 +740,13 @@ fn read_argv(pid: u32, addr: u64) -> Vec<String> {
         match read_cstr(pid, slot) {
             Some(s) => out.push(s.to_string_lossy().into_owned()),
             None => {
-                out.push(ARGV_UNREADABLE.to_string());
+                out.push(argv_unreadable().to_string());
                 break;
             }
         }
     }
     if out.len() >= MAX_ARGV {
-        out.push(ARGV_TRUNCATED.to_string());
+        out.push(argv_truncated().to_string());
     }
     out
 }
@@ -736,11 +762,18 @@ pub struct NotifyChannel {
 impl NotifyChannel {
     pub fn new(level: Level) -> std::io::Result<Self> {
         if level == Level::Off {
-            return Err(std::io::Error::other("중계가 꺼져 있음"));
+            return Err(std::io::Error::other(tr!(
+                "중계가 꺼져 있음",
+                "mediation is off"
+            )));
         }
         // 필터를 fork 전에 만들어 둡니다. 자식의 pre_exec 문맥에서는 새로 할당하지 않습니다
         let prog = build_filter(level).ok_or_else(|| {
-            std::io::Error::other("이 아키텍처의 seccomp arch 값을 모름. 중계 필터를 만들 수 없음")
+            std::io::Error::other(tr!(
+                "이 아키텍처의 seccomp arch 값을 모름. 중계 필터를 만들 수 없음",
+                "the seccomp arch value for this architecture is unknown; cannot build \
+                 the mediation filter"
+            ))
         })?;
         let mut fds = [0 as RawFd; 2];
         // # Safety

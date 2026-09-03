@@ -44,6 +44,8 @@ $ cp examples/policy/strict.toml airlock.toml
 
 정책 시스템에 관한 의미론적 문서를 [policy-dsl.md](docs/policy-dsl.md)에 정리해 두었습니다.
 
+모든 사람용 출력은 한국어(기본)와 영문을 지원합니다. `airlock setup`의 첫 질문이 언어 선택이며 선택은 `~/.config/airlock/config.toml`에 저장됩니다. 일회성 전환은 `AIRLOCK_LANG=en`으로 합니다. 영문 프리셋은 `examples/policy/en/`에 있습니다. 자세한 내용은 [i18n.md](docs/i18n.md)를 참고하세요.
+
 호스트 단위 egress 정책을 실제로 강제하려면 `--egress-proxy`가 필요합니다. 이 플래그가 없으면 정책의 호스트 목록은 의도 선언에 그칩니다.
 
 ```bash

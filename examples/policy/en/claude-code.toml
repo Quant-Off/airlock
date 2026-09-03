@@ -1,0 +1,221 @@
+# A policy for running Claude Code under airlock.
+#
+#   airlock run --policy examples/policy/claude-code.toml --workspace ~/work/myproj -- claude
+#
+# The built-in baseline has no egress allow rules at all. So if you run
+# airlock run -- claude without a policy file, outbound is shut down entirely, and
+# Claude Code cannot even find api.anthropic.com over DNS and dies with
+# ENOTFOUND. This file writes down the minimal set that must be opened then.
+#
+# Watch out! macOS Seatbelt cannot express host-level egress. If even one egress
+# allow exists below, the kernel profile opens outbound entirely. That is, this
+# host list is a declaration of intent at the policy layer, not an enforced boundary
+# on macOS. Linux Landlock also enforces only down to the port. Real host enforcement
+# only appears once the egress proxy layer lands (docs/design.md 10.1). airlock
+# exposes this fact as-is in the banner's limitations list.
+
+version = 1
+name = "claude-code"
+
+[defaults]
+file = "deny"
+exec = "allow"
+egress = "deny" # allow is forbidden at the grammar level
+# Same as the default, but stated explicitly. A preset is a document that shows the spec to humans.
+# The egress allow rules below are all 443 and state no protocol. A protocol condition only
+# gains meaning with an egress proxy layer attached; in a session without one the rule is dead entirely.
+egress_plaintext = "deny"
+
+# Even though the exec default is allow, the baseline's risky exec ask rules stay
+# alive. Because this opens via [defaults] (tier 4), not a user rule (tier 2),
+# tier 3 ask rules such as sudo, rm -rf, and curl pipe shell match first.
+
+#
+# Workspace
+#
+# Replace this path with your actual project and pass the same path to --workspace.
+# The --workspace flag opens the kernel profile's write window; the rule below is the policy layer's verdict.
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "~/work/**"
+action = "allow"
+
+#
+# Toolchain read
+#
+# The compilers and CLIs the agent invokes live here. Writing is not opened.
+# /etc/** is deliberately left out. It would put a user rule in the position of
+# touching /etc/shadow and /etc/sudoers, which the baseline catches as forbid.
+[[rules]]
+id = "toolchain-read"
+kind = "file"
+path = ["/usr/**", "/bin/**", "/sbin/**", "/opt/homebrew/**", "/System/**", "/Library/**"]
+mode = ["read", "metadata", "exec"]
+action = "allow"
+
+#
+# Claude Code installation
+#
+# This assumes a native install. For a global npm install, enter that path instead.
+[[rules]]
+id = "claude-install"
+kind = "file"
+path = ["~/.local/share/claude/**", "~/.local/bin/**"]
+mode = ["read", "metadata", "exec"]
+action = "allow"
+
+#
+# Claude Code state
+#
+# Sessions, history, settings, and shell snapshots all live here, so writing is needed.
+# ~/.claude.json holds the MCP server list and project state.
+[[rules]]
+id = "claude-state"
+kind = "file"
+path = ["~/.claude/**", "~/.claude.json*"]
+action = "allow"
+
+#
+# Build caches
+#
+# Without these, cargo and npm fail every time.
+[[rules]]
+id = "build-cache"
+kind = "file"
+path = ["~/.cargo/registry/**", "~/.cargo/git/**", "~/.rustup/**", "~/.npm/_cacache/**"]
+action = "allow"
+
+#
+# Temporary files
+#
+# On macOS, /tmp is a symbolic link to /private/tmp. The policy evaluates both
+# the requested path and the resolved path (docs/policy-dsl.md 4.1), so both are listed.
+[[rules]]
+id = "temp-files"
+kind = "file"
+path = ["/tmp/**", "/private/tmp/**", "/private/var/folders/**"]
+action = "allow"
+
+#
+# Login credentials
+#
+# Claude Code puts its OAuth token in the "Claude Code-credentials" entry of the
+# macOS keychain. Without this rule the process starts but stalls at 'Not logged in'.
+#
+# Warning! A path-based policy cannot express "only that one entry". That is, this
+# rule lets the agent read the entire login keychain. securityd's ACLs judge each
+# entry's actual access again, but the boundary airlock provides stops at the file level.
+#
+# The data protection keychain (~/Library/Keychains/<UUID>/) is deliberately left
+# out. iCloud and Safari credentials live there and Claude Code does not use it.
+#
+# If you pass ANTHROPIC_API_KEY as an environment variable, there is no need to open
+# the keychain at all. For an agent running inside a sandbox, that is the better choice.
+[[rules]]
+id = "keychain-login-ro"
+kind = "file"
+path = "~/Library/Keychains/login.keychain-db"
+mode = ["read", "metadata"]
+action = "allow"
+
+#
+# Anthropic endpoints
+#
+# Up to here is the minimum Claude Code needs to start, log in, and converse.
+[[rules]]
+id = "anthropic-api"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "claude-code-service"
+kind = "egress"
+host = "code.claude.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "claude-platform"
+kind = "egress"
+host = "platform.claude.com"
+port = 443
+action = "allow"
+
+# OAuth login flow
+[[rules]]
+id = "claude-login"
+kind = "egress"
+host = "claude.ai"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "anthropic-console-login"
+kind = "egress"
+host = "console.anthropic.com"
+port = 443
+action = "allow"
+
+# Auto updates.
+# If autoUpdates is turned off, this is not really needed.
+[[rules]]
+id = "claude-downloads"
+kind = "egress"
+host = "downloads.claude.ai"
+port = 443
+action = "allow"
+
+#
+# Development tool endpoints
+#
+# Needed only when you have the agent run git and install packages. Delete these if unused.
+# *.githubusercontent.com matches only subdomains, never the apex
+# (docs/policy-dsl.md section 8). raw and objects are what get filtered here.
+[[rules]]
+id = "github-web"
+kind = "egress"
+host = "github.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "github-api"
+kind = "egress"
+host = "api.github.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "github-content"
+kind = "egress"
+host = "*.githubusercontent.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "npm-registry"
+kind = "egress"
+host = "registry.npmjs.org"
+port = 443
+action = "allow"
+
+#
+# Disabled entries
+#
+# ~/.config/gh/hosts.yml holds a GitHub token in plaintext. Allowing reads makes the
+# gh CLI work, but that token immediately becomes an exfiltratable credential. If you
+# need it, use the rules below, but enable them only after understanding exactly what they mean.
+#
+# [[rules]]
+# id = "gh-token"
+# kind = "file"
+# path = "~/.config/gh/**"
+# mode = ["read", "metadata"]
+# action = "allow"
+#
+# ~/.ssh and ~/.aws are baseline forbid, so they cannot be opened here. If you
+# really need them, you must name those rule ids in overrides and write a reason
+# (docs/policy-dsl.md 3.2). For git push, HTTPS is a better choice than SSH.

@@ -8,6 +8,7 @@ repository.workspace = true
 description = "airlock 정책 파일을 만드는 대화형 마법사"
 
 [dependencies]
+airlock-i18n.workspace = true
 airlock-policy.workspace = true
 cliclack.workspace = true
 console.workspace = true

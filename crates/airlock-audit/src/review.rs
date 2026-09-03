@@ -33,6 +33,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use airlock_canonical::Encoder;
+use airlock_i18n::tr;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
@@ -79,8 +80,8 @@ impl Verdict {
     /// 사람이 읽는 한국어 표기.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Clean => "정상",
-            Self::Anomalous => "이상",
+            Self::Clean => tr!("정상", "clean"),
+            Self::Anomalous => tr!("이상", "anomalous"),
         }
     }
 }
@@ -425,47 +426,122 @@ impl fmt::Display for ReviewFailure {
         match self {
             Self::FileAbsent => write!(
                 f,
-                "{REVIEW_FILE} 없음. 매일 이상여부 점검과 책임자 확인 기록이 없음"
+                "{}",
+                tr!(
+                    format!("{REVIEW_FILE} 없음. 매일 이상여부 점검과 책임자 확인 기록이 없음"),
+                    format!(
+                        "{REVIEW_FILE} missing; there is no record of daily anomaly checks and responsible-person sign-off"
+                    )
+                )
             ),
-            Self::ChainEmpty => write!(f, "확인 체인이 비어 있음"),
-            Self::MalformedLine { line, detail } => {
-                write!(f, "확인 {line}번째 줄 파싱 실패: {detail}")
+            Self::ChainEmpty => {
+                f.write_str(tr!("확인 체인이 비어 있음", "the review chain is empty"))
             }
-            Self::TruncatedFinalLine { line } => {
-                write!(f, "확인 {line}번째 줄이 개행 없이 잘림. 쓰기 중 중단 의심")
-            }
+            Self::MalformedLine { line, detail } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("확인 {line}번째 줄 파싱 실패: {detail}"),
+                    format!("failed to parse review line {line}: {detail}")
+                )
+            ),
+            Self::TruncatedFinalLine { line } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("확인 {line}번째 줄이 개행 없이 잘림. 쓰기 중 중단 의심"),
+                    format!(
+                        "review line {line} is truncated without a newline; suspected interruption mid-write"
+                    )
+                )
+            ),
             Self::BlankLine { line } => write!(
                 f,
-                "확인 {line}번째 줄이 비어 있음. 확인 줄이 아닌 줄이 끼어들었음"
+                "{}",
+                tr!(
+                    format!("확인 {line}번째 줄이 비어 있음. 확인 줄이 아닌 줄이 끼어들었음"),
+                    format!("review line {line} is blank; a non-review line crept in")
+                )
             ),
             Self::FormatVersionUnsupported { seq, got } => write!(
                 f,
-                "확인 seq {seq}의 포맷이 v{got}. 이 검증자는 v{REVIEW_VERSION}만 안다"
+                "{}",
+                tr!(
+                    format!("확인 seq {seq}의 포맷이 v{got}. 이 검증자는 v{REVIEW_VERSION}만 안다"),
+                    format!(
+                        "review seq {seq} has format v{got}; this verifier only knows v{REVIEW_VERSION}"
+                    )
+                )
             ),
-            Self::GenesisPrevNotZero { got } => {
-                write!(f, "첫 확인 줄의 prev가 0이 아님: {got}")
-            }
+            Self::GenesisPrevNotZero { got } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("첫 확인 줄의 prev가 0이 아님: {got}"),
+                    format!("the first review line's prev is not zero: {got}")
+                )
+            ),
             Self::SeqGap { expected, got } => write!(
                 f,
-                "확인 seq 빈틈. {expected} 기대, {got} 발견. 확인 줄 삭제 의심"
+                "{}",
+                tr!(
+                    format!("확인 seq 빈틈. {expected} 기대, {got} 발견. 확인 줄 삭제 의심"),
+                    format!(
+                        "review seq gap; expected {expected}, found {got}. Suspected review line deletion"
+                    )
+                )
             ),
             Self::PrevMismatch { seq, expected, got } => write!(
                 f,
-                "확인 seq {seq}의 prev 불일치. {expected} 기대, {got} 발견. 삭제·삽입·재배치 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "확인 seq {seq}의 prev 불일치. {expected} 기대, {got} 발견. 삭제·삽입·재배치 의심"
+                    ),
+                    format!(
+                        "review seq {seq} prev mismatch; expected {expected}, found {got}. Suspected deletion, insertion, or reordering"
+                    )
+                )
             ),
             Self::HashMismatch { seq, expected, got } => write!(
                 f,
-                "확인 seq {seq}의 hash 불일치. 재계산 {expected}, 기록 {got}. 내용 변조 의심"
+                "{}",
+                tr!(
+                    format!(
+                        "확인 seq {seq}의 hash 불일치. 재계산 {expected}, 기록 {got}. 내용 변조 의심"
+                    ),
+                    format!(
+                        "review seq {seq} hash mismatch; recomputed {expected}, recorded {got}. Suspected content tampering"
+                    )
+                )
             ),
             Self::ScopeMismatch { seq } => write!(
                 f,
-                "확인 seq {seq}의 범위가 지금 계산한 리포트의 범위와 다름. \
+                "{}",
+                tr!(
+                    format!(
+                        "확인 seq {seq}의 범위가 지금 계산한 리포트의 범위와 다름. \
                  보지 않은 범위에 찍힌 도장임"
+                    ),
+                    format!(
+                        "the scope of review seq {seq} differs from the scope of the report \
+                 computed now; it is a stamp on a range never looked at"
+                    )
+                )
             ),
             Self::DigestMismatch { seq, expected, got } => write!(
                 f,
-                "확인 seq {seq}의 리포트 다이제스트 불일치. 재계산 {expected}, 기록 {got}. \
+                "{}",
+                tr!(
+                    format!(
+                        "확인 seq {seq}의 리포트 다이제스트 불일치. 재계산 {expected}, 기록 {got}. \
                  확인한 리포트와 지금 리포트가 다름"
+                    ),
+                    format!(
+                        "review seq {seq} report digest mismatch; recomputed {expected}, recorded \
+                 {got}. The reviewed report and the current report differ"
+                    )
+                )
             ),
             Self::Io(e) => write!(f, "{e}"),
         }
@@ -492,11 +568,27 @@ impl fmt::Display for ReviewWarning {
         match self {
             Self::ClockWentBackwards { seq, prev_ts, ts } => write!(
                 f,
-                "확인 seq {seq}에서 벽시계가 역행 ({prev_ts} -> {ts}). 시각 조정 가능성"
+                "{}",
+                tr!(
+                    format!(
+                        "확인 seq {seq}에서 벽시계가 역행 ({prev_ts} -> {ts}). 시각 조정 가능성"
+                    ),
+                    format!(
+                        "wall clock went backwards at review seq {seq} ({prev_ts} -> {ts}); possible clock adjustment"
+                    )
+                )
             ),
             Self::TerminalNotObserved { seq } => write!(
                 f,
-                "확인 seq {seq}에 터미널이 관측되지 않음. 사람이 앉아 있었다는 근거는 아님"
+                "{}",
+                tr!(
+                    format!(
+                        "확인 seq {seq}에 터미널이 관측되지 않음. 사람이 앉아 있었다는 근거는 아님"
+                    ),
+                    format!(
+                        "no terminal observed at review seq {seq}; this is not evidence that a person was present"
+                    )
+                )
             ),
         }
     }

@@ -1,6 +1,8 @@
 use std::fmt;
 use std::net::IpAddr;
 
+use airlock_i18n::tr;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostError {
     Empty,
@@ -12,15 +14,36 @@ pub enum HostError {
 impl fmt::Display for HostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => write!(f, "빈 호스트 패턴"),
+            Self::Empty => f.write_str(tr!("빈 호스트 패턴", "empty host pattern")),
             Self::NonAscii(h) => write!(
                 f,
-                "`{h}`는 비ASCII 호스트임. v1은 IDN punycode 변환을 하지 않으므로 punycode로 직접 적어야 함"
+                "{}",
+                tr!(
+                    format!(
+                        "`{h}`는 비ASCII 호스트임. v1은 IDN punycode 변환을 하지 않으므로 punycode로 직접 적어야 함"
+                    ),
+                    format!(
+                        "`{h}` is a non-ASCII host; v1 does not do IDN punycode conversion, so write it in punycode directly"
+                    )
+                )
             ),
-            Self::BadChars(h) => write!(f, "`{h}`에 호스트명에 쓸 수 없는 문자가 있음"),
+            Self::BadChars(h) => write!(
+                f,
+                "{}",
+                tr!(
+                    format!("`{h}`에 호스트명에 쓸 수 없는 문자가 있음"),
+                    format!("`{h}` contains characters not allowed in a hostname")
+                )
+            ),
             Self::BareWildcardLabel(h) => write!(
                 f,
-                "`{h}` 형태는 지원하지 않음. `*`는 전체 또는 선행 `*.` 형태로만 씀"
+                "{}",
+                tr!(
+                    format!("`{h}` 형태는 지원하지 않음. `*`는 전체 또는 선행 `*.` 형태로만 씀"),
+                    format!(
+                        "the `{h}` form is not supported; `*` is used only as the whole pattern or as a leading `*.`"
+                    )
+                )
             ),
         }
     }

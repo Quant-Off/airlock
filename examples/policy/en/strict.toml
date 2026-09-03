@@ -1,0 +1,364 @@
+# The zero trust baseline form. Block everything outside the workspace and pass only what is needed.
+# Validate with airlock policy check --policy examples/policy/strict.toml.
+#
+# Since [defaults].exec is not allow, exec becomes a kernel whitelist. Only the programs
+# and top-level commands written in the kind = "exec" allow rules below run; the kernel
+# refuses everything else. If a program you need is missing, add that line. The point of
+# this preset is that widening is easy, but the fact that you widened stays in the policy file.
+
+version = 1
+name = "strict"
+
+[defaults]
+file = "deny"
+exec = "ask"
+egress = "deny"
+# Same as the default, but stated explicitly. A preset is a document that shows the spec to humans.
+# Plaintext outbound cannot cross this floor even toward allowed hosts.
+egress_plaintext = "deny"
+
+# Workspace
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "~/work/**"
+action = "allow"
+
+# Toolchain read: needed to read executables and libraries.
+#
+# It matters that mode carries no exec. Granting exec here would widen the
+# whitelist to all of /usr, /bin, /System, and /Library, making virtually the
+# whole system executable. Execution is opened only by the kind = "exec" rules below.
+[[rules]]
+id = "toolchain-read"
+kind = "file"
+path = ["/usr/**", "/bin/**", "/opt/homebrew/**", "/System/**", "/Library/**"]
+mode = ["read", "metadata"]
+action = "allow"
+
+# Build caches: writing is needed
+[[rules]]
+id = "build-cache"
+kind = "file"
+path = ["~/.cargo/registry/**", "~/.cargo/git/**", "~/.rustup/**", "~/.npm/_cacache/**"]
+action = "allow"
+
+#
+# Exec allow list
+#
+# Writing only a name in program opens just the path it resolves to on the current PATH.
+# Writing a file with the same name into the workspace does not make it run.
+
+# Shells
+# Without a shell the agent cannot run a single command. macOS /bin/sh re-execs
+# itself as /bin/bash through the dyld variant mechanism, so both are needed
+# (docs/limitations.md 4.13).
+[[rules]]
+id = "exec-sh"
+kind = "exec"
+program = "sh"
+action = "allow"
+
+[[rules]]
+id = "exec-bash"
+kind = "exec"
+program = "bash"
+action = "allow"
+
+[[rules]]
+id = "exec-zsh"
+kind = "exec"
+program = "zsh"
+action = "allow"
+
+# Exec helpers
+# env and xargs are conduits that exec other programs on one's behalf. Once opened,
+# whatever launches through them is judged again by this list. which is for path lookup.
+[[rules]]
+id = "exec-env"
+kind = "exec"
+program = "env"
+action = "allow"
+
+[[rules]]
+id = "exec-xargs"
+kind = "exec"
+program = "xargs"
+action = "allow"
+
+[[rules]]
+id = "exec-which"
+kind = "exec"
+program = "which"
+action = "allow"
+
+# File manipulation
+# The minimal set the agent uses to read and modify the workspace.
+[[rules]]
+id = "exec-ls"
+kind = "exec"
+program = "ls"
+action = "allow"
+
+[[rules]]
+id = "exec-cat"
+kind = "exec"
+program = "cat"
+action = "allow"
+
+[[rules]]
+id = "exec-cp"
+kind = "exec"
+program = "cp"
+action = "allow"
+
+[[rules]]
+id = "exec-mv"
+kind = "exec"
+program = "mv"
+action = "allow"
+
+[[rules]]
+id = "exec-rm"
+kind = "exec"
+program = "rm"
+action = "allow"
+
+[[rules]]
+id = "exec-mkdir"
+kind = "exec"
+program = "mkdir"
+action = "allow"
+
+[[rules]]
+id = "exec-ln"
+kind = "exec"
+program = "ln"
+action = "allow"
+
+[[rules]]
+id = "exec-chmod"
+kind = "exec"
+program = "chmod"
+action = "allow"
+
+[[rules]]
+id = "exec-touch"
+kind = "exec"
+program = "touch"
+action = "allow"
+
+[[rules]]
+id = "exec-stat"
+kind = "exec"
+program = "stat"
+action = "allow"
+
+[[rules]]
+id = "exec-find"
+kind = "exec"
+program = "find"
+action = "allow"
+
+# Text processing
+# Used for code search and editing.
+[[rules]]
+id = "exec-grep"
+kind = "exec"
+program = "grep"
+action = "allow"
+
+[[rules]]
+id = "exec-sed"
+kind = "exec"
+program = "sed"
+action = "allow"
+
+[[rules]]
+id = "exec-awk"
+kind = "exec"
+program = "awk"
+action = "allow"
+
+[[rules]]
+id = "exec-head"
+kind = "exec"
+program = "head"
+action = "allow"
+
+[[rules]]
+id = "exec-tail"
+kind = "exec"
+program = "tail"
+action = "allow"
+
+[[rules]]
+id = "exec-sort"
+kind = "exec"
+program = "sort"
+action = "allow"
+
+[[rules]]
+id = "exec-uniq"
+kind = "exec"
+program = "uniq"
+action = "allow"
+
+[[rules]]
+id = "exec-wc"
+kind = "exec"
+program = "wc"
+action = "allow"
+
+[[rules]]
+id = "exec-cut"
+kind = "exec"
+program = "cut"
+action = "allow"
+
+[[rules]]
+id = "exec-tr"
+kind = "exec"
+program = "tr"
+action = "allow"
+
+[[rules]]
+id = "exec-diff"
+kind = "exec"
+program = "diff"
+action = "allow"
+
+[[rules]]
+id = "exec-tee"
+kind = "exec"
+program = "tee"
+action = "allow"
+
+[[rules]]
+id = "exec-basename"
+kind = "exec"
+program = "basename"
+action = "allow"
+
+[[rules]]
+id = "exec-dirname"
+kind = "exec"
+program = "dirname"
+action = "allow"
+
+# Miscellaneous
+# Things scripts commonly invoke.
+[[rules]]
+id = "exec-echo"
+kind = "exec"
+program = "echo"
+action = "allow"
+
+[[rules]]
+id = "exec-date"
+kind = "exec"
+program = "date"
+action = "allow"
+
+[[rules]]
+id = "exec-sleep"
+kind = "exec"
+program = "sleep"
+action = "allow"
+
+[[rules]]
+id = "exec-uname"
+kind = "exec"
+program = "uname"
+action = "allow"
+
+# Toolchain
+# Delete the lines for languages you do not use. A name absent from PATH shows
+# up in the banner as a limitation, and the kernel refuses to execute that program.
+[[rules]]
+id = "exec-git"
+kind = "exec"
+program = "git"
+action = "allow"
+
+[[rules]]
+id = "exec-cargo"
+kind = "exec"
+program = "cargo"
+action = "allow"
+
+[[rules]]
+id = "exec-rustc"
+kind = "exec"
+program = "rustc"
+action = "allow"
+
+[[rules]]
+id = "exec-make"
+kind = "exec"
+program = "make"
+action = "allow"
+
+[[rules]]
+id = "exec-cc"
+kind = "exec"
+program = "cc"
+action = "allow"
+
+[[rules]]
+id = "exec-python3"
+kind = "exec"
+program = "python3"
+action = "allow"
+
+[[rules]]
+id = "exec-node"
+kind = "exec"
+program = "node"
+action = "allow"
+
+[[rules]]
+id = "exec-npm"
+kind = "exec"
+program = "npm"
+action = "allow"
+
+# macOS developer tool shims
+#
+# On macOS, /usr/bin/git, /usr/bin/make, /usr/bin/cc, and /usr/bin/python3 are not the
+# real programs but shims that re-exec into /Library/Developer/CommandLineTools. With the
+# name rules above alone, that re-exec is blocked in the kernel and the program never
+# starts at all (the same nature as the /bin/sh dyld variant, docs/limitations.md 4.13).
+#
+# Opening only usr/bin is not enough. Entries inside it, like python3, are symbolic links
+# pointing at the real files on the framework side, and the kernel judges by the resolved
+# path. So we open the whole CommandLineTools tree in one piece.
+#
+# This rule also opens the other executables inside the developer tool tree. Even so, it
+# is far narrower than opening all of /usr, /System, and /Library, and tools used for
+# exfiltration such as curl, nc, ssh, and osascript remain outside. If you use Xcode.app,
+# you must add /Applications/Xcode.app/Contents/Developer/** the same way. Linux has no
+# such path, so this opens nothing there.
+[[rules]]
+id = "exec-macos-developer-tools"
+kind = "exec"
+program = "/Library/Developer/CommandLineTools/**"
+action = "allow"
+
+#
+# Outbound
+#
+# Only actually enforced per host once the egress proxy layer is attached.
+[[rules]]
+id = "llm-api"
+kind = "egress"
+host = "api.foollm.com"
+port = 443
+action = "allow"
+
+[[rules]]
+id = "crates-io"
+kind = "egress"
+host = "*.crates.io"
+port = 443
+action = "allow"
