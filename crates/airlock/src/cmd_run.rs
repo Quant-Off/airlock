@@ -4,10 +4,12 @@ use airlock_broker::{
     ApproveAll, Approver, Enforcer, ObserveEnforcer, ProfileOptions, RefuseAll, SessionConfig,
     TtyApprover,
 };
+use airlock_canonical::display::sanitize;
 use airlock_i18n::tr;
-use airlock_policy::{LoadContext, LoadWarning, Policy};
+use airlock_policy::{LoadWarning, Policy};
 
 use crate::paths;
+use crate::trust;
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
@@ -157,19 +159,6 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
     let policy_path = paths::discover_policy(args.policy.as_deref(), &cwd)
         .map(|p| paths::absolutize_lexical(&p, &cwd));
 
-    // 실제로 읽은 파일뿐 아니라 탐색 후보 전체를 자기보호 대상으로 둡니다
-    let mut candidates: Vec<PathBuf> = paths::policy_candidates(&cwd)
-        .iter()
-        .flat_map(|p| paths::protect_forms(p, &cwd))
-        .collect();
-    if let Some(p) = &policy_path {
-        for form in paths::protect_forms(p, &cwd) {
-            if !candidates.contains(&form) {
-                candidates.push(form);
-            }
-        }
-    }
-
     // HOME이 없거나 상대 경로면 ~/ 앵커 forbid가 전부 엉뚱한 곳을 가리킵니다. 시크릿
     // 보호가 사라진 채로 도는 것보다 중단이 낫습니다
     let Some(home) = airlock_policy::path::home_dir_checked() else {
@@ -190,10 +179,7 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         return 78;
     };
 
-    let mut ctx = LoadContext::new(home, &audit_root).with_policy_files(candidates);
-    if let Ok(exe) = std::env::current_exe() {
-        ctx = ctx.with_binary(exe);
-    }
+    let ctx = paths::load_context(home, &audit_root, &cwd, policy_path.as_deref());
 
     let policy = match &policy_path {
         Some(p) => match Policy::load_file(p, &ctx) {
@@ -223,6 +209,17 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
                 return 70;
             }
         },
+    };
+
+    // 정책 파일을 읽었으면 그 파일이 사람이 둔 것인지 브로커를 띄우기 전에 확인합니다.
+    // --yes 는 이 관문을 건너뛰지 못합니다. 에이전트가 심은 정책이 바로 다음 --yes
+    // 실행에서 읽히는 것이 이 위협의 시나리오이기 때문입니다 (docs/design.md 9.6)
+    let trust_gate = match &policy_path {
+        Some(p) => match trust::gate_run(p, &policy, &audit_root) {
+            Ok(gate) => Some(gate),
+            Err(code) => return code,
+        },
+        None => None,
     };
 
     let proxy_planned = args.egress_proxy && !args.no_network;
@@ -368,11 +365,13 @@ pub fn exec(args: RunArgs, global_audit_root: Option<PathBuf>) -> i32 {
         &policy,
         enforcer.as_ref(),
         approver.as_ref(),
+        &audit_root,
         &session_dir,
         &workspace,
         mediation,
         proxy.as_ref().map(|p| p.addr()),
         config.anchor_dir.as_deref(),
+        trust_gate.as_ref(),
     );
 
     let report = match airlock_broker::run(
@@ -652,11 +651,13 @@ fn print_banner(
     policy: &Policy,
     enforcer: &dyn Enforcer,
     approver: &dyn Approver,
+    audit_root: &std::path::Path,
     session_dir: &std::path::Path,
     workspace: &std::path::Path,
     mediation: airlock_broker::Mediation,
     proxy: Option<std::net::SocketAddr>,
     anchor_dir: Option<&std::path::Path>,
+    trust_gate: Option<&trust::Gate>,
 ) {
     let digest = airlock_audit::Hash::from_bytes(policy.digest());
     let short: String = digest.to_hex().chars().take(12).collect();
@@ -677,6 +678,15 @@ fn print_banner(
             )
         )
     );
+    if let Some(gate) = trust_gate {
+        eprintln!(
+            "{}",
+            tr!(
+                format!("  신뢰     {}", trust::describe_gate(gate)),
+                format!("  trust      {}", trust::describe_gate(gate))
+            )
+        );
+    }
     eprintln!(
         "{}",
         tr!(
@@ -771,6 +781,28 @@ fn print_banner(
                     "  anchors    {} (same tree as the audit root; no recomputation \
                      detection, separate it with --anchor-dir)",
                     anchors.display()
+                )
+            )
+        );
+    }
+    // 기록 파일이 감사 루트에 있으므로, 감사 루트가 작업 공간 안이면 정책 신뢰 기록도
+    // 에이전트 손이 닿는 곳에 놓입니다. 그 사실을 감추면 없는 보증을 믿게 됩니다
+    if trust::is_inside(audit_root, workspace) {
+        eprintln!(
+            "{}",
+            tr!(
+                format!(
+                    "  \x1b[33m한계\x1b[0m     감사 루트 {} 가 작업 공간 안에 있음. 정책 신뢰 기록({})도 \
+                     에이전트가 쓸 수 있는 곳에 놓임. --audit-dir 를 작업 공간 밖으로 둘 것",
+                    sanitize(&audit_root.display().to_string()),
+                    trust::TRUST_FILE
+                ),
+                format!(
+                    "  \x1b[33mlimit\x1b[0m      the audit root {} is inside the workspace, so the \
+                     policy trust record ({}) is also where the agent can write; move \
+                     --audit-dir outside the workspace",
+                    sanitize(&audit_root.display().to_string()),
+                    trust::TRUST_FILE
                 )
             )
         );

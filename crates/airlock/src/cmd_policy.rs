@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use airlock_canonical::display::sanitize;
 use airlock_i18n::tr;
-use airlock_policy::{Action, FileMode, LoadContext, PLAINTEXT_FLOOR_ID, Policy, Protocol};
+use airlock_policy::{Action, FileMode, PLAINTEXT_FLOOR_ID, Policy, Protocol};
 
 use crate::paths;
+use crate::trust;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum PolicyCommand {
@@ -87,6 +88,32 @@ pub enum PolicyCommand {
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
     },
+
+    #[command(
+        about = tr!(
+            "정책 파일을 사람이 승인한 것으로 기록함. 처음 보는 정책은 이 기록이 없으면 \
+             터미널 없는 airlock run 에서 거부됨",
+            "record a policy file as approved by a person; a policy seen for the first \
+             time is refused by a terminal-less airlock run without this record"
+        )
+    )]
+    Trust {
+        #[arg(
+            value_name = "PATH",
+            help = tr!(
+                "정책 파일 경로. 생략하면 탐색 후보 중 첫 파일",
+                "policy file path; defaults to the first discovered candidate"
+            )
+        )]
+        path: Option<PathBuf>,
+
+        #[arg(long, help = tr!("기록 목록을 출력함", "print the recorded entries"))]
+        list: bool,
+    },
+}
+
+fn resolve_audit_root(audit_root: Option<PathBuf>, cwd: &std::path::Path) -> PathBuf {
+    paths::absolutize(&audit_root.unwrap_or_else(paths::audit_root), cwd)
 }
 
 fn load(
@@ -94,26 +121,15 @@ fn load(
     audit_root: Option<PathBuf>,
 ) -> Result<(Policy, Option<PathBuf>), i32> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let audit_root = paths::absolutize(&audit_root.unwrap_or_else(paths::audit_root), &cwd);
+    let audit_root = resolve_audit_root(audit_root, &cwd);
     let path = paths::discover_policy(explicit, &cwd).map(|p| paths::absolutize_lexical(&p, &cwd));
 
-    let mut candidates: Vec<PathBuf> = paths::policy_candidates(&cwd)
-        .iter()
-        .flat_map(|p| paths::protect_forms(p, &cwd))
-        .collect();
-    if let Some(p) = &path {
-        for form in paths::protect_forms(p, &cwd) {
-            if !candidates.contains(&form) {
-                candidates.push(form);
-            }
-        }
-    }
-
-    let mut ctx = LoadContext::new(airlock_policy::path::home_dir(), &audit_root)
-        .with_policy_files(candidates);
-    if let Ok(exe) = std::env::current_exe() {
-        ctx = ctx.with_binary(exe);
-    }
+    let ctx = paths::load_context(
+        airlock_policy::path::home_dir(),
+        &audit_root,
+        &cwd,
+        path.as_deref(),
+    );
     let policy = match &path {
         Some(p) => Policy::load_file(p, &ctx).map_err(|e| {
             eprintln!("airlock: {e}");
@@ -296,6 +312,29 @@ pub fn exec(cmd: PolicyCommand, audit_root: Option<PathBuf>) -> i32 {
                 }
                 0
             }
+        }
+
+        PolicyCommand::Trust { path, list } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let root = resolve_audit_root(audit_root.clone(), &cwd);
+            if list {
+                return trust::list_command(&root);
+            }
+            let (policy, source) = match load(path.as_deref(), audit_root) {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let Some(source) = source else {
+                eprintln!(
+                    "airlock: {}",
+                    tr!(
+                        "신뢰할 정책 파일을 찾지 못함. 경로를 지정할 것",
+                        "no policy file found to trust; pass a path"
+                    )
+                );
+                return 64;
+            };
+            trust::trust_command(&source, &policy, &root)
         }
 
         PolicyCommand::Profile { policy, workspace } => {
