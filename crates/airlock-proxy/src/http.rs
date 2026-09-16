@@ -80,13 +80,22 @@ impl Request {
 ///
 /// # Errors
 /// 규격을 벗어나거나 상한을 넘으면 [`Reject`]를 냅니다. 호출부는 그 상태 라인을
-/// 그대로 응답하고 연결을 닫아야 합니다
+/// 그대로 응답하고 연결을 닫아야 합니다. CRLF 쌍이 아닌 개행, 제어 문자, obs-fold,
+/// 둘 이상의 Host, `HTTP/1.0` 과 `HTTP/1.1` 외의 버전, 비ASCII 호스트는 전부 400 입니다
 pub fn parse_head(head: &[u8]) -> Result<Request, Reject> {
     if head.len() > MAX_HEADERS {
         return Err(Reject::TooLarge);
     }
+    // 짝이 아닌 CR 이나 LF 가 하나라도 있으면 앞뒤 서버가 줄 경계를 다르게 봅니다
+    // 이 검사를 지나면 어떤 줄에도 CR 과 LF 가 남지 않습니다
+    if !crlf_pairs_only(head) {
+        return Err(Reject::Malformed);
+    }
     let text = std::str::from_utf8(head).map_err(|_| Reject::Malformed)?;
-    let mut lines = text.split("\r\n");
+    // 헤드는 빈 줄 하나로 끝나야 합니다
+    // 읽기 층이 첫 빈 줄에서 끊으므로 그 앞에 빈 줄이 또 있으면 두 층이 다른 헤드를 봅니다
+    let body = text.strip_suffix("\r\n\r\n").ok_or(Reject::Malformed)?;
+    let mut lines = body.split("\r\n");
     let request_line = lines.next().ok_or(Reject::Malformed)?;
     if request_line.len() > MAX_REQUEST_LINE {
         return Err(Reject::TooLarge);
@@ -102,24 +111,18 @@ pub fn parse_head(head: &[u8]) -> Result<Request, Reject> {
     if parts.next().is_some() {
         return Err(Reject::Malformed);
     }
-    if !is_token(method) || !version.starts_with("HTTP/1.") {
+    // 버전 문자열은 그대로 재방출되므로 정확히 아는 둘만 받습니다
+    if !is_token(method) || !valid_request_target(raw_target) || !is_supported_version(version) {
         return Err(Reject::Malformed);
     }
 
+    // 터널의 헤더는 목적지로 넘기지 않지만 형태는 똑같이 확인합니다
+    // 규격을 벗어난 헤드를 받아 주면 이 프록시가 무엇을 받는지의 기준이 요청 종류마다
+    // 달라지고 그 차이가 곧 앞뒤 서버의 해석 차이가 됩니다
+    let headers = parse_headers(lines)?;
+
     if method == "CONNECT" {
         let target = split_authority(raw_target, None)?;
-        // 터널의 헤더는 목적지로 넘기지 않지만 형태는 그대로 확인합니다. 규격을
-        // 벗어난 헤드를 받아 주면 이 프록시가 무엇을 받는지의 기준이 요청 종류마다
-        // 달라지고, 그 차이가 곧 앞뒤 서버의 해석 차이가 됩니다
-        for line in lines {
-            if line.is_empty() {
-                break;
-            }
-            let (name, _) = line.split_once(':').ok_or(Reject::Malformed)?;
-            if !is_token(name) {
-                return Err(Reject::Malformed);
-            }
-        }
         return Ok(Request::Connect(target));
     }
 
@@ -140,20 +143,13 @@ pub fn parse_head(head: &[u8]) -> Result<Request, Reject> {
     out.push_str(&target.to_string());
     out.push_str("\r\n");
 
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let (name, _) = line.split_once(':').ok_or(Reject::Malformed)?;
-        // 이름과 콜론 사이의 공백은 앞뒤 서버가 다르게 읽는 대표적인 스머글링
-        // 벡터입니다. 이름 자체가 토큰이 아닌 경우도 같이 걸립니다
-        if !is_token(name) {
-            return Err(Reject::Malformed);
-        }
+    for (name, value) in headers {
         if DROPPED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
             continue;
         }
-        out.push_str(line);
+        out.push_str(name);
+        out.push(':');
+        out.push_str(value);
         out.push_str("\r\n");
     }
     // 요청 하나마다 연결을 닫아 파이프라인된 뒷 요청이 판정 없이 같은 연결로
@@ -164,6 +160,79 @@ pub fn parse_head(head: &[u8]) -> Result<Request, Reject> {
         target,
         head: out.into_bytes(),
     })
+}
+
+/// 모든 CR 과 LF 가 CRLF 쌍의 일부인지 봅니다.
+///
+/// 홀로 선 LF 를 줄 끝으로 읽는 서버와 그렇지 않은 서버가 있어, 쌍이 아닌 개행은
+/// 그 자체로 앞뒤 서버의 헤더 경계를 갈라놓는 스머글링 벡터입니다
+fn crlf_pairs_only(head: &[u8]) -> bool {
+    let mut after_cr = false;
+    for &b in head {
+        match (b, after_cr) {
+            (b'\n', true) => after_cr = false,
+            (b'\n', false) | (b'\r', true) => return false,
+            (b'\r', false) => after_cr = true,
+            (_, true) => return false,
+            (_, false) => {}
+        }
+    }
+    !after_cr
+}
+
+/// 헤더 줄들을 이름과 값으로 가릅니다.
+///
+/// 이름은 RFC 9110 token 이어야 하고 값에는 HTAB 외의 제어 문자가 없어야 합니다.
+/// obs-fold 와 빈 줄과 둘 이상의 Host 는 거부합니다 (RFC 9112 3.2, 5.2)
+///
+/// # Errors
+/// 위 규칙 중 하나라도 어긋나면 [`Reject::Malformed`] 입니다
+fn parse_headers<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<Vec<(&'a str, &'a str)>, Reject> {
+    let mut out = Vec::new();
+    let mut host_seen = false;
+    for line in lines {
+        // 빈 줄이 여기 오면 헤드 안에 빈 줄이 둘이라는 뜻이고
+        // SP 나 HTAB 로 시작하는 줄은 obs-fold 입니다
+        // 둘 다 앞뒤 서버가 헤더 경계를 다르게 읽습니다
+        if line.is_empty() || line.starts_with([' ', '\t']) {
+            return Err(Reject::Malformed);
+        }
+        let (name, value) = line.split_once(':').ok_or(Reject::Malformed)?;
+        // 이름과 콜론 사이의 공백은 앞뒤 서버가 다르게 읽는 대표적인 스머글링 벡터입니다
+        // 이름 자체가 토큰이 아닌 경우도 같이 걸립니다
+        if !is_token(name) || !valid_field_value(value) {
+            return Err(Reject::Malformed);
+        }
+        if name.eq_ignore_ascii_case("host") {
+            if host_seen {
+                return Err(Reject::Malformed);
+            }
+            host_seen = true;
+        }
+        out.push((name, value));
+    }
+    Ok(out)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    matches!(version, "HTTP/1.0" | "HTTP/1.1")
+}
+
+/// request-target 에 제어 문자가 없는지 봅니다.
+///
+/// HTAB 도 거부합니다. 요청 라인에서 HTAB 를 공백으로 읽는 서버가 있어 목적지가
+/// 어디서 끝나는지가 갈립니다
+fn valid_request_target(target: &str) -> bool {
+    !target.is_empty() && target.bytes().all(|b| b > 0x20 && b != 0x7f)
+}
+
+/// field-value 에 HTAB 외의 제어 문자가 없는지 봅니다 (RFC 9110 5.5).
+fn valid_field_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
 }
 
 /// `http://`만 벗겨 냅니다.
@@ -229,17 +298,15 @@ fn split_authority(raw: &str, default_port: Option<u16>) -> Result<Target, Rejec
 
 /// 호스트 문자열이 넘길 만한 형태인지 봅니다.
 ///
-/// 정규화도 매칭도 하지 않습니다. 제어 문자와 구분자만 걸러 냅니다. 여기서
+/// 정규화도 매칭도 하지 않습니다. ASCII 영숫자와 `-` `.` `_` 와 v6 리터럴의 `:` 만
+/// 허용하며 비ASCII 와 공백과 제어 문자와 구분자는 전부 거부합니다. 여기서
 /// 소문자화 같은 변형을 하면 정책이 보는 문자열과 감사에 남는 문자열이 갈라집니다
 fn valid_host(host: &str) -> bool {
     if host.is_empty() || host.len() > MAX_HOST {
         return false;
     }
-    host.bytes().all(|b| {
-        !b.is_ascii_control()
-            && !b.is_ascii_whitespace()
-            && !matches!(b, b'/' | b'\\' | b'@' | b'[' | b']' | b'#' | b'?' | b'%')
-    })
+    host.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b':'))
 }
 
 fn is_token(s: &str) -> bool {
@@ -424,5 +491,174 @@ mod tests {
         assert!(Reject::Malformed.status_line().contains("400"));
         assert!(Reject::NoTarget.status_line().contains("400"));
         assert!(Reject::TooLarge.status_line().contains("431"));
+    }
+
+    #[test]
+    fn a_bare_lf_cannot_inject_a_second_host_header() {
+        // CRLF 로만 자르면 줄 안의 LF 가 값의 일부로 남고 업스트림은 두 번째 Host 를 봅니다
+        let h = b"GET http://example.com/x HTTP/1.1\r\nX-A: x\nHost: evil.test\r\n\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn a_bare_lf_in_a_connect_head_is_refused() {
+        let h = b"CONNECT example.com:443 HTTP/1.1\r\nX-A: x\nHost: evil.test\r\n\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn a_bare_lf_in_the_request_target_is_refused() {
+        // 공백 수는 셋이라 요청 라인 검사는 지나지만 경로에 개행이 들어가 재방출됩니다
+        let h = b"GET http://example.com/x?a=b\nX:y HTTP/1.1\r\n\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn a_bare_cr_is_refused() {
+        let h = b"GET http://example.com/x HTTP/1.1\r\nX-A: x\rHost: evil.test\r\n\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+        let h = b"GET http://example.com/x HTTP/1.1\r\r\nX-A: x\r\n\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn lf_only_line_endings_are_refused() {
+        let h = b"GET http://example.com/x HTTP/1.1\nHost: example.com\n\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn a_folded_line_with_a_colon_is_still_refused() {
+        // 접힌 줄에 콜론이 있어도 SP 나 HTAB 로 시작하면 obs-fold 입니다 (RFC 9112 5.2)
+        let h = head("GET http://example.com/x HTTP/1.1\nX-A: 1\n\tHost: evil.test\n\n");
+        assert_eq!(parse_head(&h), Err(Reject::Malformed));
+        let h = head("GET http://example.com/x HTTP/1.1\nX-A: 1\n Host: evil.test\n\n");
+        assert_eq!(parse_head(&h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn duplicate_host_headers_are_refused() {
+        let h = head("GET http://example.com/x HTTP/1.1\nHost: example.com\nhost: evil.test\n\n");
+        assert_eq!(parse_head(&h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn duplicate_host_headers_on_connect_are_refused() {
+        let h =
+            head("CONNECT example.com:443 HTTP/1.1\nHost: example.com:443\nHost: evil.test\n\n");
+        assert_eq!(parse_head(&h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn only_http_1_0_and_1_1_are_accepted() {
+        for v in [
+            "HTTP/1.x",
+            "HTTP/1.10",
+            "HTTP/1.",
+            "HTTP/1.1x",
+            "HTTP/2",
+            "HTTP/0.9",
+            "http/1.1",
+            "HTTP/1.1\t",
+        ] {
+            let h = head(&format!("CONNECT example.com:443 {v}\n\n"));
+            assert_eq!(parse_head(&h), Err(Reject::Malformed), "{v:?}");
+        }
+        for v in ["HTTP/1.0", "HTTP/1.1"] {
+            let h = head(&format!("GET http://example.com/x {v}\n\n"));
+            let Request::Forward { head, .. } = parse_head(&h).expect("파싱 성공") else {
+                panic!("Forward 여야 함");
+            };
+            let text = String::from_utf8(head).expect("utf8");
+            assert!(text.starts_with(&format!("GET /x {v}\r\n")), "{text}");
+        }
+    }
+
+    #[test]
+    fn control_characters_in_a_header_value_are_refused() {
+        for c in [
+            '\u{0}', '\u{1}', '\u{8}', '\u{b}', '\u{c}', '\u{1b}', '\u{1f}', '\u{7f}',
+        ] {
+            let h = head(&format!(
+                "GET http://example.com/x HTTP/1.1\nX-A: a{c}b\n\n"
+            ));
+            assert_eq!(parse_head(&h), Err(Reject::Malformed), "{c:?}");
+            let h = head(&format!("CONNECT example.com:443 HTTP/1.1\nX-A: a{c}b\n\n"));
+            assert_eq!(parse_head(&h), Err(Reject::Malformed), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_horizontal_tab_inside_a_header_value_is_kept() {
+        // HTAB 는 field-value 의 정당한 공백입니다 (RFC 9110 5.5)
+        let h = head("GET http://example.com/x HTTP/1.1\nX-A: a\tb\n\n");
+        let Request::Forward { head, .. } = parse_head(&h).expect("파싱 성공") else {
+            panic!("Forward 여야 함");
+        };
+        let text = String::from_utf8(head).expect("utf8");
+        assert!(text.contains("X-A: a\tb\r\n"), "{text}");
+    }
+
+    #[test]
+    fn control_characters_in_the_request_target_are_refused() {
+        for c in ['\u{0}', '\t', '\u{1f}', '\u{7f}'] {
+            let h = head(&format!("GET http://example.com/x{c}y HTTP/1.1\n\n"));
+            assert_eq!(parse_head(&h), Err(Reject::Malformed), "{c:?}");
+            let h = head(&format!("CONNECT exam{c}ple.com:443 HTTP/1.1\n\n"));
+            assert_eq!(parse_head(&h), Err(Reject::Malformed), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_host_is_refused() {
+        let h = head("CONNECT 例え.jp:443 HTTP/1.1\n\n");
+        assert_eq!(parse_head(&h), Err(Reject::Malformed));
+        let h = head("GET http://exämple.com/x HTTP/1.1\n\n");
+        assert_eq!(parse_head(&h), Err(Reject::Malformed));
+        let h = head("CONNECT exa\u{a0}mple.com:443 HTTP/1.1\n\n");
+        assert_eq!(parse_head(&h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn hosts_are_limited_to_name_and_v6_characters() {
+        for bad in [
+            "ex*ample.com",
+            "ex;ample.com",
+            "ex\"ample.com",
+            "ex(ample).com",
+            "ex=ample.com",
+            "ex~ample.com",
+        ] {
+            let h = head(&format!("CONNECT {bad}:443 HTTP/1.1\n\n"));
+            assert_eq!(parse_head(&h), Err(Reject::Malformed), "{bad}");
+        }
+        for good in ["a-b_c.example.com", "127.0.0.1", "EXAMPLE.com", "[::1]"] {
+            let h = head(&format!("CONNECT {good}:443 HTTP/1.1\n\n"));
+            assert!(parse_head(&h).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn the_head_must_end_with_exactly_one_blank_line() {
+        // 읽기 층은 첫 빈 줄에서 끊으므로 그 앞뒤에 빈 줄이 더 있으면 두 층이 다른 헤드를 봅니다
+        let h = b"CONNECT example.com:443 HTTP/1.1\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+        let h = b"CONNECT example.com:443 HTTP/1.1\r\n\r\nX: y\r\n\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+        let h = b"GET http://example.com/x HTTP/1.1\r\n\r\nHost: evil.test\r\n\r\n";
+        assert_eq!(parse_head(h), Err(Reject::Malformed));
+    }
+
+    #[test]
+    fn the_gated_host_is_the_host_that_is_dialed_and_recorded() {
+        // 정상 요청에서 판정과 접속과 기록에 쓰이는 값은 하나의 Target 입니다
+        let h = head("GET http://Example.COM:8080/x HTTP/1.1\nHost: other.test\n\n");
+        let r = parse_head(&h).expect("파싱 성공");
+        assert_eq!(r.target(), &Target::new("Example.COM", 8080));
+        let Request::Forward { head, target } = r else {
+            panic!("Forward 여야 함");
+        };
+        let text = String::from_utf8(head).expect("utf8");
+        assert!(text.contains(&format!("Host: {target}\r\n")), "{text}");
     }
 }

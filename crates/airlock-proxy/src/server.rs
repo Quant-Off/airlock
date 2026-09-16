@@ -489,10 +489,14 @@ mod tests {
     }
 
     fn send(addr: SocketAddr, req: &str) -> String {
+        send_raw(addr, req.replace('\n', "\r\n").as_bytes())
+    }
+
+    /// 바이트를 고치지 않고 그대로 보냅니다. 개행 조작 시험용
+    fn send_raw(addr: SocketAddr, req: &[u8]) -> String {
         let mut s = TcpStream::connect(addr).expect("프록시 연결");
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        s.write_all(req.replace('\n', "\r\n").as_bytes())
-            .expect("요청 전송");
+        s.write_all(req).expect("요청 전송");
         let mut out = String::new();
         let mut buf = [0u8; 4096];
         while let Ok(n) = s.read(&mut buf) {
@@ -509,6 +513,135 @@ mod tests {
 
     fn status(resp: &str) -> String {
         resp.lines().next().unwrap_or_default().trim().to_string()
+    }
+
+    /// 연결이 왔는지만 보는 목적지. 거부 경로에서 접속이 없음을 확인하는 용도
+    fn silent_origin() -> (SocketAddr, TcpListener) {
+        let l = TcpListener::bind(("127.0.0.1", 0)).expect("바인드");
+        l.set_nonblocking(true).expect("nonblocking");
+        let addr = l.local_addr().expect("주소");
+        (addr, l)
+    }
+
+    fn was_dialed(l: &TcpListener) -> bool {
+        thread::sleep(Duration::from_millis(50));
+        match l.accept() {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("accept 오류 {e}"),
+        }
+    }
+
+    /// 거부되는 헤드는 판정에 닿지 않고 접속도 기록도 남기지 않아야 합니다.
+    /// 세 가지가 함께 없어야 판정과 접속과 기록이 같은 사실을 말합니다
+    fn assert_refused_without_side_effects(label: &str, build: impl FnOnce(u16) -> Vec<u8>) {
+        let (origin, l) = silent_origin();
+        let gate = Recorder::new(true);
+        let run = start(gate.clone());
+        let resp = send_raw(run.addr, &build(origin.port()));
+        assert_eq!(status(&resp), "HTTP/1.1 400 Bad Request", "{label}");
+        assert!(gate.calls().is_empty(), "{label}: 판정에 닿으면 안 됨");
+        assert!(!was_dialed(&l), "{label}: 업스트림에 접속하면 안 됨");
+        assert!(
+            gate.finished_calls().is_empty(),
+            "{label}: 결과 기록이 남으면 안 됨"
+        );
+    }
+
+    #[test]
+    fn a_bare_lf_host_injection_is_refused_without_touching_the_gate_or_the_origin() {
+        assert_refused_without_side_effects("bare LF Host 주입", |port| {
+            format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\nX-A: x\nHost: evil.test\r\n\r\n")
+                .into_bytes()
+        });
+        assert_refused_without_side_effects("CONNECT bare LF", |port| {
+            format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nX-A: x\nHost: evil.test\r\n\r\n")
+                .into_bytes()
+        });
+    }
+
+    #[test]
+    fn a_bare_cr_is_refused_without_touching_the_gate_or_the_origin() {
+        assert_refused_without_side_effects("bare CR", |port| {
+            format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\nX-A: x\rHost: evil.test\r\n\r\n")
+                .into_bytes()
+        });
+    }
+
+    #[test]
+    fn an_obs_fold_is_refused_without_touching_the_gate_or_the_origin() {
+        assert_refused_without_side_effects("obs-fold", |port| {
+            format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\nX-A: 1\r\n\tHost: evil.test\r\n\r\n")
+                .into_bytes()
+        });
+    }
+
+    #[test]
+    fn duplicate_host_headers_are_refused_without_touching_the_gate_or_the_origin() {
+        assert_refused_without_side_effects("중복 Host", |port| {
+            format!(
+                "GET http://127.0.0.1:{port}/x HTTP/1.1\r\nHost: a.test\r\nHost: b.test\r\n\r\n"
+            )
+            .into_bytes()
+        });
+    }
+
+    #[test]
+    fn an_unknown_minor_version_is_refused_without_touching_the_gate_or_the_origin() {
+        assert_refused_without_side_effects("HTTP/1.x", |port| {
+            format!("GET http://127.0.0.1:{port}/x HTTP/1.x\r\n\r\n").into_bytes()
+        });
+        assert_refused_without_side_effects("CONNECT HTTP/1.x", |port| {
+            format!("CONNECT 127.0.0.1:{port} HTTP/1.x\r\n\r\n").into_bytes()
+        });
+    }
+
+    #[test]
+    fn a_control_character_in_a_value_is_refused_without_touching_the_gate_or_the_origin() {
+        assert_refused_without_side_effects("제어 문자 값", |port| {
+            format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\nX-A: a\u{1}b\r\n\r\n").into_bytes()
+        });
+        assert_refused_without_side_effects("DEL 값", |port| {
+            format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\nX-A: a\u{7f}b\r\n\r\n").into_bytes()
+        });
+    }
+
+    #[test]
+    fn a_non_ascii_host_is_refused_before_the_gate() {
+        // 루프백으로 유도할 수 없는 호스트라 접속 여부 대신 판정 도달 여부를 봅니다
+        let gate = Recorder::new(true);
+        let run = start(gate.clone());
+        let resp = send(run.addr, "CONNECT 例え.jp:443 HTTP/1.1\n\n");
+        assert_eq!(status(&resp), "HTTP/1.1 400 Bad Request");
+        assert!(gate.calls().is_empty());
+        let resp = send(run.addr, "GET http://exämple.com/x HTTP/1.1\n\n");
+        assert_eq!(status(&resp), "HTTP/1.1 400 Bad Request");
+        assert!(gate.calls().is_empty());
+        assert!(gate.finished_calls().is_empty());
+    }
+
+    #[test]
+    fn a_tab_inside_a_header_value_reaches_the_origin() {
+        let (origin, origin_h) = echo_origin("HTTP/1.1 204 No Content\r\n\r\n");
+        let gate = Recorder::new(true);
+        let run = start(gate.clone());
+        let req = format!(
+            "GET http://127.0.0.1:{}/a HTTP/1.0\nX-A: a\tb\n\n",
+            origin.port()
+        );
+        let resp = send(run.addr, &req);
+        assert_eq!(status(&resp), "HTTP/1.1 204 No Content");
+        let raw = origin_h
+            .join()
+            .expect("origin 스레드")
+            .expect("origin 수신");
+        let seen = String::from_utf8(raw).expect("utf8");
+        assert!(seen.starts_with("GET /a HTTP/1.0\r\n"), "{seen}");
+        assert!(seen.contains("X-A: a\tb\r\n"), "{seen}");
+        assert_eq!(
+            gate.calls(),
+            vec![("127.0.0.1".to_string(), origin.port(), Protocol::Http)]
+        );
     }
 
     #[test]
