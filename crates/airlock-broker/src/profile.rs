@@ -55,6 +55,16 @@ const DEV_RW_LITERALS: &[&str] = &[
     "/dev/dtracehelper",
 ];
 
+/// 프록시 모드에서 자식에게 열어 주는 유닉스 도메인 소켓.
+///
+/// 이전에는 `(remote unix)` 로 모든 유닉스 소켓이 열려 ssh-agent 소켓, docker.sock,
+/// 바깥의 임의 리스너가 프록시도 감사도 거치지 않고 닿았습니다. 지금은 루트 소유 시스템
+/// 데몬 두 개만 경로 리터럴로 엽니다. mDNSResponder 는 `getaddrinfo` 의 경로라 막으면
+/// 이름 해석이 전부 실패하고, syslog 는 Apple 기반 프로파일이 모든 샌드박스 프로세스에
+/// 여는 쓰기 전용 로그 싱크입니다. 항목별 근거는 `docs/egress-proxy.md` 6.1 에 있습니다
+pub const PROXY_UNIX_SOCKET_LITERALS: &[&str] =
+    &["/private/var/run/mDNSResponder", "/private/var/run/syslog"];
+
 #[derive(Debug, Clone)]
 pub struct ProfileOptions {
     pub allow_network: bool,
@@ -68,7 +78,8 @@ pub struct ProfileOptions {
     pub program: Option<std::path::PathBuf>,
     /// egress 프록시가 듣고 있는 루프백 주소.
     ///
-    /// 값이 있으면 아웃바운드를 이 주소 하나로 좁힙니다. 그래야 프록시가 유일한
+    /// 값이 있으면 IP 아웃바운드를 이 주소 하나로 좁히고 유닉스 소켓은
+    /// [`PROXY_UNIX_SOCKET_LITERALS`] 로 좁힙니다. 그래야 프록시가 IP 연결의 유일한
     /// 출구가 되고 호스트 단위 정책이 처음으로 강제됩니다
     pub proxy: Option<std::net::SocketAddr>,
 }
@@ -343,8 +354,19 @@ pub fn generate(policy: &Policy, opts: &ProfileOptions) -> GeneratedProfile {
             "(allow network-outbound (remote ip {}))\n",
             sbpl::quote(&format!("localhost:{}", proxy.port()))
         ));
-        // 유닉스 소켓까지 막으면 시스템 라이브러리가 대부분 동작하지 않습니다
-        out.push_str("(allow network-outbound (remote unix))\n\n");
+        // 유닉스 소켓은 통째로 열지 않습니다. 통째 개방은 ssh-agent 와 docker.sock 을
+        // 프록시 밖의 출구로 만듭니다. 이름 해석과 로그에 필요한 시스템 소켓만 엽니다
+        out.push_str(tr!(
+            ";; 유닉스 소켓은 아래 시스템 데몬 소켓만 열림. 통째 개방 없음\n",
+            ";; unix sockets open only to the system daemon sockets below; no wholesale opening\n"
+        ));
+        for p in PROXY_UNIX_SOCKET_LITERALS {
+            out.push_str(&format!(
+                "(allow network-outbound (literal {}))\n",
+                sbpl::quote(p)
+            ));
+        }
+        out.push('\n');
     } else if network_allowed(policy, opts) {
         out.push_str(tr!(
             ";; 주의 호스트 단위 제어는 Seatbelt로 표현할 수 없음\n",
@@ -975,6 +997,90 @@ action = "allow"
             .with_network(false);
         let p = generate(&policy, &opts);
         assert!(!p.text.contains("network-outbound"), "{}", p.text);
+    }
+
+    /// 프록시 모드의 유닉스 소켓은 허용 목록 리터럴만 열립니다.
+    ///
+    /// `(remote unix)` 가 한 줄이라도 남으면 ssh-agent 와 docker.sock 이 프록시 밖의
+    /// 출구가 됩니다. 아웃바운드 규칙은 프록시 포트 한 줄과 허용 목록 리터럴뿐이어야 합니다
+    #[test]
+    fn a_proxy_opens_only_the_listed_unix_sockets() {
+        let policy = with_egress(
+            r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+"#,
+        );
+        let opts = ProfileOptions::default().with_proxy(proxy_addr(18899));
+        let p = generate(&policy, &opts);
+        assert!(
+            !p.text.contains("(remote unix)"),
+            "조건 없는 유닉스 소켓 개방이 남아 있음: {}",
+            p.text
+        );
+        for sock in PROXY_UNIX_SOCKET_LITERALS {
+            let line = format!("(allow network-outbound (literal {}))", sbpl::quote(sock));
+            assert!(
+                p.text.contains(&line),
+                "허용 목록 항목이 빠짐: {line}\n{}",
+                p.text
+            );
+        }
+        let outbound: Vec<&str> = p
+            .text
+            .lines()
+            .filter(|l| l.contains("network-outbound"))
+            .collect();
+        let expected = PROXY_UNIX_SOCKET_LITERALS.len().saturating_add(1);
+        assert_eq!(
+            outbound.len(),
+            expected,
+            "프록시 포트 한 줄과 허용 목록 리터럴 외의 아웃바운드 규칙이 있음: {outbound:?}"
+        );
+        for line in outbound {
+            let listed = line.contains("(remote ip \"localhost:18899\")")
+                || PROXY_UNIX_SOCKET_LITERALS
+                    .iter()
+                    .any(|s| line.contains(&format!("(literal {})", sbpl::quote(s))));
+            assert!(listed, "허용 목록 밖의 아웃바운드 규칙: {line}");
+        }
+    }
+
+    /// 허용 목록은 루트 소유 디렉토리 아래의 절대 경로 리터럴이어야 합니다.
+    ///
+    /// 자식이 만들 수 있는 위치의 소켓을 허용하면 그 이름으로 소켓을 미리 만들어
+    /// 허용 목록을 가로챌 수 있습니다
+    #[test]
+    fn the_unix_socket_allow_list_stays_under_var_run() {
+        assert!(!PROXY_UNIX_SOCKET_LITERALS.is_empty());
+        for sock in PROXY_UNIX_SOCKET_LITERALS {
+            assert!(
+                sock.starts_with("/private/var/run/"),
+                "루트 소유 디렉토리 밖의 소켓: {sock}"
+            );
+            assert!(
+                !sock.contains(['"', '\\', '\n']),
+                "인용을 깨는 문자가 든 경로: {sock}"
+            );
+            assert_eq!(
+                sock.matches('/').count(),
+                4,
+                "하위 디렉토리나 상대 세그먼트가 든 경로: {sock}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_network_closes_unix_sockets_too() {
+        let p = generate(&baseline(), &ProfileOptions::default().with_network(false));
+        assert!(!p.text.contains("network-outbound"), "{}", p.text);
+        for sock in PROXY_UNIX_SOCKET_LITERALS {
+            assert!(!p.text.contains(sock), "{}", p.text);
+        }
     }
 
     #[test]
