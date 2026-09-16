@@ -2216,6 +2216,284 @@ action = "allow"
     );
 }
 
+// ---------- 심볼릭 링크된 디렉토리 아래의 상대 링크 (H3) ----------
+
+#[test]
+fn relative_link_under_a_symlinked_directory_resolves_against_the_link_target() {
+    // work/dir 은 .ssh/sub 로 가는 디렉토리 링크이고 .ssh/sub/x 는 ../id_ed25519 를
+    // 가리킵니다. 커널은 .ssh/sub 를 먼저 해소한 뒤 .. 를 적용해 .ssh/id_ed25519 를
+    // 엽니다. 어휘적 부모(work/dir)에 .. 를 붙이면 work/id_ed25519 가 되어 작업 공간
+    // 규칙으로 allow 됩니다
+    let h = Home::new("rel-link-in-linked-dir");
+    let key = h.make_secret();
+    let sub = h.join(".ssh/sub");
+    fs::create_dir_all(&sub).unwrap();
+    std::os::unix::fs::symlink("../id_ed25519", sub.join("x")).unwrap();
+    let ws = h.join("work");
+    fs::create_dir_all(&ws).unwrap();
+    std::os::unix::fs::symlink(&sub, ws.join("dir")).unwrap();
+
+    let src = format!(
+        r#"
+version = 1
+[defaults]
+file = "deny"
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "{}/work/**"
+action = "allow"
+"#,
+        h.path().display()
+    );
+    let p = Policy::load_str(&src, &h.ctx()).unwrap();
+    let ev = p.evaluate_file(&ws.join("dir/x"), FileMode::Read, h.path());
+    let np = ev.path.clone().unwrap();
+    assert_eq!(
+        np.resolved, key,
+        "상대 링크 타겟은 해소된 부모(.ssh/sub)를 기준으로 붙여야 함"
+    );
+    assert_eq!(
+        ev.action,
+        Action::Forbid,
+        "링크 두 단계를 거쳐 도달하는 개인키가 작업 공간 allow 로 열리면 안 됨"
+    );
+}
+
+#[test]
+fn relative_link_under_a_symlinked_directory_lands_outside_the_workspace() {
+    // 시크릿이 아니어도 작업 공간 밖이면 기본값(deny)으로 떨어져야 합니다
+    let h = Home::new("rel-link-outside");
+    let outside = h.join("outside");
+    fs::create_dir_all(outside.join("dir")).unwrap();
+    fs::write(outside.join("id_rsa"), b"key").unwrap();
+    std::os::unix::fs::symlink("../id_rsa", outside.join("dir/x")).unwrap();
+    let ws = h.join("work");
+    fs::create_dir_all(&ws).unwrap();
+    std::os::unix::fs::symlink(outside.join("dir"), ws.join("dir")).unwrap();
+
+    let src = format!(
+        r#"
+version = 1
+[defaults]
+file = "deny"
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "{}/work/**"
+action = "allow"
+"#,
+        h.path().display()
+    );
+    let p = Policy::load_str(&src, &h.ctx()).unwrap();
+    let ev = p.evaluate_file(&ws.join("dir/x"), FileMode::Read, h.path());
+    assert_eq!(ev.path.clone().unwrap().resolved, outside.join("id_rsa"));
+    assert_eq!(
+        ev.action,
+        Action::Deny,
+        "커널이 여는 outside/id_rsa 는 작업 공간 밖이므로 기본값이 적용되어야 함"
+    );
+}
+
+#[test]
+fn dangling_relative_link_resolves_against_the_resolved_parent() {
+    // 대상이 아직 없는 상대 링크도 해소된 부모 기준입니다. create 는 대상이 없는 것이
+    // 정상이므로 여기서 틀리면 시크릿 자리에 파일이 만들어집니다
+    let h = Home::new("dangling-rel-link");
+    let ssh = h.join(".ssh");
+    let sub = ssh.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    std::os::unix::fs::symlink("../authorized_keys", sub.join("ak")).unwrap();
+    let ws = h.join("work");
+    fs::create_dir_all(&ws).unwrap();
+    std::os::unix::fs::symlink(&sub, ws.join("dir")).unwrap();
+
+    let src = format!(
+        r#"
+version = 1
+[defaults]
+file = "deny"
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "{}/work/**"
+action = "allow"
+"#,
+        h.path().display()
+    );
+    let p = Policy::load_str(&src, &h.ctx()).unwrap();
+    let raw = ws.join("dir/ak");
+    for m in [FileMode::Create, FileMode::Write, FileMode::Read] {
+        let ev = p.evaluate_file(&raw, m, h.path());
+        assert_eq!(
+            ev.path.clone().unwrap().resolved,
+            ssh.join("authorized_keys"),
+            "{m:?}: 매달린 상대 링크는 해소된 부모(.ssh/sub) 기준으로 계산되어야 함"
+        );
+        assert_eq!(
+            ev.action,
+            Action::Forbid,
+            "{m:?}: 매달린 링크를 따라가면 ~/.ssh 이므로 forbid 여야 함"
+        );
+    }
+}
+
+// ---------- macOS firmlink Data 볼륨 표기 (H5) ----------
+
+#[cfg(target_os = "macos")]
+fn data_volume_spelling(path: &Path) -> Option<PathBuf> {
+    if !Path::new("/System/Volumes/Data").is_dir() {
+        return None;
+    }
+    let rel = path.strip_prefix("/").ok()?;
+    let spelled = Path::new("/System/Volumes/Data").join(rel);
+    if !spelled.exists() {
+        return None;
+    }
+    Some(spelled)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn data_volume_spelling_of_a_secret_hits_the_baseline_forbid() {
+    // /Users/x/.ssh/id_rsa 와 /System/Volumes/Data/Users/x/.ssh/id_rsa 는 firmlink 로
+    // 같은 파일입니다. canonicalize 는 후자를 후자로 돌려주므로 정규화가 접두를 벗기지
+    // 않으면 ~/.ssh/** forbid 가 통째로 비켜 갑니다
+    let h = Home::new("data-volume-secret");
+    let key = h.make_secret();
+    let Some(spelled) = data_volume_spelling(&key) else {
+        return;
+    };
+
+    let p = Policy::baseline_only(&h.ctx()).unwrap();
+    let ev = p.evaluate_file(&spelled, FileMode::Read, h.path());
+    assert_eq!(
+        ev.path.clone().unwrap().resolved,
+        key,
+        "Data 볼륨 표기는 firmlink 루트 표기로 수렴해야 함"
+    );
+    assert_eq!(
+        ev.action,
+        Action::Forbid,
+        "Data 볼륨 표기의 개인키가 baseline forbid 에 걸려야 함"
+    );
+    assert_eq!(
+        ev.rule.as_ref().map(|r| r.id.as_str()),
+        Some("ssh-private-keys")
+    );
+
+    // 아직 없는 파일(create)도 접두가 벗겨져야 합니다
+    let fresh =
+        Path::new("/System/Volumes/Data").join(h.join(".ssh/new_key").strip_prefix("/").unwrap());
+    let ev = p.evaluate_file(&fresh, FileMode::Create, h.path());
+    assert_eq!(ev.action, Action::Forbid);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn data_volume_spelling_of_a_self_protect_candidate_is_tier_zero() {
+    // 자기보호 후보가 Data 표기로 들어와도, 요청이 어느 표기로 오든 티어 0 이 잡아야 합니다
+    let h = Home::new("data-volume-tier0");
+    let ws = h.join("work");
+    fs::create_dir_all(&ws).unwrap();
+    let Some(ws_spelled) = data_volume_spelling(&ws) else {
+        return;
+    };
+    let planted = ws.join("airlock.toml");
+    let planted_spelled = ws_spelled.join("airlock.toml");
+
+    let ctx = LoadContext::new(h.path(), h.join(".local/share/airlock"))
+        .with_policy_files(vec![planted_spelled.clone()]);
+    let p = Policy::baseline_only(&ctx).unwrap();
+
+    for raw in [&planted, &planted_spelled] {
+        for m in [FileMode::Write, FileMode::Create, FileMode::Delete] {
+            let ev = p.evaluate_file(raw, m, h.path());
+            assert!(
+                ev.action.is_restrictive(),
+                "{}: {m:?}로 정책을 심을 수 있으면 안 됨",
+                raw.display()
+            );
+            assert_eq!(
+                ev.rule.as_ref().map(|r| r.tier),
+                Some(Tier::SelfProtect),
+                "{}: 자기보호 티어가 잡아야 함",
+                raw.display()
+            );
+        }
+    }
+
+    // 감사 로그 루트도 마찬가지입니다
+    let chain_spelled = Path::new("/System/Volumes/Data").join(
+        h.join(".local/share/airlock/sessions/a/chain.jsonl")
+            .strip_prefix("/")
+            .unwrap(),
+    );
+    let ev = p.evaluate_file(&chain_spelled, FileMode::Write, h.path());
+    assert_eq!(ev.rule.as_ref().map(|r| r.tier), Some(Tier::SelfProtect));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn data_volume_spelling_in_a_user_rule_converges_with_the_root_spelling() {
+    // 규칙 경로에도 같은 정규화가 적용되어 두 표기가 하나로 수렴해야 합니다
+    let h = Home::new("data-volume-rule");
+    let ws = h.join("work");
+    fs::create_dir_all(&ws).unwrap();
+    fs::write(ws.join("f"), b"x").unwrap();
+    let Some(ws_spelled) = data_volume_spelling(&ws) else {
+        return;
+    };
+
+    let src = format!(
+        r#"
+version = 1
+[defaults]
+file = "deny"
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "{}/**"
+action = "allow"
+"#,
+        ws_spelled.display()
+    );
+    let p = Policy::load_str(&src, &h.ctx()).unwrap();
+    assert_eq!(
+        p.evaluate_file(&ws.join("f"), FileMode::Read, h.path())
+            .action,
+        Action::Allow,
+        "Data 표기로 적은 allow 가 루트 표기 요청에 걸려야 함"
+    );
+    assert_eq!(
+        p.evaluate_file(&ws_spelled.join("f"), FileMode::Read, h.path())
+            .action,
+        Action::Allow,
+        "Data 표기로 적은 allow 가 Data 표기 요청에도 걸려야 함"
+    );
+
+    let src = format!(
+        r#"
+version = 1
+[defaults]
+file = "deny"
+[[rules]]
+id = "workspace"
+kind = "file"
+path = "{}/**"
+action = "allow"
+"#,
+        ws.display()
+    );
+    let p = Policy::load_str(&src, &h.ctx()).unwrap();
+    assert_eq!(
+        p.evaluate_file(&ws_spelled.join("f"), FileMode::Read, h.path())
+            .action,
+        Action::Allow,
+        "루트 표기로 적은 allow 가 Data 표기 요청에 걸려야 함"
+    );
+}
+
 // ---------- 총량 한도 (max_bytes_out) ----------
 
 fn quota_policy(h: &Home, limit: u64) -> Policy {

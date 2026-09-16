@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use airlock_i18n::tr;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::path::fold_firmlink;
+
 const MAX_DOUBLE_STARS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,14 @@ impl Pattern {
         } else {
             return Err(PatternError::NotAbsolute(raw.to_string()));
         };
+        // 요청 경로와 같은 접기를 규칙에도 적용해야 두 표기가 하나로 수렴합니다 (4절)
+        let expanded: Vec<u8> = if expanded.first() == Some(&b'/') {
+            fold_firmlink(Path::new(std::ffi::OsStr::from_bytes(&expanded)))
+                .into_os_string()
+                .into_vec()
+        } else {
+            expanded
+        };
 
         let mut segs = Vec::new();
         let mut double_stars = 0usize;
@@ -141,14 +151,16 @@ impl Pattern {
     }
 
     pub fn literal(path: &Path) -> Self {
+        let path = fold_firmlink(path);
         Self {
             raw: path.to_string_lossy().into_owned(),
-            segs: literal_segs(path),
+            segs: literal_segs(&path),
         }
     }
 
     pub fn literal_subtree(path: &Path) -> Self {
-        let mut segs = literal_segs(path);
+        let path = fold_firmlink(path);
+        let mut segs = literal_segs(&path);
         segs.push(Seg::DoubleStar);
         Self {
             raw: format!("{}/**", path.to_string_lossy()),
@@ -223,7 +235,7 @@ impl Pattern {
             }
             let candidate = PathBuf::from(std::ffi::OsString::from_vec(prefix));
             if let Ok(c) = std::fs::canonicalize(&candidate) {
-                break (candidate, c);
+                break (candidate, fold_firmlink(&c));
             }
             taken -= 1;
         };
