@@ -271,8 +271,23 @@ impl Enforcer for SeatbeltEnforcer {
             )
             .to_string()
         };
-        let mut gaps = vec![
-            egress_note,
+        let mut gaps = vec![egress_note];
+        if self.options.proxy.is_some() && self.options.allow_network {
+            // 허용 목록에 남긴 소켓은 프록시도 감사도 거치지 않으므로 숨기지 않습니다
+            let sockets = profile::PROXY_UNIX_SOCKET_LITERALS.join(", ");
+            gaps.push(tr!(
+                format!(
+                    "유닉스 소켓은 시스템 데몬 소켓 {sockets} 만 열림 (DNS 와 로그). \
+                     그 연결은 프록시와 감사 로그를 거치지 않음. 나머지 유닉스 소켓은 커널이 거부함"
+                ),
+                format!(
+                    "unix sockets open only to the system daemon sockets {sockets} (DNS and \
+                     logging); those connections bypass the proxy and the audit log; every \
+                     other unix socket is refused by the kernel"
+                )
+            ));
+        }
+        gaps.extend([
             profile::ask_rules_are_denied_note().to_string(),
             tr!(
                 "커널이 거부한 개별 파일·네트워크 접근은 감사 로그에 남지 않음. \
@@ -288,7 +303,7 @@ impl Enforcer for SeatbeltEnforcer {
                  is outside the policy model and the audit log"
             )
             .to_string(),
-        ];
+        ]);
         if !self.untranslatable.is_empty() {
             gaps.push(tr!(
                 format!(
@@ -373,6 +388,45 @@ mod tests {
         let gaps = e.gaps();
         assert!(gaps.iter().any(|g| g.contains("egress")));
         assert!(gaps.iter().any(|g| g.contains("ask")));
+    }
+
+    /// 프록시 모드에 남긴 유닉스 소켓 허용 목록은 배너가 밝혀야 합니다
+    #[test]
+    fn the_proxy_mode_declares_its_unix_socket_allow_list() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 18899));
+        let mut e =
+            SeatbeltEnforcer::new().with_options(ProfileOptions::default().with_proxy(addr));
+        e.prepare(&policy()).unwrap();
+        let gaps = e.gaps();
+        for sock in profile::PROXY_UNIX_SOCKET_LITERALS {
+            assert!(
+                gaps.iter().any(|g| g.contains(sock)),
+                "허용 목록의 {sock} 이 gap 에 없음: {gaps:?}"
+            );
+        }
+
+        let mut plain = SeatbeltEnforcer::new();
+        plain.prepare(&policy()).unwrap();
+        assert!(
+            !plain
+                .gaps()
+                .iter()
+                .any(|g| g.contains("/private/var/run/mDNSResponder")),
+            "프록시가 없는 모드에서 프록시 전용 gap 이 나옴"
+        );
+
+        let mut off = SeatbeltEnforcer::new().with_options(
+            ProfileOptions::default()
+                .with_proxy(addr)
+                .with_network(false),
+        );
+        off.prepare(&policy()).unwrap();
+        assert!(
+            !off.gaps()
+                .iter()
+                .any(|g| g.contains("/private/var/run/mDNSResponder")),
+            "--no-network 에서는 유닉스 소켓이 하나도 열리지 않으므로 gap 도 없어야 함"
+        );
     }
 
     #[test]

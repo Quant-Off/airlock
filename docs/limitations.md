@@ -240,7 +240,7 @@ Landlock이 등록하는 LSM 훅에는 `mmap_file`도 `file_mprotect`도 없습�
 
 `allow` 모드에서 방출하지 않는 이유는 사람이 승인한 실행이 커널에서 막혀 어떤 방법으로도 진행할 수 없게 되기 때문입니다. macOS에는 중계 층도 없으므로(2.6), 그 모드에서 `danger-rm`/`sudo-exec`/`pipe-curl-to-shell` 같은 규칙은 **강제되지도 기록되지도 않습니다.** 화이트리스트 모드에서는 커널이 거부하지만, 사람에게 물어볼 통로가 없어 승인으로 되돌릴 방법도 없습니다.
 
-egress는 `--egress-proxy` 여부로 갈립니다. 플래그가 없으면 egress allow 규칙이 하나라도 있을 때 `(allow network-outbound)`로 아웃바운드가 통째로 열리고, 호스트 규칙은 전부 gap이 됩니다. 플래그가 있으면 프로파일이 `(allow network-outbound (remote ip "localhost:<프록시포트>"))` 하나로 좁아져 프록시가 유일한 출구가 되고, 호스트 판정이 실제 경계를 갖습니다. 규격은 `docs/egress-proxy.md`입니다.
+egress는 `--egress-proxy` 여부로 갈립니다. 플래그가 없으면 egress allow 규칙이 하나라도 있을 때 `(allow network-outbound)`로 아웃바운드가 통째로 열리고, 호스트 규칙은 전부 gap이 됩니다. 플래그가 있으면 프로파일이 `(allow network-outbound (remote ip "localhost:<프록시포트>"))` 와 유닉스 소켓 리터럴 두 개(mDNSResponder, syslog. 4.5)로 좁아져 IP 연결은 프록시가 유일한 출구가 되고, 호스트 판정이 실제 경계를 갖습니다. 규격은 `docs/egress-proxy.md` 6.1 입니다.
 
 ### 4.1.1 프록시 모드에서도 DNS는 경계 밖이다
 
@@ -270,7 +270,9 @@ egress는 `--egress-proxy` 여부로 갈립니다. 플래그가 없으면 egress
 
 - `(allow process-exec*)` (`profile.rs:237`): **`[defaults].exec = "allow"`인 정책에만 방출됩니다.** 그 설정에서는 명시 deny가 없는 모든 exec이 허용됩니다. `ask`/`deny`/`forbid`이면 이 줄이 없고 허용 목록만 열립니다 (4.12).
 - `(allow mach-lookup)` (`profile.rs:245`): 클립보드 두 개만 막고 (`profile.rs:247-248`) 나머지 XPC/Mach 서비스는 전부 닿습니다. XPC로 오가는 것은 정책 모델 밖이자 감사 로그 밖입니다 (gap: `seatbelt.rs:255-257`).
-- `(allow file-read-metadata)` (`profile.rs:255`): 시스템 전체 경로의 존재/크기/mtime을 읽을 수 있습니다.
+- `(allow file-read-metadata)` (`profile.rs:255`): 시스템 전체 경로의 존재/크기/mtime을 읽을 수 있습니다. 유닉스 소켓의 경로도 여기 포함되므로, 환경 변수를 벗겨도(9.6) 소켓 위치는 디렉토리 나열로 다시 찾을 수 있습니다.
+- `(allow network-outbound (literal ...))` 두 줄, 프록시 모드 전용 (`profile.rs`의 `PROXY_UNIX_SOCKET_LITERALS`): `/private/var/run/mDNSResponder`와 `/private/var/run/syslog`. 이전에는 `(allow network-outbound (remote unix))`로 **모든** 유닉스 소켓이 열려 있어 ssh-agent 소켓, `docker.sock`, 바깥의 임의 `nc -lU` 리스너가 프록시도 감사도 거치지 않고 닿았습니다 (Darwin 25에서 재현). 지금은 이 두 리터럴만 열리며, 항목별 근거는 `egress-proxy.md` 6.1에 있습니다. 둘 다 루트 소유 시스템 데몬이고 주는 능력은 DNS 질의(4.1.1)와 로컬 로그 쓰기뿐입니다. 프록시 모드 gap으로 배너에 나옵니다.
+- `(allow network-outbound)` (egress allow 규칙이 있고 `--egress-proxy`가 없을 때, `profile.rs`의 `network_allowed` 분기): IP뿐 아니라 유닉스 소켓도 통째로 열립니다. 곧 이 모드에서는 `docker.sock`과 ssh-agent 소켓이 닿습니다. 이 모드는 4.1대로 호스트 규칙이 애초에 강제되지 않는 모드이며, 유닉스 소켓 축소는 프록시 모드에서만 합니다. 유닉스 소켓을 정책으로 표현할 어휘가 없으므로(6.8) 이 모드까지 좁히면 `docker` CLI 같은 정당한 사용을 되살릴 길이 없어 그대로 둡니다. `--no-network`는 아웃바운드 규칙을 하나도 방출하지 않아 유닉스 소켓까지 전부 닫힙니다.
 
 ### 4.6 `(with no-report)`가 OS 자체 위반 로그를 끈다
 
@@ -789,9 +791,13 @@ PID/마운트/유저/네트워크 네임스페이스 어느 것도 쓰지 않습
 
 ### 9.6 환경 정화가 고정 거부 목록이다
 
-`INJECTION_PREFIXES = ["LD_", "DYLD_"]`와 14개 정확 일치 목록입니다 (`session.rs:418-436`).
+`INJECTION_PREFIXES = ["LD_", "DYLD_"]`, 14개 정확 일치 목록 `INJECTION_EXACT`, 그리고 호스트 데몬 소켓을 가리키는 `SOCKET_HANDLE_EXACT = ["SSH_AUTH_SOCK", "DOCKER_HOST"]`입니다 (`session.rs`의 `sanitize_env`).
 
-허용 목록이 아니라 거부 목록이라 목록에 없는 로더/인터프리터 훅은 그대로 통과합니다. `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `GEM_PATH`, `LUA_INIT`, `R_PROFILE`, `PYTHONHOME`, `GIT_CONFIG_GLOBAL`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`가 예입니다. `PATH`는 의도적으로 보존합니다 (`session.rs:438-441`).
+허용 목록이 아니라 거부 목록이라 목록에 없는 로더/인터프리터 훅은 그대로 통과합니다. `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `GEM_PATH`, `LUA_INIT`, `R_PROFILE`, `PYTHONHOME`, `GIT_CONFIG_GLOBAL`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`가 예입니다. `PATH`는 의도적으로 보존합니다.
+
+`SSH_AUTH_SOCK`과 `DOCKER_HOST`를 벗기는 근거는 시크릿 경로 기본 deny의 연장입니다. 베이스라인은 `~/.ssh`를 forbid하지만 ssh-agent 소켓은 같은 키로 서명하는 능력을 다른 문으로 내주고, `docker.sock`은 호스트 루트와 다름없는 능력입니다. 키 파일을 막으면서 그 키를 쓰는 소켓의 주소를 자식에게 건네는 것은 모순이므로, 둘 다 기본으로 벗깁니다. 완화는 사용자가 정책으로 정당화해야 하는데 **지금은 그 어휘가 없습니다** (6.8, 유닉스 소켓과 환경 변수 모두). 곧 airlock 아래에서 ssh-agent나 Docker를 써야 하는 사용자는 현재 정당한 경로가 없으며, 이는 조용히 넘기는 쪽이 아니라 닫아 두는 쪽을 택한 결과입니다. 완화 축은 `kind = "env"`나 유닉스 소켓 규칙으로 명시적으로 들어와야 하고 기본값을 되돌리는 방식이어서는 안 됩니다.
+
+벗기는 것은 가리키는 값이지 소켓 자체가 아닙니다. 소켓 경로는 `file-read-metadata`(4.5)로 다시 찾을 수 있으므로 실제 차단은 커널 층의 몫입니다. macOS 프록시 모드는 유닉스 소켓을 두 리터럴로 좁혀 막고(4.5), macOS의 egress allow 모드와 Linux는 막지 않습니다 (5.13, `egress-proxy.md` 6.2).
 
 ### 9.7 강제 gap이 감사 체인에 절대 기록되지 않는다
 

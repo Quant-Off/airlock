@@ -394,6 +394,130 @@ action = "allow"
     drop(accepting);
 }
 
+fn run_under_sandbox_with(opts: ProfileOptions, policy: &Policy, argv: &[&str]) -> bool {
+    let mut enforcer = SeatbeltEnforcer::new().with_options(opts);
+    enforcer.prepare(policy).unwrap();
+
+    let (program, rest) = argv.split_first().expect("빈 argv");
+    let mut cmd = Command::new(program);
+    cmd.args(rest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+    enforcer.wrap(&mut cmd).unwrap();
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// 바깥에서 띄운 유닉스 소켓 리스너.
+///
+/// 짧은 경로가 필요합니다. `sockaddr_un` 의 경로 상한(104 바이트) 때문에 temp_dir
+/// 아래 긴 이름은 bind 자체가 실패합니다
+fn unix_listener(tag: &str) -> (PathBuf, std::os::unix::net::UnixListener) {
+    let path = PathBuf::from(format!("/tmp/airlock-{tag}-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    (path, listener)
+}
+
+/// 프록시 모드에서 유닉스 소켓은 허용 목록 밖이면 커널이 거부해야 합니다.
+///
+/// `(remote unix)` 통째 개방이 남아 있으면 ssh-agent 와 docker.sock 이 프록시도
+/// 감사도 거치지 않는 출구가 됩니다. 대조군으로 egress allow 모드에서는 같은 연결이
+/// 성공하는 것을 확인해, 실패가 프로파일 때문이지 환경 때문이 아님을 고정합니다
+#[test]
+fn a_proxy_refuses_unix_sockets_outside_the_allow_list() {
+    let s = Scratch::new("unix-proxy");
+    let (sock, listener) = unix_listener("unix-proxy");
+    let accepting = std::thread::spawn(move || {
+        for _ in 0..2 {
+            if listener.accept().is_err() {
+                break;
+            }
+        }
+    });
+
+    let sock_s = sock.to_string_lossy().into_owned();
+    // `-z` 는 유닉스 소켓에서 성공해도 1 을 돌려주므로 실제 연결 뒤 stdin EOF 로 끝냅니다
+    let argv = ["/usr/bin/nc", "-U", "-w", "1", sock_s.as_str()];
+    let policy = policy_with(
+        s.path(),
+        r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+"#,
+    );
+
+    // 대조군. 프록시 없는 egress allow 모드는 아웃바운드가 통째로 열립니다
+    assert!(
+        run_under_sandbox_with(
+            ProfileOptions::default().with_workspace(s.path()),
+            &policy,
+            &argv
+        ),
+        "대조군인 egress allow 모드에서 유닉스 소켓 연결이 실패하면 이 테스트가 무의미함"
+    );
+
+    let proxy = std::net::SocketAddr::from(([127, 0, 0, 1], 18899));
+    assert!(
+        !run_under_sandbox_with(
+            ProfileOptions::default()
+                .with_workspace(s.path())
+                .with_proxy(proxy),
+            &policy,
+            &argv
+        ),
+        "프록시 모드에서 허용 목록 밖의 유닉스 소켓에 연결됨. (remote unix) 통째 개방이 남아 있음"
+    );
+
+    drop(accepting);
+    let _ = fs::remove_file(&sock);
+}
+
+/// 허용 목록의 시스템 소켓은 프록시 모드에서도 닿아야 합니다. 이름 해석이 그 위에 있습니다.
+///
+/// `nc` 는 stream 소켓만 다루고 syslog 소켓은 datagram 이라 perl 로 두 타입을 다 시도합니다
+#[test]
+fn a_proxy_still_reaches_the_listed_system_sockets() {
+    const PERL: &str = "/usr/bin/perl";
+    if !Path::new(PERL).is_file() {
+        return;
+    }
+    let s = Scratch::new("unix-mdns");
+    let policy = policy_with(
+        s.path(),
+        r#"
+[[rules]]
+id = "anthropic"
+kind = "egress"
+host = "api.anthropic.com"
+port = 443
+action = "allow"
+"#,
+    );
+    let proxy = std::net::SocketAddr::from(([127, 0, 0, 1], 18899));
+    let opts = ProfileOptions::default()
+        .with_workspace(s.path())
+        .with_proxy(proxy);
+    let probe = "use Socket; my $p = shift; \
+        for my $t (SOCK_STREAM, SOCK_DGRAM) { \
+            socket(my $s, PF_UNIX, $t, 0) or next; \
+            exit 0 if connect($s, sockaddr_un($p)); \
+        } exit 1";
+    for sock in airlock_broker::profile::PROXY_UNIX_SOCKET_LITERALS {
+        if !Path::new(sock).exists() {
+            continue;
+        }
+        assert!(
+            run_under_sandbox_with(opts.clone(), &policy, &[PERL, "-e", probe, sock]),
+            "허용 목록의 {sock} 에 연결되지 않음. 리터럴 방출이 깨졌거나 경로가 vnode 경로와 다름"
+        );
+    }
+}
+
 // ---------- exec 화이트리스트 ----------
 
 fn whitelist_policy(scratch: &Path, rules: &str) -> Policy {

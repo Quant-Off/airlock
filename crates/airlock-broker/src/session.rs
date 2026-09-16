@@ -826,6 +826,81 @@ pub fn which(program: &str) -> Option<PathBuf> {
     None
 }
 
+/// 로더 주입에 쓰이는 환경 변수 접두.
+///
+/// 이 값들이 살아 있으면 정책이 경로로 허용한 프로그램 안에서 남의 코드가 돕니다.
+/// `kind = "exec"` allowlist 가 통째로 무의미해지므로 전달하지 않습니다
+const INJECTION_PREFIXES: &[&str] = &["LD_", "DYLD_"];
+
+/// 쉘이 시작할 때 읽어 실행하는 환경 변수.
+const INJECTION_EXACT: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "IFS",
+    "PS4",
+    "PERL5OPT",
+    "PERL5LIB",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "NODE_OPTIONS",
+    "RUBYOPT",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SSH_COMMAND",
+];
+
+/// 호스트 데몬 소켓을 가리키는 환경 변수.
+///
+/// 시크릿 경로 기본 deny 의 연장입니다. `~/.ssh` 를 막으면서 같은 키로 서명해 주는
+/// ssh-agent 소켓의 주소를 건네는 것은 모순이고, `DOCKER_HOST` 가 가리키는 소켓은
+/// 호스트 루트와 다름없는 능력입니다. 완화 어휘가 정책에 생기기 전까지는 벗깁니다
+/// (`docs/limitations.md` 9.6)
+const SOCKET_HANDLE_EXACT: &[&str] = &["SSH_AUTH_SOCK", "DOCKER_HOST"];
+
+/// 자식에게 넘기지 않을 환경 변수인지.
+///
+/// # Arguments
+/// `key` - UTF-8 로 읽힌 변수 이름
+fn env_is_stripped(key: &str) -> bool {
+    INJECTION_PREFIXES.iter().any(|p| key.starts_with(p))
+        || INJECTION_EXACT.contains(&key)
+        || SOCKET_HANDLE_EXACT.contains(&key)
+        // 감사 로그 위치를 알려 줄 이유가 없습니다
+        || key == "AIRLOCK_AUDIT_DIR"
+}
+
+/// 자식에게 넘길 환경에서 코드 주입 통로와 호스트 데몬 소켓 핸들을 걷어냅니다.
+///
+/// 통째로 비우지 않는 이유는 에이전트가 `PATH`, `HOME`, `TERM` 없이는 정상 동작하지
+/// 않기 때문입니다. 대신 로더와 인터프리터가 시작 시점에 실행하는 값과 소켓을 가리키는
+/// 값만 지웁니다.
+///
+/// # Arguments
+/// `cmd` - 환경을 정리할 명령
+fn sanitize_env(cmd: &mut Command) {
+    sanitize_env_from(cmd, std::env::vars_os().map(|(k, _)| k));
+}
+
+/// [`sanitize_env`] 의 본체. 검사할 변수 이름을 밖에서 받아 프로세스 환경을 건드리지
+/// 않고도 검증할 수 있게 합니다.
+///
+/// # Arguments
+/// `cmd` - 환경을 정리할 명령
+/// `keys` - 자식에게 상속될 후보 변수 이름
+fn sanitize_env_from(cmd: &mut Command, keys: impl IntoIterator<Item = std::ffi::OsString>) {
+    for key in keys {
+        let Some(k) = key.to_str() else {
+            // UTF-8이 아닌 변수 이름은 검사할 수 없으므로 넘기지 않습니다
+            cmd.env_remove(&key);
+            continue;
+        };
+        if env_is_stripped(k) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RunReport {
     pub audit_dir: PathBuf,
@@ -878,54 +953,6 @@ pub fn run(
     // 그때는 배너가 이미 나간 뒤라 규칙 수와 gap 이 실제로 걸릴 프로파일과 어긋납니다
     enforcer.set_program(&resolved);
     enforcer.prepare(&policy)?;
-
-    /// 로더 주입에 쓰이는 환경 변수 접두.
-    ///
-    /// 이 값들이 살아 있으면 정책이 경로로 허용한 프로그램 안에서 남의 코드가 돕니다.
-    /// `kind = "exec"` allowlist 가 통째로 무의미해지므로 전달하지 않습니다
-    const INJECTION_PREFIXES: &[&str] = &["LD_", "DYLD_"];
-
-    /// 쉘이 시작할 때 읽어 실행하는 환경 변수.
-    const INJECTION_EXACT: &[&str] = &[
-        "BASH_ENV",
-        "ENV",
-        "SHELLOPTS",
-        "BASHOPTS",
-        "IFS",
-        "PS4",
-        "PERL5OPT",
-        "PERL5LIB",
-        "PYTHONSTARTUP",
-        "PYTHONPATH",
-        "NODE_OPTIONS",
-        "RUBYOPT",
-        "GIT_EXTERNAL_DIFF",
-        "GIT_SSH_COMMAND",
-    ];
-
-    /// 자식에게 넘길 환경에서 코드 주입 통로를 걷어냅니다.
-    ///
-    /// 통째로 비우지 않는 이유는 에이전트가 `PATH`, `HOME`, `TERM` 없이는 정상 동작하지
-    /// 않기 때문입니다. 대신 로더와 인터프리터가 시작 시점에 실행하는 값만 지웁니다.
-    ///
-    /// # Arguments
-    /// `cmd` - 환경을 정리할 명령
-    fn sanitize_env(cmd: &mut Command) {
-        for (key, _) in std::env::vars_os() {
-            let Some(k) = key.to_str() else {
-                // UTF-8이 아닌 변수 이름은 검사할 수 없으므로 넘기지 않습니다
-                cmd.env_remove(&key);
-                continue;
-            };
-            let strip = INJECTION_PREFIXES.iter().any(|p| k.starts_with(p))
-                || INJECTION_EXACT.contains(&k)
-                // 감사 로그 위치를 알려 줄 이유가 없습니다
-                || k == "AIRLOCK_AUDIT_DIR";
-            if strip {
-                cmd.env_remove(&key);
-            }
-        }
-    }
 
     let enforcement = enforcer.kind();
     let mut gaps = enforcer.gaps();
@@ -1277,5 +1304,56 @@ mod tests {
             PathBuf::from("/mnt/wormvol"),
             "명시한 앵커 루트가 이겨야 분리가 가능함"
         );
+    }
+
+    /// 소켓 핸들 변수는 시크릿 경로 기본 deny 의 연장으로 자식에게 넘기지 않습니다
+    #[test]
+    fn socket_handles_and_injection_hooks_are_stripped_from_the_child_env() {
+        use std::ffi::OsString;
+
+        let mut cmd = std::process::Command::new("/usr/bin/true");
+        let keys = [
+            "SSH_AUTH_SOCK",
+            "DOCKER_HOST",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "BASH_ENV",
+            "AIRLOCK_AUDIT_DIR",
+            "PATH",
+            "HOME",
+            "TERM",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        super::sanitize_env_from(&mut cmd, keys);
+
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for key in [
+            "SSH_AUTH_SOCK",
+            "DOCKER_HOST",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "BASH_ENV",
+            "AIRLOCK_AUDIT_DIR",
+        ] {
+            assert!(
+                removed.iter().any(|r| r == key),
+                "{key} 가 자식에게 넘어감: {removed:?}"
+            );
+        }
+        for key in ["PATH", "HOME", "TERM"] {
+            assert!(
+                !removed.iter().any(|r| r == key),
+                "{key} 는 보존해야 함: {removed:?}"
+            );
+        }
+        assert!(super::env_is_stripped("SSH_AUTH_SOCK"));
+        assert!(super::env_is_stripped("DOCKER_HOST"));
+        assert!(!super::env_is_stripped("DOCKER_HOSTNAME"));
+        assert!(!super::env_is_stripped("SSH_AUTH_SOCKET"));
     }
 }

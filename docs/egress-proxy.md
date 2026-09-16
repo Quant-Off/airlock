@@ -134,19 +134,36 @@ v1은 릴레이 구간에서 내용을 해석하지 않습니다. 그 다음 단
 
 ## 6. 플랫폼 결합
 
-프록시가 유일한 출구가 되게 만드는 부분입니다. 이것이 없으면 프록시는 그냥 편의 기능입니다.
+프록시를 실제 경계로 만드는 부분입니다. 이것이 없으면 프록시는 그냥 편의 기능입니다. "프록시가 유일한 출구"라는 말은 플랫폼과 조건이 붙어야 참이 되며, 그 조건은 아래에 정확히 적습니다.
 
 ### 6.1 macOS (Seatbelt)
 
-egress 프록시가 켜지면 프로파일의 아웃바운드 규칙을 루프백 한정으로 좁힙니다.
+egress 프록시가 켜지면(`--egress-proxy`가 있고 `--no-network`가 없을 때) 프로파일의 아웃바운드 규칙을 루프백 한 포트와 시스템 데몬 소켓 두 개로 좁힙니다.
 
 ```
-(deny network-outbound)
+(deny default)
 (allow network-outbound (remote ip "localhost:<프록시포트>"))
-(allow network-outbound (remote unix))
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
+(allow network-outbound (literal "/private/var/run/syslog"))
 ```
 
 Darwin 25.4(macOS 26.4) arm64에서 동작을 확인했습니다. 허용 포트는 연결되고, 같은 루프백의 다른 포트와 외부 IP는 커널이 거부합니다. `localhost:<포트>`는 IPv4와 IPv6 루프백 양쪽에 매칭합니다.
+
+**유닉스 도메인 소켓은 통째로 열지 않습니다.** 이전 프로파일은 `(allow network-outbound (remote unix))`를 무조건 방출했고, 그것은 자식이 호스트의 어떤 유닉스 소켓에든 붙을 수 있다는 뜻이었습니다. Darwin 25에서 실측한 결과 자식은 바깥에서 띄운 `nc -lU` 리스너로 데이터를 내보냈고, 상속된 `SSH_AUTH_SOCK`으로 ssh-agent에 서명을 요청할 수 있었으며, `/private/var/run/docker.sock`이 살아 있는 호스트라면 컨테이너 데몬에 그대로 닿았습니다. 전부 프록시도 감사 로그도 거치지 않습니다. 곧 "유일한 출구"는 IP 연결에만 참이었습니다.
+
+지금은 경로 리터럴 허용 목록만 방출합니다 (`profile.rs`의 `PROXY_UNIX_SOCKET_LITERALS`). 항목마다 근거는 다음과 같습니다.
+
+| 소켓 | 판단 | 근거 |
+|------|------|------|
+| `/private/var/run/mDNSResponder` | 유지 | `getaddrinfo`가 이 소켓으로 mDNSResponder에 묻습니다. 막으면 외부 이름 해석이 전부 `EAI_NONAME`으로 실패합니다 (`/etc/hosts`의 `localhost`는 여전히 풀립니다). 루트 소유 데몬이며 DNS-SD 프로토콜만 받으므로 이 소켓이 주는 능력은 이름 질의뿐이고, 그것은 이미 7절과 `limitations.md` 4.1.1이 밝힌 DNS 반출 구멍 그대로입니다. 열어 둬도 새로 생기는 능력은 없습니다 |
+| `/private/var/run/syslog` | 유지 | syslogd의 `syslog(3)` 입력 소켓입니다. Apple의 기반 프로파일 `system.sb`가 모든 샌드박스 프로세스에 여는 유일한 유닉스 소켓입니다. 루트 소유이고 쓰기 전용 로그 싱크라 파일·exec·네트워크 어느 능력도 주지 않습니다. Darwin 25의 `logger(1)`는 logd XPC로 가므로 이 소켓 없이도 동작하지만, `syslog(3)`를 직접 부르는 도구와 검증하지 않은 OS 버전을 위해 남깁니다 |
+| `/private/var/run/asl_input` | 제외 | Darwin 25에 존재하지 않고 현재 `system.sb`에도 없습니다. 죽은 항목을 허용 목록에 두지 않습니다 |
+
+Seatbelt는 유닉스 소켓을 vnode 경로로 비교하므로 `/var/run/...`(심볼릭 링크)은 `/private/var/run/...`으로 적어야 매칭합니다. `/private/var/run`은 루트 소유 디렉토리라 자식이 같은 이름의 소켓을 미리 만들어 허용 목록을 가로챌 수 없습니다. 방출은 다른 경로 규칙과 같은 `sbpl::quote`를 거칩니다.
+
+남는 두 소켓은 프록시 모드의 enforcer gap으로 배너에 그대로 나옵니다 (`seatbelt.rs`의 `gaps`). 두 연결 모두 프록시와 감사 로그 밖입니다.
+
+**정확한 문장.** macOS에서 `--egress-proxy`가 켜지고 `--no-network`가 없을 때, 커널이 자식에게 허용하는 아웃바운드는 프록시 포트 하나와 위 두 소켓뿐입니다. 곧 IP로 나가는 연결은 프록시가 유일한 출구이고, 유닉스 소켓은 DNS와 로그 두 개만 남습니다. `--no-network`면 아웃바운드 규칙을 하나도 방출하지 않으므로 유닉스 소켓까지 전부 닫힙니다. `--egress-proxy` 없이 egress allow 규칙만 있는 정책은 `(allow network-outbound)`로 IP와 유닉스 소켓을 통째로 엽니다. 그 모드는 원래 호스트 규칙이 강제되지 않는 모드이며(`limitations.md` 4.1, 4.5) 유닉스 소켓 축소는 프록시 모드에서만 합니다.
 
 이 결합이 지금까지의 "egress allow가 하나라도 있으면 아웃바운드를 통째로 연다"는 한계(`limitations.md` 4장)를 macOS에서 해소합니다.
 
@@ -154,9 +171,14 @@ Darwin 25.4(macOS 26.4) arm64에서 동작을 확인했습니다. 허용 포트�
 
 **현재 구현.** Landlock의 TCP 포트 허용 목록이 프록시 포트 하나로 줄어듭니다. 정책의 포트 목록은 이제 프록시가 대신 나가므로 자식에게 열지 않습니다.
 
-이것만으로는 프록시가 유일한 출구가 되지 않습니다. Landlock은 포트까지만 보고 목적지 IP를 보지 못하므로, 자식이 자기 환경에 적힌 프록시 포트를 그대로 써서 외부 호스트에 직접 연결하면 프록시를 건너뜁니다. 이 잔여 구멍은 enforcer gap으로 배너에 노출합니다. **곧 Linux에서 `--egress-proxy`는 macOS와 달리 아직 fail-closed가 아닙니다.**
+이것만으로는 프록시가 유일한 출구가 되지 않습니다. 두 가지 이유입니다.
 
-**후속.** 자식을 `CLONE_NEWUSER | CLONE_NEWNET`로 새 네트워크 네임스페이스에 넣으면 그 안에는 루프백뿐이라 외부로 나갈 경로 자체가 사라집니다. 소켓은 생성 시점의 netns에 묶이므로 브로커가 자식 netns 안에서 리스너를 만들고 accept 루프는 호스트 쪽에서 돕니다. 이 단계가 들어와야 Linux도 macOS와 같은 경계를 갖고, 6.1의 DNS 구멍까지 함께 닫힙니다.
+- Landlock은 포트까지만 보고 목적지 IP를 보지 못하므로, 자식이 자기 환경에 적힌 프록시 포트를 그대로 써서 외부 호스트에 직접 연결하면 프록시를 건너뜁니다.
+- **Landlock은 유닉스 도메인 소켓을 다루지 않습니다** (추상 소켓은 ABI >= 6의 스코프만 막힙니다, `limitations.md` 3.9). seccomp 중계 층도 `connect(2)`의 피어가 INET이 아니면 평가 없이 통과시킵니다 (`limitations.md` 5.13). 곧 Linux의 프록시 모드에서 자식은 ssh-agent 소켓, `docker.sock`, 임의 유닉스 리스너에 그대로 닿고, 그 연결은 기록되지 않습니다. 브로커가 `SSH_AUTH_SOCK`과 `DOCKER_HOST`를 자식 환경에서 벗기지만(`limitations.md` 9.6) 그것은 가리키는 손가락을 지우는 것이지 소켓 자체를 막는 것이 아닙니다. 경로는 디렉토리 나열로 다시 찾을 수 있습니다.
+
+이 잔여 구멍은 enforcer gap으로 배너에 노출합니다. **곧 Linux에서 `--egress-proxy`는 macOS와 달리 아직 fail-closed가 아니며, 유닉스 소켓에 대해서는 어느 층도 경계가 아닙니다.**
+
+**후속.** 자식을 `CLONE_NEWUSER | CLONE_NEWNET`로 새 네트워크 네임스페이스에 넣으면 그 안에는 루프백뿐이라 외부로 나갈 경로 자체가 사라집니다. 소켓은 생성 시점의 netns에 묶이므로 브로커가 자식 netns 안에서 리스너를 만들고 accept 루프는 호스트 쪽에서 돕니다. 이 단계가 들어와야 Linux도 macOS와 같은 IP 경계를 갖고, 6.1의 DNS 구멍까지 함께 닫힙니다. 경로 기반 유닉스 소켓은 netns로도 닫히지 않으므로(파일시스템 네임스페이스의 문제입니다) 마운트 네임스페이스나 seccomp의 `AF_UNIX` `connect` 판정이 따로 필요합니다.
 
 ### 6.3 결합 실패 시
 
@@ -166,7 +188,9 @@ Darwin 25.4(macOS 26.4) arm64에서 동작을 확인했습니다. 허용 포트�
 
 프록시 층이 들어와도 남는 것들입니다. 배너와 `limitations.md`에 그대로 노출합니다.
 
-- **DNS 반출 (macOS).** 자식의 이름 해석은 mDNSResponder를 거치며 이 경로는 `network-outbound`가 아닙니다. `mach-lookup` deny로도 막히지 않는 것을 확인했습니다. 곧 자식은 `<유출데이터>.attacker.com` 질의로 데이터를 내보낼 수 있습니다. netns가 들어오는 Linux 후속 단계에서는 이 경로가 함께 끊깁니다.
+- **DNS 반출 (macOS).** 자식의 이름 해석은 `/private/var/run/mDNSResponder` 유닉스 소켓으로 mDNSResponder에 갑니다. 6.1대로 이 소켓은 이름 해석을 살리기 위해 일부러 허용 목록에 남겼고, `mach-lookup` deny로는 막히지 않는 것을 확인했습니다. 곧 자식은 `<유출데이터>.attacker.com` 질의로 데이터를 내보낼 수 있습니다. 이 소켓을 허용 목록에서 빼면 구멍은 닫히지만 `getaddrinfo`가 전부 실패하므로, 그 결정은 별도 옵션으로 다룰 후속입니다. netns가 들어오는 Linux 후속 단계에서는 이 경로가 함께 끊깁니다.
+- **시스템 로그 소켓 (macOS).** `/private/var/run/syslog`도 허용 목록에 남습니다. 로컬 로그 싱크라 반출 경로는 아니지만 자식이 시스템 로그에 임의 줄을 써 넣을 수 있고, 그것은 감사 로그 밖입니다.
+- **유닉스 소켓 전반 (Linux).** 6.2대로 Landlock도 seccomp 중계도 유닉스 소켓을 보지 않습니다. ssh-agent, `docker.sock`, 임의 리스너가 프록시 모드에서도 닿고 기록되지 않습니다. macOS에서는 6.1의 허용 목록 두 개 외에는 커널이 거부합니다.
 - **프록시 우회 (Linux).** 6.2대로 현재 Linux 백엔드는 포트까지만 강제하므로 자식이 프록시 포트로 외부에 직접 연결할 수 있습니다. netns가 들어오기 전까지 Linux의 `--egress-proxy`는 강제가 아니라 관측에 가깝습니다.
 - **DNS 리바인딩.** 4절대로 해석된 IP를 재판정하지 않습니다.
 - **CONNECT 대상이 IP 리터럴인 경우.** 호스트 패턴 규칙은 IP에 매칭하지 않으므로(`policy-dsl.md` 8절) `[defaults].egress`로 떨어집니다. 기본값이 deny면 막히지만, 호스트 allowlist를 통과하는 것은 아닙니다.
