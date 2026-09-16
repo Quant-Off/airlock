@@ -276,3 +276,164 @@ fn enforcement_field_is_recorded_on_mediated_entries() {
         "모든 엔트리가 강제 수준을 달고 있어야 함"
     );
 }
+
+fn file_decisions(
+    entries: &[airlock_audit::Entry],
+) -> Vec<(String, String, airlock_audit::Decision)> {
+    entries
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::FileAccess {
+                path_requested,
+                mode,
+                ..
+            } => Some((
+                path_requested.clone(),
+                mode.as_str().to_string(),
+                e.decision,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `--mediate full` 은 rename 의 원본을 `delete` 로 판정합니다. 이름 변경은 openat 을 거치지
+/// 않으므로 이것이 없으면 삭제 금지 규칙이 `mv` 한 번에 비껴갑니다
+#[test]
+fn full_mediation_refuses_a_rename_whose_source_may_not_be_deleted() {
+    let s = Scratch::new("rename-deny");
+    let keep = s.path().join("keep.txt");
+    let moved = s.path().join("moved.txt");
+    fs::write(&keep, b"stay\n").unwrap();
+
+    let policy = policy_from(
+        s.path(),
+        &format!(
+            r#"
+[[rules]]
+id = "keep-name"
+kind = "file"
+path = "{}"
+mode = ["delete"]
+action = "deny"
+reason = "테스트"
+"#,
+            keep.display()
+        ),
+    );
+    let (_, entries) = run_it(
+        s.path(),
+        policy,
+        Mediation::Full,
+        "/bin/mv",
+        &[keep.to_str().unwrap(), moved.to_str().unwrap()],
+    );
+
+    assert!(keep.exists(), "삭제 금지 파일이 rename 으로 사라짐");
+    assert!(!moved.exists(), "삭제 금지 파일이 새 이름으로 나타남");
+    let decisions = file_decisions(&entries);
+    assert!(
+        decisions.iter().any(|(p, mode, d)| p.ends_with("keep.txt")
+            && mode == "delete"
+            && *d == airlock_audit::Decision::Deny),
+        "원본에 대한 delete 거부가 감사에 남지 않음: {decisions:?}"
+    );
+}
+
+/// 정책 파일 후보는 아직 없어도 생성이 거부되어야 합니다. Landlock 은 없는 inode 에 규칙을
+/// 걸 수 없으므로 이 층이 rename 의 목적지를 `create` 로 판정해 막습니다
+#[test]
+fn full_mediation_refuses_planting_a_policy_file_by_rename() {
+    let s = Scratch::new("plant");
+    let evil = s.path().join("evil.toml");
+    let planted = s.path().join("airlock.toml");
+    fs::write(&evil, b"version = 1\n").unwrap();
+
+    let ctx =
+        LoadContext::new(s.path(), s.path().join("audit")).with_policy_files([planted.clone()]);
+    let src = r#"
+version = 1
+name = "mediation-test"
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+"#;
+    let policy = Policy::load_str(src, &ctx).unwrap();
+    let (_, entries) = run_it(
+        s.path(),
+        policy,
+        Mediation::Full,
+        "/bin/mv",
+        &[evil.to_str().unwrap(), planted.to_str().unwrap()],
+    );
+
+    assert!(!planted.exists(), "에이전트가 rename 으로 정책 파일을 심음");
+    assert!(evil.exists(), "거부된 rename 이 원본을 없애면 안 됨");
+    let decisions = file_decisions(&entries);
+    assert!(
+        decisions
+            .iter()
+            .any(|(p, mode, d)| p.ends_with("airlock.toml")
+                && mode == "create"
+                && *d == airlock_audit::Decision::Deny),
+        "목적지에 대한 create 거부가 감사에 남지 않음: {decisions:?}"
+    );
+}
+
+/// 허용된 rename 은 그대로 되어야 하고 원본 delete 와 목적지 create 가 둘 다 기록됩니다
+#[test]
+fn full_mediation_records_both_sides_of_an_allowed_rename() {
+    let s = Scratch::new("rename-ok");
+    let from = s.path().join("from.txt");
+    let to = s.path().join("to.txt");
+    fs::write(&from, b"go\n").unwrap();
+
+    let policy = policy_from(s.path(), "");
+    let (_, entries) = run_it(
+        s.path(),
+        policy,
+        Mediation::Full,
+        "/bin/mv",
+        &[from.to_str().unwrap(), to.to_str().unwrap()],
+    );
+
+    assert!(to.exists() && !from.exists(), "허용된 rename 이 되지 않음");
+    let decisions = file_decisions(&entries);
+    assert!(
+        decisions
+            .iter()
+            .any(|(p, mode, _)| p.ends_with("from.txt") && mode == "delete"),
+        "원본 delete 판정이 없음: {decisions:?}"
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|(p, mode, _)| p.ends_with("to.txt") && mode == "create"),
+        "목적지 create 판정이 없음: {decisions:?}"
+    );
+}
+
+/// 기본 수준은 rename 을 중계하지 않습니다. 느려지는 것은 `full` 을 고른 사람만 감수합니다
+#[test]
+fn exec_net_does_not_mediate_renames() {
+    let s = Scratch::new("rename-execnet");
+    let from = s.path().join("from.txt");
+    let to = s.path().join("to.txt");
+    fs::write(&from, b"go\n").unwrap();
+
+    let policy = policy_from(s.path(), "");
+    let (_, entries) = run_it(
+        s.path(),
+        policy,
+        Mediation::ExecNet,
+        "/bin/mv",
+        &[from.to_str().unwrap(), to.to_str().unwrap()],
+    );
+
+    assert!(to.exists(), "exec-net 에서 rename 이 막히면 안 됨");
+    assert!(
+        file_decisions(&entries).is_empty(),
+        "exec-net 은 파일 판정을 남기지 않아야 함"
+    );
+}

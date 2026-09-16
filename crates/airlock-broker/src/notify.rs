@@ -15,6 +15,11 @@
 //! 실제로 여는 시점 사이에 링크가 바뀔 수 있어 구조적으로 TOCTOU를 안습니다
 //! (`docs/policy-dsl.md` 4.2절). 실제 강제는 inode에 규칙을 거는 Landlock이 합니다.
 //! 그래서 여기서 내리는 거부는 방어의 층 하나일 뿐이며, 이 층만 믿어서는 안 됩니다.
+//!
+//! 예외가 하나 있습니다. 같은 필터가 `TIOCSTI` 와 `TIOCLINUX` 를 인자 값으로 커널에서
+//! 거부합니다. 인자가 경로가 아니라 정수라 TOCTOU 가 없고, 자식이 물려받은 제어 터미널에
+//! 입력을 밀어 넣어 승인 프롬프트를 위조하는 경로는 Landlock 이 막지 못하기 때문입니다.
+//! 이 부분만은 중계가 꺼져 있어도 [`TtyGuard`] 로 걸립니다.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
@@ -25,19 +30,23 @@ use airlock_audit::Protocol;
 use airlock_i18n::tr;
 use airlock_policy::FileMode;
 
+use crate::bpf::{self, Layout, SockFilter};
 use crate::session::{Actor, Session};
 
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
-const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
-/// 프로세스 전체를 즉시 죽입니다.
-///
-/// 중계할 수 없는 ABI로 들어온 syscall에 씁니다. 통과시키면 그 ABI로 부른 exec과
-/// connect가 승인 흐름을 통째로 우회하고, errno로 거부하면 프로그램이 무엇이 실패했는지
-/// 모른 채 같은 호출을 반복합니다
-const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+
+/// 어느 중계 수준에서도 커널에서 거부하는 tty ioctl.
+///
+/// `TIOCSTI` 는 제어 터미널의 입력 큐에 바이트를 밀어 넣고, `TIOCLINUX` 는 가상 콘솔의
+/// 선택 영역 붙여넣기(`TIOCL_SETSEL`, `TIOCL_PASTESEL`)로 같은 일을 합니다. 자식은 제어
+/// 터미널을 상속받으므로 둘 중 하나로 `y\n` 을 넣으면 `/dev/tty` 에서 답을 읽는 승인
+/// 프롬프트가 위조됩니다. 정상 프로그램은 둘 다 쓰지 않습니다. 쉘, 에디터, TUI, 에이전트는
+/// 자기 stdin 을 읽을 뿐 자기 입력 큐에 쓰지 않으며, bubblewrap 과 flatpak 도 같은 두 개를
+/// 막습니다. 비교는 인자의 하위 32비트로 합니다. 커널이 request 를 `unsigned int` 로
+/// 받으므로 상위 비트를 세워도 같은 명령이기 때문입니다
+const REFUSED_TTY_IOCTLS: [u32; 2] = [libc::TIOCSTI as u32, libc::TIOCLINUX as u32];
 
 /// x86_64에서 x32 ABI로 부른 syscall은 번호에 이 비트가 켜집니다.
 ///
@@ -85,32 +94,10 @@ struct SeccompNotifResp {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct SockFilter {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
-}
-
-#[repr(C)]
 #[derive(Debug)]
 struct SockFprog {
     len: u16,
     filter: *const SockFilter,
-}
-
-const fn stmt(code: u16, k: u32) -> SockFilter {
-    SockFilter {
-        code,
-        jt: 0,
-        jf: 0,
-        k,
-    }
-}
-
-const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
-    SockFilter { code, jt, jf, k }
 }
 
 /// 이 빌드가 도는 아키텍처의 `AUDIT_ARCH_*` 값.
@@ -155,6 +142,35 @@ const LEGACY_OPEN: Option<i32> = Some(libc::SYS_open as i32);
 #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm")))]
 const LEGACY_OPEN: Option<i32> = None;
 
+/// dirfd 없는 이름 공간 syscall. `openat` 만 있는 아키텍처에는 없습니다
+#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm"))]
+const LEGACY_RENAME: Option<i32> = Some(libc::SYS_rename as i32);
+#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm"))]
+const LEGACY_LINK: Option<i32> = Some(libc::SYS_link as i32);
+#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm"))]
+const LEGACY_SYMLINK: Option<i32> = Some(libc::SYS_symlink as i32);
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm")))]
+const LEGACY_RENAME: Option<i32> = None;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm")))]
+const LEGACY_LINK: Option<i32> = None;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm")))]
+const LEGACY_SYMLINK: Option<i32> = None;
+
+/// `renameat`. aarch64 는 `__ARCH_WANT_RENAMEAT` 으로 38번을 두는데 glibc 의 `rename()`
+/// 이 그 번호를 쓰지만 `libc` 크레이트가 gnu 타겟에 상수를 내놓지 않아 리터럴로 적습니다.
+/// riscv64 와 loongarch64 는 `renameat2` 만 있습니다
+#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm"))]
+const RENAMEAT: Option<i32> = Some(libc::SYS_renameat as i32);
+#[cfg(target_arch = "aarch64")]
+const RENAMEAT: Option<i32> = Some(38);
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "arm",
+    target_arch = "aarch64"
+)))]
+const RENAMEAT: Option<i32> = None;
+
 /// 어디까지 중계할지.
 ///
 /// `openat`은 보통 프로그램 하나가 초당 수천 번 부르고, 감사 엔트리는 규격상
@@ -194,73 +210,79 @@ impl Level {
 /// 중계할 syscall 번호.
 ///
 /// `openat2`는 두 아키텍처에서 번호가 같아 리터럴로 적습니다. 빠뜨리면 그 경로로
-/// 파일을 여는 프로그램이 관측되지 않습니다
+/// 파일을 여는 프로그램이 관측되지 않습니다. `Full` 은 이름 공간을 바꾸는 `rename`,
+/// `link`, `symlink` 계열도 중계합니다. 이것이 없으면 `openat` 으로 만들 수 없는 경로를
+/// 옆에서 만든 파일의 이름을 바꿔 만들 수 있습니다. `Off` 는 비어 있습니다
 fn mediated_syscalls(level: Level) -> Vec<u32> {
-    let mut v: Vec<u32> = vec![
-        libc::SYS_connect as u32,
-        libc::SYS_execve as u32,
-        libc::SYS_execveat as u32,
-    ];
+    let mut v: Vec<u32> = Vec::new();
+    if level == Level::Off {
+        return v;
+    }
+    v.push(libc::SYS_connect as u32);
+    v.push(libc::SYS_execve as u32);
+    v.push(libc::SYS_execveat as u32);
     if level == Level::Full {
         v.push(libc::SYS_openat as u32);
         v.push(437); // openat2
-        if let Some(nr) = LEGACY_OPEN {
+        v.push(libc::SYS_linkat as u32);
+        v.push(libc::SYS_symlinkat as u32);
+        v.push(libc::SYS_renameat2 as u32);
+        for nr in [
+            LEGACY_OPEN,
+            LEGACY_RENAME,
+            LEGACY_LINK,
+            LEGACY_SYMLINK,
+            RENAMEAT,
+        ]
+        .into_iter()
+        .flatten()
+        {
             v.push(nr as u32);
         }
     }
     v
 }
 
-/// 중계 필터를 조립합니다.
+/// 이 아키텍처와 수준에 맞는 필터 배치.
+///
+/// 아키텍처가 다르면 죽입니다. 32비트 바이너리를 실행하면 syscall 번호 체계가 달라
+/// 비교가 전부 빗나가는데, 통과시키면 exec·connect 중계와 tty ioctl 거부를 통째로
+/// 우회합니다. exec ask 는 이 층에만 있으므로 그 우회는 곧 승인 우회입니다. x32 는
+/// arch 가 같으므로 번호로만 걸러 냅니다
 ///
 /// # Errors
 /// 이 아키텍처의 `AUDIT_ARCH_*` 값을 모르면 `None`입니다. 아키텍처 검사를 뺀 필터는
 /// 다른 ABI의 syscall 번호를 자기 것으로 착각하므로 만들지 않습니다
-fn build_filter(level: Level) -> Option<Vec<SockFilter>> {
-    const LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
-    const JMP_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
-    const RET_K: u16 = 0x06; // BPF_RET | BPF_K
-
-    let native = NATIVE_ARCH?;
-    let nrs = mediated_syscalls(level);
-    let mut prog = Vec::with_capacity(nrs.len().saturating_add(8));
-
-    // 아키텍처가 다르면 죽입니다. 32비트 바이너리를 실행하면 syscall 번호 체계가 달라
-    // 비교가 전부 빗나가는데, 통과시키면 exec·connect 중계를 통째로 우회합니다.
-    // exec ask 는 이 층에만 있으므로 그 우회는 곧 승인 우회입니다
-    prog.push(stmt(LD_W_ABS, 4)); // seccomp_data.arch
-    prog.push(jump(JMP_JEQ_K, native, 1, 0));
-    prog.push(stmt(RET_K, SECCOMP_RET_KILL_PROCESS));
-
-    prog.push(stmt(LD_W_ABS, 0)); // seccomp_data.nr
-
-    // x32 는 arch 가 같으므로 번호로만 걸러 냅니다
+fn layout(level: Level) -> Option<Layout> {
     #[cfg(target_arch = "x86_64")]
-    {
-        const JMP_JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
-        prog.push(jump(JMP_JGE_K, X32_SYSCALL_BIT, 0, 1));
-        prog.push(stmt(RET_K, SECCOMP_RET_KILL_PROCESS));
-    }
+    let x32_bit = Some(X32_SYSCALL_BIT);
+    #[cfg(not(target_arch = "x86_64"))]
+    let x32_bit = None;
 
-    // 마지막 두 명령이 ALLOW, USER_NOTIF이므로 매칭되면 그 지점으로 점프합니다
-    let total_after = nrs.len();
-    for (i, nr) in nrs.iter().enumerate() {
-        let remaining = total_after.saturating_sub(i).saturating_sub(1);
-        // 매칭이면 ALLOW를 건너뛰어 USER_NOTIF로, 아니면 다음 비교로
-        let jt = u8::try_from(remaining.saturating_add(1)).unwrap_or(u8::MAX);
-        prog.push(jump(JMP_JEQ_K, *nr, jt, 0));
-    }
-    prog.push(stmt(RET_K, SECCOMP_RET_ALLOW));
-    prog.push(stmt(RET_K, SECCOMP_RET_USER_NOTIF));
-    Some(prog)
+    Some(Layout {
+        native_arch: NATIVE_ARCH?,
+        x32_bit,
+        ioctl_nr: libc::SYS_ioctl as u32,
+        refused_ioctls: REFUSED_TTY_IOCTLS.to_vec(),
+        refused_errno: libc::EPERM as u32,
+        mediated: mediated_syscalls(level),
+    })
 }
 
-/// 자식에서 seccomp 필터를 걸고 listener fd를 돌려줍니다.
+/// 중계 필터를 조립합니다. `Off` 면 tty ioctl 거부만 있는 최소 필터입니다
+fn build_filter(level: Level) -> Option<Vec<SockFilter>> {
+    layout(level).map(|l| bpf::assemble(&l))
+}
+
+/// 자식에서 seccomp 필터를 겁니다.
 ///
 /// # Safety
 /// `pre_exec` 문맥에서 호출합니다. 새로 할당하지 않도록 필터는 호출 전에 만들어 둡니다.
 /// `no_new_privs`를 먼저 세워야 권한 없는 프로세스가 필터를 걸 수 있습니다
-unsafe fn install_filter(prog: &[SockFilter]) -> std::io::Result<RawFd> {
+unsafe fn seccomp_filter(
+    prog: &[SockFilter],
+    flags: libc::c_ulong,
+) -> std::io::Result<libc::c_long> {
     // # Safety
     // prctl은 호출 프로세스의 플래그만 바꿉니다
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -272,23 +294,66 @@ unsafe fn install_filter(prog: &[SockFilter]) -> std::io::Result<RawFd> {
     };
     // # Safety
     // fprog는 이 스코프 동안 유효하고 len은 filter 배열 길이와 일치합니다
-    let fd = unsafe {
+    let rc = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER,
-            SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            flags,
             &raw const fprog,
         )
     };
-    if fd < 0 {
+    if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(rc)
+}
+
+/// 자식에서 중계 필터를 걸고 listener fd를 돌려줍니다.
+///
+/// # Safety
+/// [`seccomp_filter`] 와 같습니다
+unsafe fn install_filter(prog: &[SockFilter]) -> std::io::Result<RawFd> {
+    // # Safety
+    // 호출자가 pre_exec 문맥을 보장합니다
+    let fd = unsafe { seccomp_filter(prog, SECCOMP_FILTER_FLAG_NEW_LISTENER)? };
     RawFd::try_from(fd).map_err(|_| {
         std::io::Error::other(tr!(
             "listener fd가 범위를 벗어남",
             "listener fd out of range"
         ))
     })
+}
+
+/// 중계 없이도 거는 최소 seccomp 필터.
+///
+/// 중계 수준이 `off` 이거나 중계를 켤 수 없어도 [`REFUSED_TTY_IOCTLS`] 는 막혀야 합니다.
+/// 승인 프롬프트가 `/dev/tty` 에서 답을 읽는 한 그 위조 경로는 중계와 무관하기 때문입니다.
+/// 강제 층이 `pre_exec` 에서 겁니다. 중계 필터와 겹쳐 걸려도 seccomp 는 더 엄격한
+/// 결과를 취하므로 해가 없습니다
+#[derive(Debug, Clone)]
+pub struct TtyGuard {
+    prog: Vec<SockFilter>,
+}
+
+impl TtyGuard {
+    /// # Errors
+    /// 이 아키텍처의 seccomp arch 값을 모르면 `None` 입니다
+    pub fn new() -> Option<Self> {
+        Some(Self {
+            prog: build_filter(Level::Off)?,
+        })
+    }
+
+    /// 자식에서 필터를 겁니다.
+    ///
+    /// # Safety
+    /// `pre_exec` 문맥에서 호출합니다. 필터는 이미 만들어져 있어 새로 할당하지 않습니다.
+    /// 필터는 호출한 스레드에만 걸리는데 exec 직전의 자식은 스레드가 하나뿐입니다
+    pub unsafe fn install(&self) -> std::io::Result<()> {
+        // # Safety
+        // 호출자가 pre_exec 문맥을 보장합니다
+        unsafe { seccomp_filter(&self.prog, 0).map(|_| ()) }
+    }
 }
 
 /// SCM_RIGHTS로 fd 하나를 보냅니다.
@@ -424,22 +489,114 @@ fn read_cstr(pid: u32, addr: u64) -> Option<PathBuf> {
     }
 }
 
+/// syscall 인자에서 dirfd 를 커널과 같은 방식으로 읽습니다.
+///
+/// 커널은 dirfd 를 `int` 로 받으므로 레지스터의 하위 32비트만 봅니다. `AT_FDCWD` 는
+/// 호출 규약에 따라 부호 확장(`0xffff_ffff_ffff_ff9c`)으로도 영 확장(`0xffff_ff9c`)으로도
+/// 들어오는데, 64비트 전체를 부호 있는 값으로 읽으면 후자를 큰 양수 fd 로 착각해 기준
+/// 디렉토리를 잃습니다
+fn dirfd_of(arg: u64) -> i32 {
+    arg as u32 as i32
+}
+
 /// dirfd 기준 상대 경로를 절대 경로로 만듭니다 (`docs/policy-dsl.md` 4.2절).
-fn resolve_at(pid: u32, dirfd: i64, path: PathBuf) -> PathBuf {
+///
+/// # Errors
+/// 기준을 알 수 없으면 `None` 입니다. 상대 경로를 그대로 돌려주면 정책 엔진이 브로커의
+/// cwd 에 이어 붙여 판정하는데 자식이 `chdir` 했으면 그것은 엉뚱한 경로입니다.
+/// 판단 불가는 제한 방향으로 처리합니다
+fn resolve_at(pid: u32, dirfd: i32, path: PathBuf) -> Option<PathBuf> {
     if path.is_absolute() {
-        return path;
+        return Some(path);
     }
-    let base = if dirfd == libc::AT_FDCWD as i64 {
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    let base = if dirfd == libc::AT_FDCWD {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?
     } else if dirfd >= 0 {
-        std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).ok()
+        std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).ok()?
+    } else {
+        return None;
+    };
+    // 소켓이나 지워진 파일은 "socket:[..]" 같은 문자열로 읽히며 절대 경로가 아닙니다
+    if !base.is_absolute() {
+        return None;
+    }
+    // `AT_EMPTY_PATH` 로 fd 자체를 가리키는 호출은 경로가 비어 있습니다
+    if path.as_os_str().is_empty() {
+        return Some(base);
+    }
+    Some(base.join(path))
+}
+
+/// 이름 공간을 바꾸는 syscall 하나의 인자 자리.
+///
+/// 원본은 `Delete`, 목적지는 `Create` 로 판정합니다. 하드링크의 원본도 `Delete` 로
+/// 봅니다. 파일 자체는 남지만 그 inode 가 새 이름을 얻어 원래 경로에 걸린 규칙을
+/// 벗어나므로, 원래 이름을 지우는 것과 같은 무게로 다룹니다. 심볼릭 링크의 대상 문자열은
+/// 접근이 아니라 값이라 판정하지 않습니다. 그 링크를 통한 접근은 열리는 시점에 해소 경로로
+/// 다시 판정됩니다
+struct LinkSpec {
+    src: Option<(i32, u64)>,
+    dst: (i32, u64),
+    /// `RENAME_EXCHANGE` 는 양쪽이 서로의 자리를 차지하므로 두 모드를 모두 봅니다
+    exchange: bool,
+}
+
+fn link_spec(nr: i32, args: &[u64; 6]) -> Option<LinkSpec> {
+    let cwd = libc::AT_FDCWD;
+    if Some(nr) == LEGACY_RENAME || Some(nr) == LEGACY_LINK {
+        Some(LinkSpec {
+            src: Some((cwd, args[0])),
+            dst: (cwd, args[1]),
+            exchange: false,
+        })
+    } else if Some(nr) == RENAMEAT || nr == libc::SYS_linkat as i32 {
+        Some(LinkSpec {
+            src: Some((dirfd_of(args[0]), args[1])),
+            dst: (dirfd_of(args[2]), args[3]),
+            exchange: false,
+        })
+    } else if nr == libc::SYS_renameat2 as i32 {
+        Some(LinkSpec {
+            src: Some((dirfd_of(args[0]), args[1])),
+            dst: (dirfd_of(args[2]), args[3]),
+            exchange: (args[4] as u32) & libc::RENAME_EXCHANGE != 0,
+        })
+    } else if Some(nr) == LEGACY_SYMLINK {
+        Some(LinkSpec {
+            src: None,
+            dst: (cwd, args[1]),
+            exchange: false,
+        })
+    } else if nr == libc::SYS_symlinkat as i32 {
+        Some(LinkSpec {
+            src: None,
+            dst: (dirfd_of(args[1]), args[2]),
+            exchange: false,
+        })
     } else {
         None
-    };
-    match base {
-        Some(b) => b.join(path),
-        None => path,
     }
+}
+
+/// 판정할 (경로, 모드) 목록. 원본이 먼저입니다
+///
+/// # Errors
+/// 경로 하나라도 읽거나 해소하지 못하면 `None` 이며 호출자는 거부합니다
+fn link_targets(pid: u32, spec: &LinkSpec) -> Option<Vec<(PathBuf, FileMode)>> {
+    let mut out = Vec::with_capacity(4);
+    if let Some((dirfd, addr)) = spec.src {
+        let src = resolve_at(pid, dirfd, read_cstr(pid, addr)?)?;
+        if spec.exchange {
+            out.push((src.clone(), FileMode::Create));
+        }
+        out.push((src, FileMode::Delete));
+    }
+    let dst = resolve_at(pid, spec.dst.0, read_cstr(pid, spec.dst.1)?)?;
+    if spec.exchange {
+        out.push((dst.clone(), FileMode::Delete));
+    }
+    out.push((dst, FileMode::Create));
+    Some(out)
 }
 
 /// `connect`의 대상 주소를 읽은 결과.
@@ -636,13 +793,12 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
                 continue;
             }
             let (dirfd, path_arg, argv_arg) = if nr == execveat_nr {
-                (args[0] as i64, args[1], args[2])
+                (dirfd_of(args[0]), args[1], args[2])
             } else {
-                (libc::AT_FDCWD as i64, args[0], args[1])
+                (libc::AT_FDCWD, args[0], args[1])
             };
-            match read_cstr(pid, path_arg) {
-                Some(p) => {
-                    let program = resolve_at(pid, dirfd, p);
+            match read_cstr(pid, path_arg).and_then(|p| resolve_at(pid, dirfd, p)) {
+                Some(program) => {
                     let argv = read_argv(pid, argv_arg);
                     let mut s = match session.lock() {
                         Ok(s) => s,
@@ -654,20 +810,41 @@ pub fn supervise(listener: OwnedFd, session: Arc<Mutex<Session>>, stop: Arc<Atom
                 }
                 None => false,
             }
+        } else if let Some(spec) = link_spec(nr, &args) {
+            // rename / link / symlink 계열. 원본이 거부되면 목적지는 묻지 않습니다
+            match link_targets(pid, &spec) {
+                Some(targets) => {
+                    let mut s = match session.lock() {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    let mut ok = true;
+                    for (path, mode) in &targets {
+                        ok = s
+                            .check_file(path, *mode, Actor::Observed(pid))
+                            .map(|o| o.permitted())
+                            .unwrap_or(false);
+                        if !ok {
+                            break;
+                        }
+                    }
+                    ok
+                }
+                None => false,
+            }
         } else {
             // openat / openat2 / open
             let (dirfd, path_arg, mode) = if nr == openat_nr {
-                (args[0] as i64, args[1], file_mode_for(args[2]))
+                (dirfd_of(args[0]), args[1], file_mode_for(args[2]))
             } else if LEGACY_OPEN == Some(nr) {
-                (libc::AT_FDCWD as i64, args[0], file_mode_for(args[1]))
+                (libc::AT_FDCWD, args[0], file_mode_for(args[1]))
             } else {
                 // openat2 는 세 번째 인자가 open_how 구조체 포인터입니다. 플래그를 따로
                 // 읽지 않고 읽기로 보수적으로 잡아 정책 평가만 받습니다
-                (args[0] as i64, args[1], FileMode::Read)
+                (dirfd_of(args[0]), args[1], FileMode::Read)
             };
-            match read_cstr(pid, path_arg) {
-                Some(p) => {
-                    let path = resolve_at(pid, dirfd, p);
+            match read_cstr(pid, path_arg).and_then(|p| resolve_at(pid, dirfd, p)) {
+                Some(path) => {
                     let mut s = match session.lock() {
                         Ok(s) => s,
                         Err(_) => break,
@@ -836,17 +1013,21 @@ mod tests {
         build_filter(level).expect("이 아키텍처의 필터를 만들 수 없음")
     }
 
+    fn is_ret(i: &SockFilter, k: u32) -> bool {
+        i.code == bpf::RET_K && i.k == k
+    }
+
     #[test]
     fn filter_program_is_well_formed() {
         let prog = filter(Level::Full);
         assert!(prog.len() >= 6, "필터가 너무 짧음");
         let last = prog.last().copied().expect("빈 필터");
-        assert_eq!(last.k, SECCOMP_RET_USER_NOTIF, "마지막은 USER_NOTIF여야 함");
+        assert_eq!(last.k, bpf::RET_USER_NOTIF, "마지막은 USER_NOTIF여야 함");
         let allow = prog
             .get(prog.len().saturating_sub(2))
             .copied()
             .expect("짧음");
-        assert_eq!(allow.k, SECCOMP_RET_ALLOW);
+        assert_eq!(allow.k, bpf::RET_ALLOW);
     }
 
     #[test]
@@ -855,10 +1036,37 @@ mod tests {
         let prog = filter(Level::Full);
         for nr in nrs {
             assert!(
-                prog.iter().any(|i| i.k == nr && i.code == 0x15),
+                prog.iter().any(|i| i.k == nr && i.code == bpf::JMP_JEQ_K),
                 "syscall {nr} 비교가 필터에 없음"
             );
         }
+    }
+
+    #[test]
+    fn full_mediates_the_rename_and_link_family() {
+        let nrs = mediated_syscalls(Level::Full);
+        for nr in [
+            libc::SYS_linkat as u32,
+            libc::SYS_symlinkat as u32,
+            libc::SYS_renameat2 as u32,
+        ] {
+            assert!(nrs.contains(&nr), "syscall {nr} 이 full 중계 목록에 없음");
+        }
+        for nr in [LEGACY_RENAME, LEGACY_LINK, LEGACY_SYMLINK, RENAMEAT]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                nrs.contains(&(nr as u32)),
+                "syscall {nr} 이 full 중계 목록에 없음"
+            );
+        }
+        let exec_net = mediated_syscalls(Level::ExecNet);
+        assert!(
+            !exec_net.contains(&(libc::SYS_renameat2 as u32)),
+            "기본 수준은 rename 을 중계하지 않음"
+        );
+        assert!(mediated_syscalls(Level::Off).is_empty());
     }
 
     #[test]
@@ -867,7 +1075,7 @@ mod tests {
         // 첫 세 명령이 arch 적재, 비교, 불일치 처리입니다
         assert_eq!(
             prog.first().map(|i| i.k),
-            Some(4),
+            Some(bpf::OFF_ARCH),
             "arch 적재가 먼저여야 함"
         );
         assert_eq!(
@@ -877,14 +1085,11 @@ mod tests {
         );
         assert_eq!(
             prog.get(2).map(|i| i.k),
-            Some(SECCOMP_RET_KILL_PROCESS),
+            Some(bpf::RET_KILL_PROCESS),
             "아키텍처 불일치를 통과시키면 중계가 통째로 우회됨"
         );
         assert!(
-            !prog
-                .iter()
-                .take(3)
-                .any(|i| i.k == SECCOMP_RET_ALLOW && i.code == 0x06),
+            !prog.iter().take(3).any(|i| is_ret(i, bpf::RET_ALLOW)),
             "아키텍처 검사 구간에 ALLOW가 있으면 안 됨"
         );
     }
@@ -899,8 +1104,49 @@ mod tests {
             .expect("x32 비트 검사가 없음. arch 검사를 통과하면서 번호가 어긋나 우회됨");
         assert_eq!(
             prog.get(idx.saturating_add(1)).map(|i| i.k),
-            Some(SECCOMP_RET_KILL_PROCESS)
+            Some(bpf::RET_KILL_PROCESS)
         );
+    }
+
+    #[test]
+    fn tty_ioctls_are_refused_at_every_level() {
+        for level in [Level::Off, Level::ExecNet, Level::Full] {
+            let prog = filter(level);
+            assert!(
+                prog.iter()
+                    .any(|i| i.code == bpf::JMP_JEQ_K && i.k == libc::SYS_ioctl as u32),
+                "{level:?} 필터에 ioctl 비교가 없음"
+            );
+            for request in REFUSED_TTY_IOCTLS {
+                assert!(
+                    prog.iter()
+                        .any(|i| i.code == bpf::JMP_JEQ_K && i.k == request),
+                    "{level:?} 필터에 ioctl {request:#x} 비교가 없음"
+                );
+            }
+            assert!(
+                prog.iter()
+                    .any(|i| is_ret(i, bpf::RET_ERRNO | libc::EPERM as u32)),
+                "{level:?} 필터가 EPERM 을 돌려주지 않음"
+            );
+            assert!(
+                prog.iter()
+                    .any(|i| i.code == bpf::LD_W_ABS && i.k == bpf::off_arg_lo(1)),
+                "{level:?} 필터가 ioctl 의 두 번째 인자를 읽지 않음"
+            );
+        }
+        let off = filter(Level::Off);
+        assert!(
+            !off.iter().any(|i| is_ret(i, bpf::RET_USER_NOTIF)),
+            "off 수준의 최소 필터는 아무것도 중계하지 않음"
+        );
+        assert!(TtyGuard::new().is_some());
+    }
+
+    #[test]
+    fn refused_tty_ioctl_numbers_match_the_kernel_abi() {
+        // x86_64 와 aarch64 는 asm-generic ioctls.h 를 공유하므로 값이 같습니다
+        assert_eq!(REFUSED_TTY_IOCTLS, [0x5412, 0x541C]);
     }
 
     #[test]
@@ -926,5 +1172,64 @@ mod tests {
             file_mode_for((libc::O_WRONLY | libc::O_CREAT) as u64),
             FileMode::Create
         );
+    }
+
+    #[test]
+    fn dirfd_is_read_like_the_kernel_reads_it() {
+        // 부호 확장과 영 확장 모두 AT_FDCWD 로 읽혀야 합니다
+        assert_eq!(dirfd_of(0xffff_ffff_ffff_ff9c), libc::AT_FDCWD);
+        assert_eq!(dirfd_of(0x0000_0000_ffff_ff9c), libc::AT_FDCWD);
+        assert_eq!(dirfd_of(3), 3);
+        assert_eq!(dirfd_of(0xdead_beef_0000_0003), 3);
+    }
+
+    #[test]
+    fn an_unresolvable_base_is_a_refusal_not_a_relative_path() {
+        let me = std::process::id();
+        assert_eq!(
+            resolve_at(me, libc::AT_FDCWD, PathBuf::from("/abs")),
+            Some(PathBuf::from("/abs"))
+        );
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(
+            resolve_at(me, libc::AT_FDCWD, PathBuf::from("rel")),
+            Some(cwd.join("rel"))
+        );
+        assert_eq!(resolve_at(me, libc::AT_FDCWD, PathBuf::new()), Some(cwd));
+        assert_eq!(resolve_at(me, -2, PathBuf::from("rel")), None);
+        assert_eq!(resolve_at(me, 999_999, PathBuf::from("rel")), None);
+    }
+
+    #[test]
+    fn link_specs_take_source_then_destination() {
+        let cwd = libc::AT_FDCWD;
+        let args = [7, 0x10, 9, 0x20, u64::from(libc::RENAME_EXCHANGE), 0];
+        let spec = link_spec(libc::SYS_renameat2 as i32, &args).expect("renameat2");
+        assert_eq!(spec.src, Some((7, 0x10)));
+        assert_eq!(spec.dst, (9, 0x20));
+        assert!(spec.exchange);
+
+        let spec = link_spec(libc::SYS_linkat as i32, &[7, 0x10, 9, 0x20, 0, 0]).expect("linkat");
+        assert_eq!(spec.src, Some((7, 0x10)));
+        assert_eq!(spec.dst, (9, 0x20));
+        assert!(!spec.exchange);
+
+        let spec =
+            link_spec(libc::SYS_symlinkat as i32, &[0x10, 9, 0x20, 0, 0, 0]).expect("symlinkat");
+        assert_eq!(spec.src, None, "심볼릭 링크 대상 문자열은 접근이 아님");
+        assert_eq!(spec.dst, (9, 0x20));
+
+        if let Some(nr) = LEGACY_RENAME {
+            let spec = link_spec(nr, &[0x10, 0x20, 0, 0, 0, 0]).expect("rename");
+            assert_eq!(spec.src, Some((cwd, 0x10)));
+            assert_eq!(spec.dst, (cwd, 0x20));
+        }
+        if let Some(nr) = LEGACY_SYMLINK {
+            let spec = link_spec(nr, &[0x10, 0x20, 0, 0, 0, 0]).expect("symlink");
+            assert_eq!(spec.src, None);
+            assert_eq!(spec.dst, (cwd, 0x20));
+        }
+        assert!(link_spec(libc::SYS_openat as i32, &[0; 6]).is_none());
+        assert!(link_spec(libc::SYS_unlinkat as i32, &[0; 6]).is_none());
     }
 }
