@@ -36,6 +36,7 @@ use landlock::{
 
 use crate::enforcer::Enforcer;
 use crate::error::{BrokerError, Result};
+use crate::notify::TtyGuard;
 use crate::profile::{self, ProfileOptions};
 
 /// 루트 하나를 걸어 내려가며 검사할 최대 디렉토리 항목 수.
@@ -1085,6 +1086,12 @@ pub struct LandlockEnforcer {
     plan: Option<Plan>,
     abi: ABI,
     gaps: Vec<String>,
+    /// 중계 수준과 무관하게 거는 tty ioctl 거부 필터.
+    ///
+    /// Landlock 은 상속된 fd 에 아무것도 하지 못하므로 자식이 물려받은 제어 터미널에
+    /// `TIOCSTI` 를 부르는 것을 막을 수 없습니다. 그 경로는 승인 프롬프트 위조이고,
+    /// `--mediate off` 에서도 열려 있으면 안 되므로 강제 층이 seccomp 로 함께 겁니다
+    tty_guard: Option<TtyGuard>,
 }
 
 impl Default for LandlockEnforcer {
@@ -1100,6 +1107,7 @@ impl LandlockEnforcer {
             plan: None,
             abi: detect_abi(),
             gaps: Vec::new(),
+            tty_guard: TtyGuard::new(),
         }
     }
 
@@ -1348,15 +1356,20 @@ impl Enforcer for LandlockEnforcer {
             }
         }
         let abi = self.abi;
+        let tty_guard = self.tty_guard.clone();
 
         use std::os::unix::process::CommandExt;
         // # Safety
         // pre_exec은 fork 이후 exec 이전의 자식에서 실행됩니다. 브로커는 spawn 시점에
         // 단일 스레드이므로 malloc 락 경합이 없습니다. 계획은 fork 전에 확정한 경로 목록이며
         // 자식에서는 그 경로를 열어 규칙으로 거는 일만 합니다. restrict_self는 호출한
-        // 스레드에만 걸리는데, exec 직전의 자식은 스레드가 하나뿐이라 전체에 걸립니다
+        // 스레드에만 걸리는데, exec 직전의 자식은 스레드가 하나뿐이라 전체에 걸립니다.
+        // tty 필터도 fork 전에 조립해 두었고 같은 이유로 자식 전체에 걸립니다
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(guard) = &tty_guard {
+                    guard.install()?;
+                }
                 let status = apply(&plan, abi)?;
                 if status == RulesetStatus::NotEnforced {
                     return Err(std::io::Error::other(tr!(
@@ -1411,6 +1424,18 @@ impl Enforcer for LandlockEnforcer {
             )
             .to_string(),
         );
+        if self.tty_guard.is_none() {
+            gaps.push(
+                tr!(
+                    "이 아키텍처의 seccomp arch 값을 몰라 TIOCSTI/TIOCLINUX 거부 필터를 걸지 \
+                     못함. 자식이 상속된 터미널에 입력을 밀어 넣어 승인 프롬프트를 위조할 수 있음",
+                    "the seccomp arch value for this architecture is unknown, so the \
+                     TIOCSTI/TIOCLINUX refusal filter is not installed; a child can push \
+                     input into the inherited terminal and forge an approval prompt"
+                )
+                .to_string(),
+            );
+        }
         gaps.extend(self.gaps.iter().cloned());
         gaps
     }
@@ -1593,6 +1618,19 @@ mod tests {
         assert!(
             plan.read_write.iter().any(|p| p.path == root.join("ok")),
             "형제 파일은 그대로 허용되어야 함"
+        );
+    }
+
+    #[test]
+    fn the_tty_guard_rides_along_with_every_enforcer() {
+        let e = LandlockEnforcer::new();
+        assert!(
+            e.tty_guard.is_some(),
+            "지원 아키텍처에서는 TIOCSTI 거부 필터가 항상 있어야 함"
+        );
+        assert!(
+            !e.gaps().iter().any(|g| g.contains("TIOCSTI")),
+            "필터가 있는데 gap 으로 없다고 알리면 안 됨"
         );
     }
 

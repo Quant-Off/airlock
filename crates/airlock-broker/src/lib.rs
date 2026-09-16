@@ -1,4 +1,5 @@
 pub mod approve;
+pub(crate) mod bpf;
 pub mod egress;
 pub mod enforcer;
 pub mod error;

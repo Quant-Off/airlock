@@ -635,3 +635,63 @@ fn the_whitelist_declares_what_it_cannot_reach() {
         "화이트리스트가 걸린 상태에서 미강제라고 보고함: {gaps:?}"
     );
 }
+
+/// 부모가 이 이름으로 자기 자신을 다시 실행할 때만 동작하는 탐침입니다.
+///
+/// 환경 변수가 없으면 아무 일도 하지 않는 빈 테스트입니다. 있으면 fd 0 에 `TIOCSTI` 를
+/// 부르고 그 errno 를 종료 코드로 돌려줍니다. fd 0 은 부모가 `/dev/null` 로 두므로
+/// 필터가 없으면 커널이 `ENOTTY` 를, 필터가 있으면 seccomp 가 `EPERM` 을 돌려줍니다.
+/// 둘이 구분되므로 어느 커널의 `dev.tty.legacy_tiocsti` 값과도 무관하게 판정됩니다
+#[test]
+fn tiocsti_probe() {
+    if std::env::var_os("AIRLOCK_TEST_TIOCSTI_PROBE").is_none() {
+        return;
+    }
+    let byte = b'y';
+    // # Safety
+    // fd 0 은 열려 있고 인자는 한 바이트 버퍼의 포인터입니다
+    let rc = unsafe { libc::ioctl(0, libc::TIOCSTI, std::ptr::addr_of!(byte)) };
+    let code = if rc == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(99)
+    };
+    std::process::exit(code);
+}
+
+fn tiocsti_under_sandbox(tag: &str, request: &str) -> Option<i32> {
+    let s = Scratch::new(tag);
+    let me = std::env::current_exe().unwrap();
+    // 작업 공간 밖의 target/ 를 통째로 열지 않도록 탐침 바이너리를 작업 공간 안으로 복사합니다
+    let probe = s.path().join("probe");
+    fs::copy(&me, &probe).unwrap();
+
+    let policy = permissive_policy(s.path());
+    let opts = ProfileOptions::default().with_workspace(s.path());
+    let mut enforcer = LandlockEnforcer::new().with_options(opts);
+    enforcer.prepare(&policy).unwrap();
+
+    let mut cmd = Command::new(&probe);
+    cmd.args(["tiocsti_probe", "--exact", "--test-threads=1"])
+        .env(request, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    enforcer.wrap(&mut cmd).unwrap();
+    cmd.status().ok().and_then(|st| st.code())
+}
+
+/// 중계가 꺼진 상태(`run` 을 거치지 않는 순수 강제 층)에서도 TIOCSTI 는 EPERM 이어야 합니다
+#[test]
+fn tiocsti_is_refused_even_without_mediation() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let code = tiocsti_under_sandbox("tiocsti", "AIRLOCK_TEST_TIOCSTI_PROBE");
+    assert_eq!(
+        code,
+        Some(libc::EPERM),
+        "TIOCSTI 가 seccomp 에서 EPERM 으로 거부되지 않음 (ENOTTY={} 면 필터가 빠진 것)",
+        libc::ENOTTY
+    );
+}

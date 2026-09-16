@@ -222,6 +222,17 @@ Landlock이 등록하는 LSM 훅에는 `mmap_file`도 `file_mprotect`도 없습�
 
 이것은 exec 화이트리스트가 **의도적 실행 경로만** 좁힌다는 뜻입니다. 코드 실행 자체를 막는 경계가 아닙니다.
 
+### 3.15 아직 없는 경로의 생성은 거부할 수 없다
+
+Landlock 규칙은 inode 에 걸립니다. 없는 파일에는 inode 가 없으므로 "이 경로는 만들지 말라"를 표현할 방법이 없고, 순회는 존재하는 항목만 봅니다 (`landlock.rs:399-497`). 곧 `deny` 대상이 하나도 없는 디렉토리는 `Grant::Whole` 로 통째로 쓰기 허용되고, 그 안에 어떤 이름이든 새로 만들 수 있습니다 (`landlock.rs:477-478`, `516-537`).
+
+이것이 정책 파일 자기보호에 그대로 영향을 줍니다. `self:policy-file` 은 아직 없는 후보(`cwd/airlock.toml` 등)까지 쓰기 거부로 두지만 (`airlock-policy/src/baseline.rs:345-368`), 파일이 없으면 Landlock 계획은 작업 공간 루트에 `Whole` 을 주므로 **에이전트가 `./airlock.toml` 을 만들 수 있고, 다음 `airlock run` 이 그것을 홈 정책보다 먼저 읽습니다** (`airlock/src/paths.rs`). 파일이 이미 있으면 루트가 `Partial` 이 되어 루트 안 생성과 `rename` 이 커널에서 막히지만, 그 경우에는 3.3 대로 루트에 새 파일을 만들 수 없게 됩니다. 루트를 늘 `Partial` 로 내리면 실사용이 깨지므로 그 방향은 택하지 않습니다.
+
+그래서 방어는 두 겹입니다.
+
+- `--mediate full` 이 `openat` 의 `O_CREAT` 와 `rename`/`link`/`symlink` 계열의 목적지를 `create` 로 판정해 자기보호 규칙으로 거부합니다(5.1). 기본 수준 `exec-net` 에는 없습니다.
+- **로드 시점의 정책 신뢰 기록(TOFU)** 이 처음 보는 정책이나 다이제스트가 바뀐 정책을 사람에게 확인시킵니다 (`docs/design.md` 9.6). 커널이 생성을 거부할 수 없다는 이 한계가 TOFU 가 필요한 직접적인 이유입니다.
+
 ---
 
 ## 4. 강제 층: macOS (Seatbelt)
@@ -330,35 +341,39 @@ Darwin 25.4에서 확인했으며 회귀 테스트로 고정해 두었습니다 
 
 ## 5. 중계 층 (seccomp user notification, Linux 전용)
 
-### 5.1 중재되는 syscall이 기본 3개, 최대 6개다
+### 5.1 중재되는 syscall이 기본 3개, `full` 에서 x86_64 13개 aarch64 9개다
 
-`mediated_syscalls`가 `connect`, `execve`, `execveat`를 돌려주고 (`notify.rs:197-211`), `Level::Full`이 `openat`, `openat2`, 레거시 `open`을 더합니다 (`notify.rs:152-155`, `205`).
+`mediated_syscalls`가 `connect`, `execve`, `execveat`를 돌려주고 (`notify.rs:216-248`), `Level::Full`이 `openat`, `openat2`, 레거시 `open` 과 이름 공간을 바꾸는 `linkat`, `symlinkat`, `renameat2`, 그리고 아키텍처에 남아 있는 `rename`, `link`, `symlink`, `renameat` 을 더합니다 (`notify.rs:145-172`). aarch64 의 `renameat`(38) 은 `libc` 크레이트가 gnu 타겟에 상수를 내놓지 않아 리터럴입니다 (`notify.rs:165`).
+
+이름 공간 syscall 은 원본을 `delete`, 목적지를 `create` 로 판정하고 하나라도 거부면 거부합니다 (`notify.rs:537-604`, `813-835`). 하드링크의 원본도 `delete` 로 봅니다. 그 inode 가 새 이름을 얻어 원래 경로의 규칙을 벗어나기 때문입니다. 심볼릭 링크의 대상 문자열은 접근이 아니라 값이므로 판정하지 않고, 그 링크를 통한 접근은 열리는 시점에 해소 경로로 다시 판정됩니다. `RENAME_EXCHANGE` 는 양쪽에 두 모드를 모두 묻습니다. 원본이 거부되면 목적지는 묻지 않으므로 감사에는 첫 거부까지만 남습니다.
+
+이와 별개로 **모든 수준의 필터가 `ioctl(TIOCSTI)` 과 `ioctl(TIOCLINUX)` 를 `EPERM` 으로 거부합니다** (`notify.rs:49`, `bpf.rs:74-94`). 중계가 아니라 커널 거부이며 감사 엔트리를 남기지 않습니다. 근거는 8.5 에 있습니다.
 
 **어느 수준에서도 중재되지 않는 것**은 다음과 같습니다.
 
-`unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `truncate`, `mkdir`, `link`/`symlink`, `chmod`/`chown`, `socket`, `bind`, `listen`, `sendto`, `sendmsg`, `ptrace`, `clone`/`fork`/`vfork`, `memfd_create`, `mount`, `prctl`, `io_uring_*`.
+`unlink`/`unlinkat`, `truncate`, `mkdir`, `chmod`/`chown`, `socket`, `bind`, `listen`, `sendto`, `sendmsg`, `ptrace`, `clone`/`fork`/`vfork`, `memfd_create`, `mount`, `prctl`, `io_uring_*`.
 
-곧 **파일 삭제와 이름 변경은 `--mediate full`에서도 기록되지 않습니다.** 연결 없는 UDP 전송(`sendto`/`sendmsg`)은 egress 관측과 승인을 통째로 비껴갑니다.
+곧 **파일 삭제(`unlink`)는 `--mediate full`에서도 기록되지 않습니다.** 이름 변경은 `full` 에서만 기록되며 기본 수준 `exec-net` 은 여전히 보지 못합니다. 연결 없는 UDP 전송(`sendto`/`sendmsg`)은 egress 관측과 승인을 통째로 비껴갑니다.
 
 ### 5.2 io_uring이 중계를 통째로 우회한다
 
-필터는 syscall 번호만 봅니다 (`notify.rs:246-253`). `IORING_OP_OPENAT`, `IORING_OP_CONNECT`, `IORING_OP_WRITE`는 실행 시점에 syscall이 아니므로 알림을 만들지 않습니다. egress `ask`/`deny`와 파일 감사가 전부 우회되고 Landlock만 남습니다.
+필터는 syscall 번호만 봅니다 (`bpf.rs:96-99`). `IORING_OP_OPENAT`, `IORING_OP_CONNECT`, `IORING_OP_WRITE`는 실행 시점에 syscall이 아니므로 알림을 만들지 않습니다. egress `ask`/`deny`와 파일 감사가 전부 우회되고 Landlock만 남습니다.
 
-### 5.3 `FileMode::Delete`와 `FileMode::Metadata`는 런타임에 생성될 수 없다
+### 5.3 `FileMode::Delete`는 이름 변경에서만, `FileMode::Metadata`는 어디서도 생성되지 않는다
 
-`file_mode_for`가 `Read`, `Create`, `Write`만 돌려줍니다 (`notify.rs:534-543`).
+`file_mode_for`가 `Read`, `Create`, `Write`만 돌려줍니다 (`notify.rs:706-715`). `Delete` 는 `--mediate full` 의 `rename`/`link` 계열이 원본에 대해 만들고 (`notify.rs:585-604`), `Create` 는 `O_CREAT` 열기와 같은 계열의 목적지에서 나옵니다. 곧 감사 엔트리의 `mode` 에 `delete` 가 나오면 그것은 `unlink` 가 아니라 이름 변경이나 하드링크의 원본입니다.
 
-`mode = ["delete"]`나 `mode = ["metadata"]`로 쓴 규칙은 중계 층이 절대 평가하지 않습니다. 그 규칙의 `ask`/`deny` 의미론이 발화하지 않습니다.
+`mode = ["delete"]` 규칙은 `unlink` 에는 발화하지 않습니다. `mode = ["metadata"]` 로 쓴 규칙은 중계 층이 절대 평가하지 않습니다. 그 규칙의 `ask`/`deny` 의미론이 발화하지 않습니다.
 
 ### 5.4 `openat2`의 쓰기가 읽기로 분류된다
 
-`openat2`의 세 번째 인자는 `open_how` 구조체 포인터인데, 이를 읽지 않고 보수적으로 `FileMode::Read`로 잡습니다 (`notify.rs:649-651`, 근거는 같은 자리 주석).
+`openat2`의 세 번째 인자는 `open_how` 구조체 포인터인데, 이를 읽지 않고 보수적으로 `FileMode::Read`로 잡습니다 (`notify.rs:838-846`, 근거는 같은 자리 주석).
 
 의도는 보수적 판정이지만 효과는 반대입니다. **읽기 allow + 쓰기 deny인 경로에 `openat2`로 쓰면 허용됩니다.** 감사 엔트리도 mode를 `read`로 남깁니다.
 
 ### 5.5 argv와 경로 읽기에 하드 상한이 있고 잘림이 argv 자리를 차지한다
 
-`MAX_CSTR = 4096`바이트 (`notify.rs:367`), `MAX_ARGV = 256`원소 (`notify.rs:680`), sockaddr 길이는 `2..=128`만 (`notify.rs:454`).
+`MAX_CSTR = 4096`바이트 (`notify.rs:447`), `MAX_ARGV = 256`원소 (`notify.rs:872`), sockaddr 길이는 `2..=128`만 (`notify.rs:626`). 이름 변경 계열의 두 경로도 같은 상한으로 읽습니다.
 
 - `argv_contains = ["--force"]` deny 규칙은 `--force`를 257번째 이후에 두면 우회됩니다. 평가가 잘린 목록으로 돌기 때문입니다 (`notify.rs:722-724`).
 - 더 나쁘게, **읽을 수 없는 원소 하나가 루프를 멈춥니다** (`notify.rs:716-719`). 그 뒤 인자는 평가되지 않습니다.
@@ -366,15 +381,15 @@ Darwin 25.4에서 확인했으며 회귀 테스트로 고정해 두었습니다 
 
 ### 5.6 32비트와 x32 syscall은 프로세스를 죽인다
 
-아키텍처 불일치는 `SECCOMP_RET_KILL_PROCESS`입니다 (`notify.rs:230-232`, x32는 `237-242`).
+아키텍처 불일치는 `SECCOMP_RET_KILL_PROCESS`입니다 (`bpf.rs:67-70`, x32는 `72-76`).
 
-중계 상태에서 i386 바이너리를 돌리면 진단 없이 SIGSYS로 즉사합니다. errno도 감사 엔트리도 없습니다. multiarch 툴체인, 32비트 크로스 컴파일러, Wine은 중계가 켜진 동안 쓸 수 없습니다. 이 강경한 선택 자체는 32비트 바이너리가 `ask` 승인을 건너뛰던 문제의 수정이며(`CHANGELOG.md`), 우회보다 죽이는 쪽이 옳습니다.
+이 검사는 이제 **`--mediate off` 에서도** 걸립니다. TIOCSTI 거부 필터가 같은 프롤로그를 쓰기 때문이며 (`notify.rs:334-359`, `landlock.rs:1370-1372`), i386 ABI 의 `ioctl`(54번)은 네이티브 번호(16번)와 달라 검사 없이 통과시키면 거부가 우회됩니다. 곧 Landlock 강제 아래에서 i386 바이너리를 돌리면 중계 수준과 무관하게 진단 없이 SIGSYS로 즉사합니다. errno도 감사 엔트리도 없습니다. multiarch 툴체인, 32비트 크로스 컴파일러, Wine은 `airlock run` 아래에서 쓸 수 없습니다. 이 강경한 선택 자체는 32비트 바이너리가 `ask` 승인을 건너뛰던 문제의 수정이며(`CHANGELOG.md`), 우회보다 죽이는 쪽이 옳습니다.
 
 ### 5.7 모르는 아키텍처는 조용히 중계 0으로 강등된다
 
-`NATIVE_ARCH`는 8개 아키텍처만 압니다 (`notify.rs:120-146`). `None`이면 필터가 만들어지지 않고 (`notify.rs:223`), 세션은 `Mediation::Off`로 진행합니다 (`session.rs:586-592`).
+`NATIVE_ARCH`는 8개 아키텍처만 압니다 (`notify.rs:108-134`). `None`이면 필터가 만들어지지 않고 (`notify.rs:256-274`), 세션은 `Mediation::Off`로 진행합니다 (`session.rs`의 `setup_mediation`).
 
-제네시스에는 올바르게 기록되지만 (`session.rs:478-483`), 사용자에게 가는 신호는 stderr 한 줄뿐입니다.
+제네시스에는 올바르게 기록되지만, 사용자에게 가는 신호는 stderr 한 줄뿐입니다. 같은 이유로 TIOCSTI 거부 필터도 만들어지지 않으며 이쪽은 Landlock 강제 층이 gap 으로 냅니다 (`landlock.rs:1427-1438`). 그 아키텍처에서는 8.5 의 승인 위조 경로가 열려 있습니다.
 
 ### 5.8 첫 `execve` 알림은 무조건 허용된다
 
@@ -745,11 +760,17 @@ CI, 데몬, 분리된 세션에서는 모든 `ask` 규칙이 조용히 `deny`처
 
 사람이 `y`를 누른 시점과 커널이 syscall을 다시 실행하는 시점 사이에 대상은 자기 메모리의 경로나 주소를 바꿔 쓸 수 있습니다. **프롬프트는 관측한 것에 대해 정직하지만 앞으로 일어날 일에 대한 보증은 아닙니다.**
 
-### 8.5 상속된 stdin으로 자식이 사용자의 답을 읽을 수 있다
+### 8.5 상속된 터미널로 자식이 사용자의 답을 읽거나 위조할 수 있다
 
-`/dev/tty`는 양쪽 허용 목록에서 일부러 뺐지만 (`landlock.rs:56-60`, `profile.rs:32-37`), 같은 자리 주석대로 상속된 stdin/stdout/stderr는 그대로 둡니다. `Command`에 stdio 리다이렉션이 없습니다 (`session.rs:466-469`).
+`/dev/tty`는 양쪽 허용 목록에서 일부러 뺐지만 (`landlock.rs:76-87`, `profile.rs`), 같은 자리 주석대로 상속된 stdin/stdout/stderr는 그대로 둡니다. `Command`에 stdio 리다이렉션이 없고 `setsid` 도 하지 않습니다. `setsid` 는 대화형 에이전트를 깨기 때문입니다.
 
-대화형 실행에서 fd 0/1/2는 **바로 그 터미널입니다.** 자식은 fd 1에 써서 그럴듯한 가짜 승인 프롬프트를 그릴 수 있고, fd 0을 읽어 브로커의 `read_line`(`approve.rs:236`)보다 먼저 사용자가 친 `y`를 가져갈 수 있습니다. **`/dev/tty`를 막는 것으로 이 경로가 닫히지 않습니다.**
+대화형 실행에서 fd 0/1/2는 **바로 그 터미널입니다.** 자식은 fd 1에 써서 그럴듯한 가짜 승인 프롬프트를 그릴 수 있고, fd 0을 읽어 브로커의 `read_line`보다 먼저 사용자가 친 `y`를 가져갈 수 있습니다. **`/dev/tty`를 막는 것으로 이 경로가 닫히지 않습니다.**
+
+**답을 위조하는 경로는 닫았습니다.** 제어 터미널에 `ioctl(TIOCSTI, "y\n")` 을 부르면 사용자가 치지 않은 바이트가 입력 큐에 들어가 `/dev/tty` 를 새로 연 승인 프롬프트가 그것을 답으로 읽습니다. macOS 는 Seatbelt 가 TIOCSTI 를 거부함을 실측했고, Linux 는 커널 6.2 이후 `dev.tty.legacy_tiocsti = 0` 이면 막히지만 배포판 기본값과 구버전 커널은 열려 있습니다. 그래서 Linux 는 seccomp 로 `TIOCSTI`(0x5412) 와 가상 콘솔 붙여넣기 경로인 `TIOCLINUX`(0x541C) 를 `EPERM` 으로 거부합니다 (`notify.rs:49`, `bpf.rs:74-94`). 두 값은 x86_64 와 aarch64 에서 같고, 비교는 커널이 그러듯 인자의 하위 32비트로 합니다. 이 필터는 **중계 수준과 무관하게** 걸립니다. 중계 필터에도 들어 있고 (`notify.rs:256-274`), Landlock 강제 층이 `--mediate off` 를 포함한 모든 세션에서 최소 필터로 따로 겁니다 (`notify.rs:334-359`, `landlock.rs:1359-1372`). `--enforce observe` 에 중계까지 끄면 걸리지 않습니다. bubblewrap 과 flatpak 이 같은 두 개를 막습니다.
+
+이 조치는 대화형 에이전트를 깨지 않습니다. 쉘, 에디터, TUI, 코딩 에이전트는 자기 stdin 을 **읽을** 뿐 자기 입력 큐에 쓰지 않으며, 터미널 크기 조회(`TIOCGWINSZ`)나 모드 설정(`TCSETS`)은 다른 ioctl 이라 영향받지 않습니다. TIOCSTI 를 쓰는 정상 프로그램은 사실상 없고, 그래서 커널 자체가 이를 끄는 방향으로 갔습니다.
+
+남는 것은 fd 0 을 먼저 읽어 사용자의 진짜 답을 가로채는 경합과 fd 1 에 가짜 프롬프트를 그리는 것입니다. 전자는 브로커에 답이 닿지 않아 거부로 끝나므로 승인 위조가 아니라 방해입니다. 후자는 사회공학입니다. 진짜 프롬프트가 대기 중일 때 가짜 화면으로 `y` 를 유도하면 그 `y` 는 브로커가 읽습니다. 프롬프트 내용의 제어 문자 정리(`docs/policy-dsl.md` 3.4)가 화면 덮어쓰기를 어렵게 하지만 없애지는 못합니다. 둘 다 stdio 재지정이나 별도 세션 없이는 닫히지 않으며 그 방향은 대화형 사용을 깹니다.
 
 ### 8.6 프롬프트 내용이 잘린 관측만큼만 완전하다
 
