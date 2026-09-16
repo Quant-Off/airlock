@@ -578,6 +578,232 @@ fn a_deleted_session_directory_is_caught_by_the_anchor_chain() {
     );
 }
 
+/// append 권한만 가진 공격자가 하는 일. 세션 체인 끝에 자체 정합적인 엔트리 `count` 개를
+/// 잇고, `fix_head` 면 head.json 도 새 끝으로 맞춥니다. 마지막 엔트리의 (seq, hash) 를
+/// 돌려줍니다
+fn forge_tail(dir: &Path, count: u64, fix_head: bool) -> (u64, airlock_audit::Hash) {
+    use airlock_audit::{Decision, Entry, Event, FileMode, Head, Record};
+    use std::io::Write;
+
+    let chain = dir.join("chain.jsonl");
+    let entries: Vec<Entry> = std::fs::read_to_string(&chain)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let mut last = entries.last().unwrap().clone();
+    let mut body = String::new();
+    for _ in 0..count {
+        let forged = Entry::seal(
+            last.seq + 1,
+            last.ts + 1,
+            last.session,
+            last.enforcement,
+            last.hash,
+            Record::new(
+                "pid:1 test",
+                Event::FileAccess {
+                    path_requested: "/Users/me/.ssh/id_ed25519".into(),
+                    path_resolved: "/Users/me/.ssh/id_ed25519".into(),
+                    mode: FileMode::Read,
+                },
+                Decision::Allow,
+            ),
+        );
+        body.push_str(&serde_json::to_string(&forged).unwrap());
+        body.push('\n');
+        last = forged;
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&chain)
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    if fix_head {
+        std::fs::write(
+            dir.join("head.json"),
+            serde_json::to_string_pretty(&Head {
+                version: 1,
+                seq: last.seq,
+                hash: last.hash,
+                session: last.session,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    (last.seq, last.hash)
+}
+
+#[test]
+fn appending_after_close_with_a_fresh_anchor_fails_verify_and_report() {
+    // H2. chain.jsonl 과 anchors.jsonl 에 append 만 할 수 있는 공격자가 종료된 세션에 위조
+    // 엔트리를 잇고 새 head 를 가리키는 앵커 한 줄을 더한다. 재앵커링을 "체크포인트" 로
+    // 허용하면 verify 는 0, report 는 이상 없음이 된다
+    let s = Scratch::new("report-reanchor");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+
+    let session_dir = s.session();
+    let first: airlock_audit::Entry =
+        serde_json::from_str(s.chain().lines().next().unwrap()).unwrap();
+    let (seq, hash) = forge_tail(&session_dir, 2, true);
+    airlock_audit::AnchorLog::open(s.audit())
+        .unwrap()
+        .append(first.session, seq, hash)
+        .unwrap();
+
+    let verify = airlock(
+        &s,
+        &ws,
+        &[
+            "audit",
+            "verify",
+            "--anchor-dir",
+            s.audit().to_str().unwrap(),
+            session_dir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&verify), 2, "{}", printed(&verify));
+    assert!(
+        printed(&verify).contains("다시 앵커함"),
+        "두 번째 앵커 줄이 실패로 보고되어야 함: {}",
+        printed(&verify)
+    );
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+    assert!(
+        printed(&out).contains("anchor_chain_broken"),
+        "{}",
+        printed(&out)
+    );
+
+    let json = report_json(&s, &ws);
+    let kinds: Vec<&str> = json["anomalies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["kind"].as_str())
+        .collect();
+    assert!(kinds.contains(&"anchor_chain_broken"), "{kinds:?}");
+    // session_end 뒤의 엔트리는 세션 체인 층에서도 따로 걸린다
+    assert!(kinds.contains(&"integrity"), "{kinds:?}");
+    assert_eq!(json["exit_code"], 2, "{json}");
+}
+
+#[test]
+fn appending_after_session_end_without_a_new_anchor_fails() {
+    let s = Scratch::new("report-after-end");
+    let ws = work_dir(&s);
+    one_session(&s, &ws);
+
+    let session_dir = s.session();
+    forge_tail(&session_dir, 1, true);
+
+    let verify = airlock(
+        &s,
+        &ws,
+        &[
+            "audit",
+            "verify",
+            "--anchor-dir",
+            s.audit().to_str().unwrap(),
+            session_dir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&verify), 2, "{}", printed(&verify));
+    assert!(
+        printed(&verify).contains("session_end"),
+        "{}",
+        printed(&verify)
+    );
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+}
+
+#[test]
+fn an_anchored_session_with_a_lagging_head_is_an_evidence_anomaly() {
+    // SIGKILL 로 죽어 앵커가 없는 세션에 공격자가 엔트리 하나를 잇고(head.json 은 못 건드림)
+    // 첫 앵커를 대신 쓴다. 세션 체인만 보면 크래시 잔여 경고이고 앵커는 head 와 일치한다
+    use airlock_audit::{
+        AnchorLog, AuditLog, Decision, Enforcement, Event, FileMode, GenesisInfo, Hash, Mediation,
+        Record, SessionId,
+    };
+
+    let s = Scratch::new("report-anchored-lag");
+    let ws = work_dir(&s);
+    let dir = s.audit().join("sessions").join("1700000000000000000-1");
+    let id = SessionId::from_bytes([4; 16]);
+    {
+        let mut log = AuditLog::create(
+            &dir,
+            id,
+            Enforcement::Observe,
+            true,
+            GenesisInfo {
+                airlock_version: "0.0.0-test".into(),
+                argv: vec!["airlock".into(), "run".into()],
+                cwd: "/tmp".into(),
+                policy_digest: Hash::ZERO,
+                policy_source: None,
+                mediation: Mediation::Off,
+                operator: None,
+                policy_signer: None,
+            },
+        )
+        .unwrap();
+        log.append(Record::new(
+            "pid:1 test",
+            Event::FileAccess {
+                path_requested: "/tmp/a".into(),
+                path_resolved: "/tmp/a".into(),
+                mode: FileMode::Read,
+            },
+            Decision::Allow,
+        ))
+        .unwrap();
+    }
+    let (seq, hash) = forge_tail(&dir, 1, false);
+    AnchorLog::open(s.audit())
+        .unwrap()
+        .append(id, seq, hash)
+        .unwrap();
+
+    let verify = airlock(
+        &s,
+        &ws,
+        &[
+            "audit",
+            "verify",
+            "--anchor-dir",
+            s.audit().to_str().unwrap(),
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&verify), 2, "{}", printed(&verify));
+    assert!(
+        printed(&verify).contains("크래시 잔여일 수 없음"),
+        "{}",
+        printed(&verify)
+    );
+
+    let out = report(&s, &ws, &[]);
+    assert_eq!(code(&out), 2, "{}", printed(&out));
+    assert!(
+        printed(&out).contains("anchored_head_lag"),
+        "{}",
+        printed(&out)
+    );
+    let json = report_json(&s, &ws);
+    assert_eq!(
+        json["sessions"][0]["anchor"]["status"], "mismatch",
+        "{json}"
+    );
+}
+
 #[test]
 fn a_tampered_review_chain_makes_the_report_exit_non_zero() {
     let s = Scratch::new("report-review-tamper");

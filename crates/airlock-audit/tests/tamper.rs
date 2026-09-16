@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use airlock_canonical::Encoder;
 
 use airlock_audit::{
-    AuditLog, CHAIN_FILE, Decision, Enforcement, Entry, Event, FileMode, GenesisInfo, Granted,
-    HEAD_FILE, Hash, Head, Mediation, Record, SessionId, Warning, now_unix_nanos, verify_dir,
+    AuditLog, CHAIN_FILE, Decision, Enforcement, Entry, Event, ExitStatus, FileMode, GenesisInfo,
+    Granted, HEAD_FILE, Hash, Head, Mediation, Record, SessionId, Warning, now_unix_nanos,
+    verify_dir,
 };
 
 struct Scratch(PathBuf);
@@ -628,6 +629,8 @@ fn self_referencing_approval_is_fatal() {
 
 #[test]
 fn anchor_lagging_by_one_is_treated_as_crash_residue() {
+    // 세션 체인 층만의 판정이다. 앵커가 있는 세션에서는 앵커 대조가 이것을 실패로 올린다
+    // (tests/anchor.rs 의 an_anchored_session_with_a_lagging_head_is_a_failure)
     let s = Scratch::new("head-lag");
     build_chain(s.path(), Enforcement::Landlock);
 
@@ -645,6 +648,103 @@ fn anchor_lagging_by_one_is_treated_as_crash_residue() {
         )),
         "{:?}",
         report.warnings
+    );
+    assert_eq!(report.head_lag(), Some(3));
+    assert!(report.fsync_per_entry);
+}
+
+// ---------- session_end 이후 ----------
+
+fn session_end() -> Event {
+    Event::SessionEnd {
+        status: ExitStatus::Exited { code: 0 },
+    }
+}
+
+#[test]
+fn a_chain_ending_with_session_end_is_clean_and_marked_ended() {
+    let s = Scratch::new("ended");
+    let mut log = AuditLog::create(
+        s.path(),
+        SessionId::from_bytes([0xAB; 16]),
+        Enforcement::Landlock,
+        true,
+        genesis(),
+    )
+    .unwrap();
+    log.append(Record::new("airlock", session_end(), Decision::Allow))
+        .unwrap();
+
+    let report = verify_dir(s.path()).unwrap();
+    assert!(report.is_clean(), "{:?}", report.warnings);
+    assert!(report.session_ended);
+
+    let s2 = Scratch::new("not-ended");
+    build_chain(s2.path(), Enforcement::Landlock);
+    let report = verify_dir(s2.path()).unwrap();
+    assert!(
+        !report.session_ended,
+        "session_end 가 없는 체인이 끝난 것으로 보이면 안 됨"
+    );
+}
+
+#[test]
+fn entries_after_session_end_are_fatal() {
+    // 브로커는 session_end 뒤의 append 를 거부하므로 이 상태는 종료 뒤 덧붙이기로만 생긴다.
+    // 앵커가 있든 없든 세션 체인 층에서 실패해야 한다
+    let s = Scratch::new("after-end");
+    let mut log = AuditLog::create(
+        s.path(),
+        SessionId::from_bytes([0xAB; 16]),
+        Enforcement::Landlock,
+        true,
+        genesis(),
+    )
+    .unwrap();
+    log.append(Record::new("airlock", session_end(), Decision::Allow))
+        .unwrap();
+    // AuditLog 자체는 닫힘을 모르므로 append 가 성공한다. 그것이 공격자가 하는 일이다
+    log.append(Record::new(
+        "pid:100 claude",
+        file_read("/Users/me/.ssh/id_ed25519"),
+        Decision::Allow,
+    ))
+    .unwrap();
+
+    let err = verify_dir(s.path()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            airlock_audit::Failure::EntryAfterSessionEnd { end_seq: 1, seq: 2 }
+        ),
+        "session_end 뒤의 엔트리가 통과하면 종료된 세션에 무엇이든 덧붙일 수 있음: {err}"
+    );
+    assert!(err.to_string().contains("덧붙이기 의심"), "{err}");
+}
+
+#[test]
+fn a_second_session_end_is_also_fatal() {
+    let s = Scratch::new("double-end");
+    let mut log = AuditLog::create(
+        s.path(),
+        SessionId::from_bytes([0xAB; 16]),
+        Enforcement::Landlock,
+        true,
+        genesis(),
+    )
+    .unwrap();
+    log.append(Record::new("airlock", session_end(), Decision::Allow))
+        .unwrap();
+    log.append(Record::new("airlock", session_end(), Decision::Allow))
+        .unwrap();
+
+    let err = verify_dir(s.path()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            airlock_audit::Failure::EntryAfterSessionEnd { end_seq: 1, seq: 2 }
+        ),
+        "{err}"
     );
 }
 

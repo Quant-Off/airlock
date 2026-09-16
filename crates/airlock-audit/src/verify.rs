@@ -59,6 +59,10 @@ pub enum Failure {
         seq: u64,
         for_seq: u64,
     },
+    EntryAfterSessionEnd {
+        end_seq: u64,
+        seq: u64,
+    },
     HeadMismatch {
         head: Box<Head>,
         chain_seq: u64,
@@ -189,6 +193,18 @@ impl fmt::Display for Failure {
                 tr!(
                     format!("seq {seq} approval의 대상 seq {for_seq}가 ask가 아님"),
                     format!("seq {seq} approval targets seq {for_seq}, which is not an ask")
+                )
+            ),
+            Self::EntryAfterSessionEnd { end_seq, seq } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!(
+                        "seq {seq}가 session_end(seq {end_seq}) 뒤에 있음. 체인은 session_end로 끝나야 하므로 종료 뒤 덧붙이기 의심"
+                    ),
+                    format!(
+                        "seq {seq} follows session_end (seq {end_seq}); the chain must end with session_end, so append after close is suspected"
+                    )
                 )
             ),
             Self::HeadMismatch {
@@ -337,12 +353,22 @@ pub struct VerifyReport {
     pub session: SessionId,
     pub head_seq: u64,
     pub head_hash: Hash,
+    /// 제네시스가 기록한 값. 앵커 대조가 head.json 뒤처짐을 실패로 올릴지 정할 때 봅니다
+    pub fsync_per_entry: bool,
+    pub session_ended: bool,
     pub warnings: Vec<Warning>,
 }
 
 impl VerifyReport {
     pub fn is_clean(&self) -> bool {
         self.warnings.is_empty()
+    }
+
+    pub fn head_lag(&self) -> Option<u64> {
+        self.warnings.iter().find_map(|w| match w {
+            Warning::HeadLagsByOne { head_seq, .. } => Some(*head_seq),
+            _ => None,
+        })
     }
 }
 
@@ -385,6 +411,8 @@ pub fn verify_stream<R: BufRead>(
     let mut last_seq: u64 = 0;
     let mut observe_count: u64 = 0;
     let mut entry_count: u64 = 0;
+    let mut fsync_per_entry = true;
+    let mut ended_at: Option<u64> = None;
 
     let mut open_asks: HashSet<u64> = HashSet::new();
     let mut answered: HashSet<u64> = HashSet::new();
@@ -469,6 +497,21 @@ pub fn verify_stream<R: BufRead>(
                 expected: recomputed,
                 got: entry.hash,
             });
+        }
+
+        if let Some(end_seq) = ended_at {
+            return Err(Failure::EntryAfterSessionEnd {
+                end_seq,
+                seq: entry.seq,
+            });
+        }
+        match &entry.event {
+            Event::SessionStart {
+                fsync_per_entry: per_entry,
+                ..
+            } => fsync_per_entry = *per_entry,
+            Event::SessionEnd { .. } => ended_at = Some(entry.seq),
+            _ => {}
         }
 
         if entry.seq > 0 && entry.ts < last_ts {
@@ -571,6 +614,8 @@ pub fn verify_stream<R: BufRead>(
         session,
         head_seq: last_seq,
         head_hash: prev_hash,
+        fsync_per_entry,
+        session_ended: ended_at.is_some(),
         warnings,
     })
 }

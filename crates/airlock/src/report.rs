@@ -822,7 +822,8 @@ fn build_session(
     }
 
     let mut warnings: Vec<String> = Vec::new();
-    let integrity = match airlock_audit::verify_dir(dir) {
+    let verified = airlock_audit::verify_dir(dir);
+    let integrity = match &verified {
         Ok(v) => {
             for w in &v.warnings {
                 warnings.push(w.to_string());
@@ -858,47 +859,49 @@ fn build_session(
         }
     };
 
-    let anchor = match (chain, session, &integrity) {
-        (ChainState::Absent, _, _) => AnchorState::ChainAbsent,
-        (ChainState::Broken { .. }, _, _) => AnchorState::ChainBroken,
-        (
-            ChainState::Ok { .. },
-            Some(id),
-            Integrity::Ok {
-                head_seq,
-                head_hash,
-                ..
-            },
-        ) => match airlock_audit::check_session(anchor_dir, &id, *head_seq, head_hash) {
-            Ok(AnchorCheck::Matches { anchor_seq }) => AnchorState::Matches { anchor_seq },
-            Ok(AnchorCheck::Missing) => {
-                anomalies.push(Anomaly {
-                    severity: Severity::Evidence,
-                    kind: "anchor_missing",
-                    session: Some(name.clone()),
-                    detail: tr!(
-                        "이 세션의 앵커 줄이 없음. 삭제와 재계산을 탐지할 수 없으며 통과가 아님",
-                        "this session has no anchor line; deletion and recomputation \
-                         cannot be detected, which is not a pass"
-                    )
-                    .to_string(),
-                });
-                AnchorState::Missing
+    let anchor = match (chain, &verified) {
+        (ChainState::Absent, _) => AnchorState::ChainAbsent,
+        (ChainState::Broken { .. }, _) => AnchorState::ChainBroken,
+        // 원시 check_session 이 아니라 check_session_report 를 쓴다
+        // 앵커가 있는 세션의 head.json 뒤처짐은 크래시 잔여가 아니라 덧붙이기다
+        (ChainState::Ok { .. }, Ok(v)) => {
+            match airlock_audit::check_session_report(anchor_dir, v) {
+                Ok(AnchorCheck::Matches { anchor_seq }) => AnchorState::Matches { anchor_seq },
+                Ok(AnchorCheck::Missing) => {
+                    anomalies.push(Anomaly {
+                        severity: Severity::Evidence,
+                        kind: "anchor_missing",
+                        session: Some(name.clone()),
+                        detail: tr!(
+                            "이 세션의 앵커 줄이 없음. 삭제와 재계산을 탐지할 수 없으며 통과가 아님",
+                            "this session has no anchor line; deletion and recomputation \
+                             cannot be detected, which is not a pass"
+                        )
+                        .to_string(),
+                    });
+                    AnchorState::Missing
+                }
+                Err(failure) => {
+                    // 종류는 로케일 무관 고정이며 덧붙이기와 재계산은 대응이 다르므로 나눈다
+                    let kind = match &failure {
+                        AnchorFailure::EntriesAfterAnchor { .. } => "entries_after_anchor",
+                        AnchorFailure::AnchoredHeadLag { .. } => "anchored_head_lag",
+                        _ => "anchor_mismatch",
+                    };
+                    let detail = failure.to_string();
+                    anomalies.push(Anomaly {
+                        severity: Severity::Evidence,
+                        kind,
+                        session: Some(name.clone()),
+                        detail: detail.clone(),
+                    });
+                    AnchorState::Mismatch { detail }
+                }
             }
-            Err(failure) => {
-                let detail = failure.to_string();
-                anomalies.push(Anomaly {
-                    severity: Severity::Evidence,
-                    kind: "anchor_mismatch",
-                    session: Some(name.clone()),
-                    detail: detail.clone(),
-                });
-                AnchorState::Mismatch { detail }
-            }
-        },
+        }
         // 체인을 읽지 못한 세션은 대조할 head 가 없습니다. 무결성 실패가 이미 이상으로
         // 올라가 있으므로 여기서 다시 세지 않습니다
-        (ChainState::Ok { .. }, _, _) => AnchorState::Missing,
+        (ChainState::Ok { .. }, Err(_)) => AnchorState::Missing,
     };
 
     let mut decisions = Decisions::default();
