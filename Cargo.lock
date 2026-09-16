@@ -14,6 +14,7 @@ dependencies = [
  "airlock-proxy",
  "airlock-setup",
  "clap",
+ "libc",
  "serde_json",
 ]
 

@@ -5,6 +5,7 @@
 //! 정책 로드 실패 시 fail-closed, 작업 공간 안전장치가 대상입니다. 강제 층 동작은
 //! 플랫폼별 통합 테스트가 따로 검사합니다.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -58,20 +59,69 @@ impl Drop for Scratch {
 
 /// 격리된 환경에서 airlock 을 부릅니다.
 ///
-/// `HOME`을 스크래치 안으로 옮겨 실행하는 사람의 실제 홈과 정책 파일을 건드리지 않습니다
+/// `HOME`을 스크래치 안으로 옮겨 실행하는 사람의 실제 홈과 정책 파일을 건드리지 않습니다.
+/// 자식은 새 세션에서 돌려 제어 터미널을 떼어 냅니다. 터미널에서 `cargo test` 를 돌리면
+/// 자식이 `/dev/tty` 를 열 수 있어 ask 나 정책 신뢰 확인이 사람 입력을 기다리며 멈추는데,
+/// CI 와 같은 조건(터미널 없음)으로 고정해야 결과가 결정적입니다
+///
+/// # Safety
+/// `setsid(2)` 는 fork 뒤 exec 전의 자식에서 부르며 async-signal-safe 입니다. 방금 fork 된
+/// 자식은 프로세스 그룹 리더가 아니므로 실패하지 않고, 실패하더라도 exec 은 계속됩니다
 fn airlock(s: &Scratch, cwd: &Path, args: &[&str]) -> Output {
     let home = s.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    Command::new(bin())
-        .args(args)
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
         .current_dir(cwd)
         .env("HOME", &home)
         .env("AIRLOCK_LANG", "ko")
         .env_remove("AIRLOCK_AUDIT_DIR")
-        .env_remove("XDG_DATA_HOME")
-        .output()
-        .expect("airlock 실행 실패")
+        .env_remove("XDG_DATA_HOME");
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.output().expect("airlock 실행 실패")
 }
+
+/// 정책 파일을 사람이 승인한 것으로 기록합니다.
+///
+/// 정책 파일을 넘기는 `airlock run` 은 이 기록이 없으면 터미널 없는 테스트에서 거부되므로
+/// 실행 전에 부릅니다
+fn trust(s: &Scratch, cwd: &Path, policy: &Path) -> Output {
+    let out = airlock(
+        s,
+        cwd,
+        &[
+            "policy",
+            "trust",
+            "--audit-root",
+            s.audit().to_str().unwrap(),
+            policy.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", printed(&out));
+    out
+}
+
+const ALLOW_ALL_EXEC: &str = r#"
+version = 1
+name = "allow-exec"
+[defaults]
+file = "allow"
+exec = "allow"
+egress = "deny"
+"#;
+
+const EXTRA_RULE: &str = r#"
+[[rules]]
+id = "open-tmp"
+kind = "file"
+path = "/tmp/**"
+action = "allow"
+"#;
 
 fn code(out: &Output) -> i32 {
     out.status.code().unwrap_or(-1)
@@ -194,6 +244,7 @@ egress = "deny"
 "#,
     )
     .unwrap();
+    trust(&s, &ws, &ws.join("airlock.toml"));
 
     let out = airlock(
         &s,
@@ -332,6 +383,274 @@ fn an_unknown_mediation_level_is_rejected() {
     );
     assert_eq!(code(&out), 64, "{}", stderr(&out));
     assert!(!s.audit().exists(), "인자가 틀렸는데 세션이 시작되었음");
+}
+
+// ---------- 정책 출처 신뢰 ----------
+
+fn run_echo(s: &Scratch, ws: &Path, extra: &[&str]) -> Output {
+    let audit = s.audit();
+    let mut args = vec!["run", "--audit-dir", audit.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", "/bin/echo", "hi"]);
+    airlock(s, ws, &args)
+}
+
+#[test]
+fn an_untrusted_policy_is_refused_without_a_tty() {
+    let s = Scratch::new("trust-none");
+    let ws = work_dir(&s);
+    std::fs::write(ws.join("airlock.toml"), ALLOW_ALL_EXEC).unwrap();
+
+    let out = run_echo(&s, &ws, &[]);
+    assert_eq!(
+        code(&out),
+        78,
+        "기록 없는 정책이 터미널 없이 실행되면 에이전트가 심은 정책이 그대로 읽힘: {}",
+        stderr(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("airlock policy trust"),
+        "힌트가 있어야 함: {err}"
+    );
+    assert!(err.contains("실행을 중단함"), "{err}");
+    assert!(
+        !s.audit().join("sessions").exists(),
+        "정책 출처를 확인하지 못했는데 브로커가 세션을 시작했음"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "자식이 실행되었음"
+    );
+}
+
+#[test]
+fn a_trusted_policy_runs_and_is_reported_in_the_banner() {
+    let s = Scratch::new("trust-ok");
+    let ws = work_dir(&s);
+    let policy = ws.join("airlock.toml");
+    std::fs::write(&policy, ALLOW_ALL_EXEC).unwrap();
+
+    let recorded = trust(&s, &ws, &policy);
+    let text = printed(&recorded);
+    assert!(text.contains("정책 신뢰 기록됨"), "{text}");
+    assert!(
+        s.audit().join("trusted-policies.jsonl").is_file(),
+        "기록 파일이 감사 루트에 생겨야 함"
+    );
+
+    let out = run_echo(&s, &ws, &[]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    assert!(
+        stderr(&out).contains("신뢰     기록 일치"),
+        "배너가 기록 일치를 보여야 함: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_changed_policy_is_refused_again_but_comments_are_not() {
+    let s = Scratch::new("trust-changed");
+    let ws = work_dir(&s);
+    let policy = ws.join("airlock.toml");
+    std::fs::write(&policy, ALLOW_ALL_EXEC).unwrap();
+    trust(&s, &ws, &policy);
+    assert_eq!(code(&run_echo(&s, &ws, &[])), 0);
+
+    // 주석만 바뀐 정책은 의미가 같으므로 다시 묻지 않습니다
+    std::fs::write(
+        &policy,
+        format!(
+            "# comment
+{ALLOW_ALL_EXEC}"
+        ),
+    )
+    .unwrap();
+    let out = run_echo(&s, &ws, &[]);
+    assert_eq!(
+        code(&out),
+        0,
+        "주석은 다이제스트를 바꾸지 않아야 함: {}",
+        stderr(&out)
+    );
+
+    // 규칙이 바뀌면 다른 정책입니다
+    std::fs::write(&policy, format!("{ALLOW_ALL_EXEC}\n{EXTRA_RULE}")).unwrap();
+    let out = run_echo(&s, &ws, &[]);
+    assert_eq!(code(&out), 78, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("기록된"),
+        "이전에 기록된 다이제스트와 다르다는 사실이 드러나야 함: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn yes_and_observe_do_not_bypass_the_trust_check() {
+    let s = Scratch::new("trust-yes");
+    let ws = work_dir(&s);
+    std::fs::write(ws.join("airlock.toml"), ALLOW_ALL_EXEC).unwrap();
+
+    for flags in [
+        &["--yes"][..],
+        &["--observe"][..],
+        &["--yes", "--observe"][..],
+    ] {
+        let out = run_echo(&s, &ws, flags);
+        assert_eq!(
+            code(&out),
+            78,
+            "{flags:?} 가 정책 신뢰 확인을 우회함. 심긴 정책이 바로 --yes 실행에서 읽히는 것이 \
+             이 위협의 시나리오임: {}",
+            stderr(&out)
+        );
+        assert!(!s.audit().join("sessions").exists());
+    }
+}
+
+#[test]
+fn a_distrusted_record_file_refuses_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("trust-distrusted");
+    let ws = work_dir(&s);
+    let policy = ws.join("airlock.toml");
+    std::fs::write(&policy, ALLOW_ALL_EXEC).unwrap();
+    trust(&s, &ws, &policy);
+
+    let record = s.audit().join("trusted-policies.jsonl");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let out = run_echo(&s, &ws, &[]);
+    assert_eq!(
+        code(&out),
+        78,
+        "다른 사용자가 쓸 수 있는 기록 파일을 믿으면 안 됨: {}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("불신"), "{}", stderr(&out));
+
+    let list = airlock(
+        &s,
+        &ws,
+        &[
+            "policy",
+            "trust",
+            "--list",
+            "--audit-root",
+            s.audit().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&list), 78, "{}", printed(&list));
+}
+
+#[test]
+fn policy_trust_list_shows_the_latest_record_per_path() {
+    let s = Scratch::new("trust-list");
+    let ws = work_dir(&s);
+    let policy = ws.join("airlock.toml");
+    let list_args = |s: &Scratch| {
+        let audit = s.audit();
+        vec![
+            "policy".to_string(),
+            "trust".to_string(),
+            "--list".to_string(),
+            "--audit-root".to_string(),
+            audit.to_str().unwrap().to_string(),
+        ]
+    };
+
+    let args = list_args(&s);
+    let empty = airlock(
+        &s,
+        &ws,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    assert_eq!(code(&empty), 0, "{}", printed(&empty));
+    assert!(printed(&empty).contains("기록 없음"), "{}", printed(&empty));
+
+    std::fs::write(&policy, ALLOW_ALL_EXEC).unwrap();
+    let first = trust(&s, &ws, &policy);
+    let first_digest = printed(&first)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("다이제스트 "))
+        .map(str::to_string)
+        .expect("다이제스트 줄이 없음");
+
+    std::fs::write(&policy, format!("{ALLOW_ALL_EXEC}\n{EXTRA_RULE}")).unwrap();
+    let second = trust(&s, &ws, &policy);
+    let second_digest = printed(&second)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("다이제스트 "))
+        .map(str::to_string)
+        .expect("다이제스트 줄이 없음");
+    assert_ne!(first_digest, second_digest);
+
+    let args = list_args(&s);
+    let list = airlock(
+        &s,
+        &ws,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    assert_eq!(code(&list), 0, "{}", printed(&list));
+    let text = printed(&list);
+    assert!(text.contains(policy.to_str().unwrap()), "{text}");
+    assert!(
+        text.contains(&second_digest),
+        "마지막 기록이 보여야 함: {text}"
+    );
+    assert!(
+        !text.contains(&first_digest),
+        "덮인 기록은 목록에 나오면 안 됨: {text}"
+    );
+
+    // 같은 다이제스트를 다시 기록하면 줄을 늘리지 않습니다
+    let again = trust(&s, &ws, &policy);
+    assert!(printed(&again).contains("이미"), "{}", printed(&again));
+    let body = std::fs::read_to_string(s.audit().join("trusted-policies.jsonl")).unwrap();
+    assert_eq!(body.lines().count(), 2, "{body}");
+}
+
+#[test]
+fn an_explicit_policy_path_is_also_gated() {
+    let s = Scratch::new("trust-explicit");
+    let ws = work_dir(&s);
+    let policy = s.path().join("elsewhere.toml");
+    std::fs::write(&policy, ALLOW_ALL_EXEC).unwrap();
+
+    let out = run_echo(&s, &ws, &["--policy", policy.to_str().unwrap()]);
+    assert_eq!(code(&out), 78, "{}", stderr(&out));
+
+    trust(&s, &ws, &policy);
+    let out = run_echo(&s, &ws, &["--policy", policy.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+#[test]
+fn an_audit_root_inside_the_workspace_is_called_out() {
+    let s = Scratch::new("trust-inside");
+    let ws = work_dir(&s);
+    let inside = ws.join("audit");
+    let out = airlock(
+        &s,
+        &ws,
+        &[
+            "run",
+            "--audit-dir",
+            inside.to_str().unwrap(),
+            "--yes",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("trusted-policies.jsonl"),
+        "기록 파일이 에이전트 손이 닿는 곳에 있다는 경고가 있어야 함: {}",
+        stderr(&out)
+    );
 }
 
 // ---------- 작업 공간 안전장치 ----------

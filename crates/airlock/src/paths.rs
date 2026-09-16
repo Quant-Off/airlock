@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use airlock_policy::LoadContext;
 use airlock_policy::path::home_dir;
 
 pub const POLICY_FILE_NAMES: &[&str] = &["airlock.toml", ".airlock.toml"];
@@ -87,6 +88,40 @@ pub fn discover_policy(explicit: Option<&Path>, cwd: &Path) -> Option<PathBuf> {
         return Some(p.to_path_buf());
     }
     policy_candidates(cwd).into_iter().find(|c| c.is_file())
+}
+
+/// 정책 로드 문맥을 만듭니다.
+///
+/// 실제로 읽을 파일뿐 아니라 탐색 후보 전체를 자기보호 대상으로 넣습니다. 비어 있는
+/// 후보 자리에 대상이 정책을 만들어 두면 다음 실행이 그것을 읽기 때문입니다.
+///
+/// # Arguments
+/// `home` - 홈 디렉토리
+/// `audit_root` - 감사 루트
+/// `cwd` - 현재 디렉토리
+/// `policy_path` - 실제로 읽을 정책 파일. 없으면 베이스라인만 적용
+pub fn load_context(
+    home: PathBuf,
+    audit_root: &Path,
+    cwd: &Path,
+    policy_path: Option<&Path>,
+) -> LoadContext {
+    let mut candidates: Vec<PathBuf> = policy_candidates(cwd)
+        .iter()
+        .flat_map(|p| protect_forms(p, cwd))
+        .collect();
+    if let Some(p) = policy_path {
+        for form in protect_forms(p, cwd) {
+            if !candidates.contains(&form) {
+                candidates.push(form);
+            }
+        }
+    }
+    let mut ctx = LoadContext::new(home, audit_root).with_policy_files(candidates);
+    if let Ok(exe) = std::env::current_exe() {
+        ctx = ctx.with_binary(exe);
+    }
+    ctx
 }
 
 pub fn latest_session(root: &Path) -> Option<PathBuf> {

@@ -6,6 +6,7 @@
 
 ### 추가
 
+- **정책 파일 신뢰 기록 (TOFU).** `airlock run`이 정책 파일을 읽을 때마다 정책 다이제스트를 `<감사루트>/trusted-policies.jsonl`의 기록과 대조함. 처음 보거나 바뀐 정책은 `/dev/tty`로 사람에게 확인받고, 터미널이 없으면 종료 코드 78로 거부하며 **`--yes`와 `--observe`로 건너뛸 수 없음**. `airlock policy trust [PATH] [--list]`가 신설되고 `airlock setup`이 만든 파일은 자동으로 기록됨. Linux Landlock이 아직 없는 경로의 생성을 거부할 수 없어 샌드박스 안 에이전트가 `./airlock.toml`을 심을 수 있다는 한계의 로드 시점 방어임. 근거는 `docs/design.md` 9.6
 - **`--mediate full`이 rename과 link 계열을 중계함.** `rename`, `renameat`, `renameat2`, `link`, `linkat`, `symlink`, `symlinkat`을 원본 `delete`와 목적지 `create`로 판정하며 하나라도 deny면 거부함. 같은 디렉토리 안 `rename`으로 자기보호 대상 정책 파일을 갈아 끼우는 경로가 이 수준에서 닫힘. 기본 수준 `exec-net`에는 넣지 않음
 - **Linux seccomp 필터가 모든 중계 수준(`off` 포함)에서 `ioctl(TIOCSTI)`와 `ioctl(TIOCLINUX)`를 EPERM으로 거부함.** 자식이 상속한 터미널에 입력을 밀어 넣어 ask 승인 프롬프트를 위조하는 경로를 닫음. macOS는 Seatbelt가 이미 거부함. 정상 프로그램은 두 ioctl을 쓰지 않으며 bubblewrap과 flatpak이 같은 조치를 함
 - **출력 로케일 (한국어·영문).** 모든 사람용 출력(CLI 도움말, 배너와 한계 목록, 승인 프롬프트, 감사 보고, 마법사, 생성되는 정책 파일의 주석)이 로케일을 따름. 결정 순서는 `AIRLOCK_LANG` -> `~/.config/airlock/config.toml`의 `locale` 키 -> `LC_ALL`/`LC_MESSAGES`/`LANG` 접두 -> 기본 한국어. 기계 판독 필드(JSON 키, `kind`·`status`·`verdict`, 스키마 이름, 규칙 id)와 **정책 다이제스트는 로케일과 무관하게 고정**임. 자세한 것은 `docs/i18n.md`

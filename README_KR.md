@@ -24,7 +24,7 @@ $ airlock policy check
 $ airlock policy explain --file ~/.ssh/id_rsa
 $ airlock policy explain --exec rm -rf /
 
-# 브로커 아래에서 실행
+# 브로커 아래에서 실행. 처음 보는 정책 파일이면 [y/N] 확인을 받음 (setup 이 만든 파일은 이미 신뢰됨)
 $ airlock run -- claude
 
 # 무슨 일이 있었는지 검증, 조회
@@ -40,7 +40,10 @@ $ airlock audit ack --note "일일 점검"
 
 ```bash
 $ cp examples/policy/strict.toml airlock.toml
+$ airlock policy trust airlock.toml
 ```
+
+손으로 둔 정책 파일은 첫 `airlock run`에서 경로와 다이제스트를 보여 주고 `[y/N]` 확인을 받습니다. 터미널이 없는 실행(CI, 헤드리스)은 확인 없이 거부되므로 위처럼 `airlock policy trust`로 먼저 승인합니다. 정책 내용이 바뀌면 다시 묻고, `--yes`로는 건너뛸 수 없습니다.
 
 정책 시스템에 관한 의미론적 문서를 [policy-dsl.md](docs/policy-dsl.md)에 정리해 두었습니다.
 

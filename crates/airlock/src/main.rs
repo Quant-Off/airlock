@@ -5,6 +5,7 @@ mod cmd_setup;
 mod paths;
 mod render;
 mod report;
+mod trust;
 
 use std::path::PathBuf;
 

@@ -24,7 +24,7 @@ $ airlock policy check
 $ airlock policy explain --file ~/.ssh/id_rsa
 $ airlock policy explain --exec rm -rf /
 
-# Run under the broker
+# Run under the broker. A policy file seen for the first time gets a [y/N] prompt (files written by setup are already trusted)
 $ airlock run -- claude
 
 # Verify and inspect what happened
@@ -40,7 +40,10 @@ If there is no policy file, only the built-in baseline applies. Airlock looks fo
 
 ```bash
 $ cp examples/policy/strict.toml airlock.toml
+$ airlock policy trust airlock.toml
 ```
+
+A policy file you placed by hand is shown (path and digest) on the first `airlock run` and must be confirmed with `[y/N]`. Runs without a terminal (CI, headless) are refused instead of prompted, so approve first with `airlock policy trust` as above. A changed policy is asked about again, and `--yes` does not skip this check.
 
 The semantics of the policy system are written up in [policy-dsl.md](docs/policy-dsl.md).
 
