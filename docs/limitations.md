@@ -587,11 +587,16 @@ env, cwd, uid, 부모 프로세스, 실행 파일 해시 같은 조건을 쓸 �
 
 ## 7. 감사 로그
 
-### 7.1 단일 위조 엔트리가 실패가 아니라 경고로 강등된다
+### 7.1 단일 위조 엔트리가 앵커 없는 세션에서는 경고로 강등된다
 
-`verify_stream`은 `head.seq == last_seq - 1 && head.hash == second_last_hash`를 크래시 잔여물로 보고 `Warning::HeadLagsByOne`만 냅니다 (`verify.rs:400-409`). CLI의 `verify_one`은 `Ok(report)`면 경고가 있어도 **0을 반환합니다** (`cmd_audit.rs:80-96`).
+`verify_stream`은 `head.seq == last_seq - 1 && head.hash == second_last_hash`를 크래시 잔여물로 보고 `Warning::HeadLagsByOne`만 냅니다 (`verify.rs`). CLI의 `verify_one`은 `Ok(report)`면 경고가 있어도 **0을 반환합니다**.
 
-곧 `chain.jsonl`에 쓸 수 있으나 `head.json`을 건드리지 않은 공격자가 잘 만들어진 엔트리 **하나**를 덧붙이면(seq+1, prev = 마지막 해시, 해시 재계산. 비밀값이 필요 없습니다) `airlock audit verify`가 노란 "크래시 잔여물" 줄을 찍고 **0으로 끝납니다.** 일어나지 않은 행위에 대한 allow 판정이나 가짜 `session_end`를 위조하는 비용이 엔트리 하나이며 실패를 내지 않습니다.
+앵커가 있는 세션은 다릅니다. 앵커는 엔트리와 `head.json`이 `fsync`된 뒤에 쓰이므로 앵커가 있는데 `head.json`이 뒤처진 상태는 정상 경로로 만들어질 수 없고, 앵커 대조 단계가 `AnchoredHeadLag` 실패로 올립니다 (`docs/audit-format.md` 8.3). 체인이 앵커보다 길면 `EntriesAfterAnchor`, `session_end` 뒤에 엔트리가 있으면 무결성 실패, 같은 세션의 두 번째 앵커 줄은 `SessionReanchored` 실패입니다. 곧 **브로커가 정상 종료한 세션에는 엔트리 하나를 덧붙일 자리가 없습니다.**
+
+남는 표면은 둘입니다.
+
+- **SIGKILL로 죽어 앵커가 없는 세션.** `chain.jsonl`에 쓸 수 있으나 `head.json`을 건드리지 않은 공격자가 잘 만들어진 엔트리 **하나**를 덧붙이면(seq+1, prev = 마지막 해시, 해시 재계산. 비밀값이 필요 없습니다) `airlock audit verify`가 노란 "크래시 잔여물" 줄을 찍고 **0으로 끝납니다.** `airlock audit report`는 그 세션을 `anchor_missing` 증거 이상으로 세어 2로 끝나므로 매일 점검에서는 드러나지만, 위조와 크래시를 구분하지는 못합니다. 그 공격자가 `anchors.jsonl`에도 append할 수 있으면 첫 앵커를 대신 써서 `anchor_missing`을 지울 수 있고, 그때는 `AnchoredHeadLag`이 유일한 단서입니다. `head.json`까지 다시 쓸 수 있으면 단서가 없습니다.
+- **`--no-fsync` 세션.** 제네시스가 `fsync_per_entry: false`면 엔트리와 `head.json`의 내구화 순서가 보장되지 않아 앵커가 있어도 한 칸 뒤처짐이 크래시로 생길 수 있으므로 경고를 유지합니다. 그 세션에서는 앵커가 있어도 엔트리 하나의 위조가 경고로 남습니다.
 
 ### 7.2 시간은 벽시계뿐이고 신뢰할 수 없다
 
@@ -658,11 +663,11 @@ exec 엔트리의 `cwd`는 세션의 `self.cwd`이지 호출 프로세스의 실
 
 ### 7.11 검증이 연결 관계와 작은 의미 규칙 몇 개만 본다
 
-`verify_stream`이 보는 것: 파싱, `seq` 무결번, 단일 세션 id, 제네시스 `prev == 0`과 `session_start`, `prev` 연결, 해시 재계산, 승인 대상의 존재와 `ask` 여부, head 앵커 (`verify.rs:275-418`).
+`verify_stream`이 보는 것: 파싱, `seq` 무결번, 단일 세션 id, 제네시스 `prev == 0`과 `session_start`, `prev` 연결, 해시 재계산, 승인 대상의 존재와 `ask` 여부, `session_end` 뒤에 엔트리가 없는지, head 앵커 (`verify.rs`).
 
-**보지 않는 것**: `policy_digest`를 실제 정책과 대조, `mediation`이 실제와 맞는지, `enforcement`가 무엇과 맞는지, `ts_rfc3339`와 `ts`의 일치, `session_end`가 체인을 끝내는지, `session`이 0이 아닌지, 결정이 기록된 규칙 id와 일관되는지.
+**보지 않는 것**: `policy_digest`를 실제 정책과 대조, `mediation`이 실제와 맞는지, `enforcement`가 무엇과 맞는지, `ts_rfc3339`와 `ts`의 일치, `session_end`가 **있는지**, `session`이 0이 아닌지, 결정이 기록된 규칙 id와 일관되는지.
 
-SIGKILL로 죽어 `session_end`가 없는 체인이 경고 없이 깨끗하게 검증됩니다. `enforcement: landlock` / `mediation: full`을 주장하면서 실제로는 아무것도 강제되지 않은 체인도 깨끗하게 검증됩니다. **검증은 "사후에 편집되었는가"에 답하지 "정확한 기록인가"에 답하지 않습니다.**
+SIGKILL로 죽어 `session_end`가 없는 체인이 경고 없이 깨끗하게 검증됩니다. `session_end` 뒤의 엔트리는 실패지만 `session_end`의 부재는 아무 신호도 내지 않으며, 앵커가 있는 세션이 `session_end` 없이 끝나는 것도 검사하지 않습니다. `enforcement: landlock` / `mediation: full`을 주장하면서 실제로는 아무것도 강제되지 않은 체인도 깨끗하게 검증됩니다. **검증은 "사후에 편집되었는가"에 답하지 "정확한 기록인가"에 답하지 않습니다.**
 
 ### 7.12 실행 중인 로그를 검증할 수 없다
 

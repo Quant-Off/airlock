@@ -11,7 +11,7 @@ mod verify;
 
 pub use anchor::{
     ANCHOR_DOMAIN, ANCHOR_FILE, ANCHOR_VERSION, AnchorCheck, AnchorEntry, AnchorFailure, AnchorLog,
-    AnchorReport, AnchorWarning, check_session, read_anchors, verify_anchors,
+    AnchorReport, AnchorWarning, check_session, check_session_report, read_anchors, verify_anchors,
 };
 pub use entry::{DOMAIN, Entry, Record, compute_hash};
 pub use error::{Error, Result};

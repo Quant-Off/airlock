@@ -42,6 +42,7 @@ use crate::error::Error;
 use crate::log::{FILE_MODE, create_dir_all_private};
 use crate::time::{format_rfc3339_nanos, now_unix_nanos};
 use crate::types::{Hash, SessionId};
+use crate::verify::VerifyReport;
 
 pub const ANCHOR_FILE: &str = "anchors.jsonl";
 pub const ANCHOR_DOMAIN: &[u8] = b"airlock.anchor.v1\x00";
@@ -285,6 +286,13 @@ pub enum AnchorFailure {
         previous: u64,
         got: u64,
     },
+    SessionReanchored {
+        seq: u64,
+        session: SessionId,
+        first_seq: u64,
+        previous: u64,
+        got: u64,
+    },
     SessionHeadMismatch {
         session: SessionId,
         anchor_seq: u64,
@@ -292,6 +300,18 @@ pub enum AnchorFailure {
         anchor_head_hash: Hash,
         chain_head_seq: u64,
         chain_head_hash: Hash,
+    },
+    EntriesAfterAnchor {
+        session: SessionId,
+        anchor_seq: u64,
+        anchor_head_seq: u64,
+        chain_head_seq: u64,
+    },
+    AnchoredHeadLag {
+        session: SessionId,
+        anchor_seq: u64,
+        head_seq: u64,
+        chain_seq: u64,
     },
     Io(Error),
 }
@@ -427,6 +447,24 @@ impl fmt::Display for AnchorFailure {
                     )
                 )
             ),
+            Self::SessionReanchored {
+                seq,
+                session,
+                first_seq,
+                previous,
+                got,
+            } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!(
+                        "앵커 seq {seq}가 세션 {session}을 다시 앵커함 (처음은 seq {first_seq}, head_seq {previous} -> {got}). 세션당 앵커는 정확히 하나이므로 종료 뒤 덧붙이기 의심"
+                    ),
+                    format!(
+                        "anchor seq {seq} re-anchors session {session} (first at seq {first_seq}, head_seq {previous} -> {got}); a session has exactly one anchor, so append after close is suspected"
+                    )
+                )
+            ),
             Self::SessionHeadMismatch {
                 session,
                 anchor_seq,
@@ -435,16 +473,16 @@ impl fmt::Display for AnchorFailure {
                 chain_head_seq,
                 chain_head_hash,
             } => {
-                if chain_head_seq > anchor_head_seq {
+                if chain_head_seq < anchor_head_seq {
                     write!(
                         f,
                         "{}",
                         tr!(
                             format!(
-                                "세션 {session}의 체인이 앵커보다 김. 앵커(seq {anchor_seq})는 head {anchor_head_seq}, 체인은 head {chain_head_seq}. 앵커 이후 덧붙이기 의심"
+                                "세션 {session}의 체인이 앵커보다 짧음. 앵커(seq {anchor_seq})는 head {anchor_head_seq}, 체인은 head {chain_head_seq}. 잘라내기 의심"
                             ),
                             format!(
-                                "the chain of session {session} is longer than the anchor; the anchor (seq {anchor_seq}) says head {anchor_head_seq}, the chain says head {chain_head_seq}. Suspected append after anchoring"
+                                "the chain of session {session} is shorter than the anchor; the anchor (seq {anchor_seq}) says head {anchor_head_seq}, the chain says head {chain_head_seq}. Suspected truncation"
                             )
                         )
                     )
@@ -463,6 +501,40 @@ impl fmt::Display for AnchorFailure {
                     )
                 }
             }
+            Self::EntriesAfterAnchor {
+                session,
+                anchor_seq,
+                anchor_head_seq,
+                chain_head_seq,
+            } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!(
+                        "세션 {session}의 체인이 앵커보다 김. 앵커(seq {anchor_seq})는 head {anchor_head_seq}, 체인은 head {chain_head_seq}. 앵커 이후 덧붙이기 의심"
+                    ),
+                    format!(
+                        "the chain of session {session} is longer than the anchor; the anchor (seq {anchor_seq}) says head {anchor_head_seq}, the chain says head {chain_head_seq}. Suspected append after anchoring"
+                    )
+                )
+            ),
+            Self::AnchoredHeadLag {
+                session,
+                anchor_seq,
+                head_seq,
+                chain_seq,
+            } => write!(
+                f,
+                "{}",
+                tr!(
+                    format!(
+                        "세션 {session}은 앵커(seq {anchor_seq})가 있는데 head.json이 뒤처짐 (head {head_seq}, 체인 {chain_seq}). 앵커는 head.json이 fsync된 뒤에 쓰이므로 크래시 잔여일 수 없음. 앵커되지 않은 세션에 엔트리와 앵커를 덧붙인 것 의심"
+                    ),
+                    format!(
+                        "session {session} has an anchor (seq {anchor_seq}) yet head.json lags (head {head_seq}, chain {chain_seq}); the anchor is written after head.json is fsynced, so this cannot be crash residue. Suspected entry and anchor appended to an unanchored session"
+                    )
+                )
+            ),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -473,7 +545,6 @@ impl std::error::Error for AnchorFailure {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorWarning {
     ClockWentBackwards { seq: u64, prev_ts: u64, ts: u64 },
-    SessionReanchored { session: SessionId, count: u64 },
 }
 
 impl fmt::Display for AnchorWarning {
@@ -488,16 +559,6 @@ impl fmt::Display for AnchorWarning {
                     ),
                     format!(
                         "wall clock went backwards at anchor seq {seq} ({prev_ts} -> {ts}); possible clock adjustment"
-                    )
-                )
-            ),
-            Self::SessionReanchored { session, count } => write!(
-                f,
-                "{}",
-                tr!(
-                    format!("세션 {session}이 {count}번 앵커됨. 중간 체크포인트로 판단"),
-                    format!(
-                        "session {session} anchored {count} times; judged to be intermediate checkpoints"
                     )
                 )
             ),
@@ -553,10 +614,11 @@ pub fn read_anchors(dir: &Path) -> Result<Vec<AnchorEntry>, AnchorFailure> {
     Ok(out)
 }
 
-/// 세션 하나의 앵커 기록을 찾습니다. 여러 번 앵커된 세션은 가장 나중 줄을 돌려줍니다.
+/// 세션 하나의 앵커 기록을 찾습니다. 세션당 앵커 줄은 정확히 하나입니다.
 ///
 /// 조회 전에 앵커 체인 전체를 검증합니다. 깨진 체인에서 꺼낸 값으로 대조하면 없는 보증을
-/// 만들어 내기 때문입니다.
+/// 만들어 내기 때문입니다. 같은 세션의 줄이 둘 이상이면 그 검증이 실패하므로 "가장 나중
+/// 줄" 을 고르는 경로는 없습니다.
 ///
 /// # Errors
 /// 앵커 체인 검증이 실패하면 그 사유를 그대로 돌려줍니다.
@@ -581,8 +643,8 @@ pub fn lookup(dir: &Path, session: &SessionId) -> Result<Option<AnchorEntry>, An
 ///
 /// # Errors
 /// 앵커 체인이 깨졌거나, 앵커가 가리키는 head 와 실제 head 가 다르면 실패합니다. 체인이
-/// 앵커보다 긴 경우도 실패입니다. 앵커는 세션 종료 시점에 쓰므로 그 뒤에 자란 체인은 종료
-/// 후 덧붙이기를 뜻합니다.
+/// 앵커보다 긴 경우는 [`AnchorFailure::EntriesAfterAnchor`] 입니다. 앵커는 세션 종료
+/// 시점에 쓰므로 그 뒤에 자란 체인은 종료 후 덧붙이기를 뜻합니다.
 pub fn check_session(
     dir: &Path,
     session: &SessionId,
@@ -594,6 +656,12 @@ pub fn check_session(
         Some(a) if a.head_seq == head_seq && a.head_hash == *head_hash => {
             Ok(AnchorCheck::Matches { anchor_seq: a.seq })
         }
+        Some(a) if head_seq > a.head_seq => Err(AnchorFailure::EntriesAfterAnchor {
+            session: *session,
+            anchor_seq: a.seq,
+            anchor_head_seq: a.head_seq,
+            chain_head_seq: head_seq,
+        }),
         Some(a) => Err(AnchorFailure::SessionHeadMismatch {
             session: *session,
             anchor_seq: a.seq,
@@ -603,6 +671,41 @@ pub fn check_session(
             chain_head_hash: *head_hash,
         }),
     }
+}
+
+/// 검증을 통과한 세션 체인을 앵커 기록과 대조합니다.
+///
+/// [`check_session`] 에 더해 head.json 의 뒤처짐을 봅니다. 앵커는 엔트리와 head.json 이
+/// fsync 된 뒤에 쓰이므로, 앵커가 있는데 head.json 이 한 칸 뒤처진 상태는 크래시 잔여가
+/// 아니라 앵커되지 않은 세션에 엔트리 하나와 앵커 줄을 덧붙인 흔적입니다. 제네시스가
+/// `fsync_per_entry: false` 인 세션만 내구화 순서가 보장되지 않으므로 경고로 남깁니다.
+///
+/// # Arguments
+/// `dir` - 앵커 루트
+/// `report` - 이미 통과한 세션 체인 검증 결과
+///
+/// # Errors
+/// [`check_session`] 의 실패에 더해, fsync 세션에서 앵커가 있는데 head.json 이 뒤처지면
+/// [`AnchorFailure::AnchoredHeadLag`] 입니다.
+pub fn check_session_report(
+    dir: &Path,
+    report: &VerifyReport,
+) -> Result<AnchorCheck, AnchorFailure> {
+    let check = check_session(dir, &report.session, report.head_seq, &report.head_hash)?;
+    let AnchorCheck::Matches { anchor_seq } = check else {
+        return Ok(check);
+    };
+    if report.fsync_per_entry
+        && let Some(head_seq) = report.head_lag()
+    {
+        return Err(AnchorFailure::AnchoredHeadLag {
+            session: report.session,
+            anchor_seq,
+            head_seq,
+            chain_seq: report.head_seq,
+        });
+    }
+    Ok(check)
 }
 
 fn open_anchors(dir: &Path) -> Result<BufReader<File>, AnchorFailure> {
@@ -626,9 +729,8 @@ fn scan<R: BufRead>(
     let mut entry_count: u64 = 0;
     let mut warnings: Vec<AnchorWarning> = Vec::new();
 
-    // 세션 -> (첫 등장 seq, 마지막 head_seq, 등장 횟수)
-    let mut seen: HashMap<SessionId, (u64, u64, u64)> = HashMap::new();
-    let mut order: Vec<SessionId> = Vec::new();
+    // 세션 -> (첫 등장 seq, head_seq)
+    let mut seen: HashMap<SessionId, (u64, u64)> = HashMap::new();
 
     let mut buf = String::new();
     loop {
@@ -692,29 +794,34 @@ fn scan<R: BufRead>(
             });
         }
 
-        match seen.get_mut(&entry.session) {
+        // 세션당 앵커는 정확히 하나이며 두 번째 줄은 head_seq 에 따라 사유만 갈린다
+        match seen.get(&entry.session) {
             None => {
-                seen.insert(entry.session, (entry.seq, entry.head_seq, 1));
-                order.push(entry.session);
+                seen.insert(entry.session, (entry.seq, entry.head_seq));
             }
-            Some((first_seq, last_head_seq, count)) => {
-                if entry.head_seq == *last_head_seq {
+            Some(&(first_seq, previous)) => {
+                if entry.head_seq == previous {
                     return Err(AnchorFailure::SessionDuplicated {
                         seq: entry.seq,
                         session: entry.session,
-                        first_seq: *first_seq,
+                        first_seq,
                     });
                 }
-                if entry.head_seq < *last_head_seq {
+                if entry.head_seq < previous {
                     return Err(AnchorFailure::HeadSeqRegressed {
                         seq: entry.seq,
                         session: entry.session,
-                        previous: *last_head_seq,
+                        previous,
                         got: entry.head_seq,
                     });
                 }
-                *last_head_seq = entry.head_seq;
-                *count = count.saturating_add(1);
+                return Err(AnchorFailure::SessionReanchored {
+                    seq: entry.seq,
+                    session: entry.session,
+                    first_seq,
+                    previous,
+                    got: entry.head_seq,
+                });
             }
         }
 
@@ -737,18 +844,6 @@ fn scan<R: BufRead>(
 
     if entry_count == 0 {
         return Err(AnchorFailure::ChainEmpty);
-    }
-
-    // HashMap 순회 순서는 실행마다 달라집니다. 보고가 재현 가능해야 하므로 등장 순으로 냅니다
-    for session in &order {
-        if let Some((_, _, count)) = seen.get(session)
-            && *count > 1
-        {
-            warnings.push(AnchorWarning::SessionReanchored {
-                session: *session,
-                count: *count,
-            });
-        }
     }
 
     Ok(AnchorReport {

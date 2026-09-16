@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use airlock_audit::{
-    AnchorCheck, AnchorFailure, Entry, Event, ReviewLog, Warning, check_session, verify_anchors,
-    verify_dir,
+    AnchorCheck, AnchorFailure, Entry, Event, ReviewLog, Warning, check_session_report,
+    verify_anchors, verify_dir,
 };
 use airlock_canonical::display::sanitize;
 use airlock_i18n::tr;
@@ -539,11 +539,14 @@ fn report_anchor_chain(anchors: &Path) -> i32 {
 
 /// 세션 체인의 head가 앵커 기록과 맞는지 대조해 한 줄로 보고합니다.
 ///
+/// 원시 `check_session` 이 아니라 `check_session_report` 를 씁니다. 앵커가 있는 세션의
+/// head.json 뒤처짐은 크래시 잔여가 아니라 덧붙이기이므로, 그것을 보는 쪽이어야 합니다.
+///
 /// # Arguments
 /// `anchors` - 앵커 루트
 /// `report` - 이미 통과한 세션 체인 검증 결과
 fn report_session_anchor(anchors: &Path, report: &airlock_audit::VerifyReport) -> i32 {
-    match check_session(anchors, &report.session, report.head_seq, &report.head_hash) {
+    match check_session_report(anchors, report) {
         Ok(AnchorCheck::Matches { anchor_seq }) => {
             println!(
                 "{}",
@@ -569,13 +572,17 @@ fn report_session_anchor(anchors: &Path, report: &airlock_audit::VerifyReport) -
         }
         Err(AnchorFailure::FileAbsent) => 0,
         Err(failure) => {
-            println!(
-                "{}",
-                tr!(
-                    format!("  \x1b[1;31m앵커 불일치\x1b[0m {failure}"),
-                    format!("  \x1b[1;31manchor mismatch\x1b[0m {failure}")
-                )
-            );
+            let label = match &failure {
+                AnchorFailure::EntriesAfterAnchor { .. }
+                | AnchorFailure::SessionReanchored { .. } => {
+                    tr!("종료 후 덧붙이기", "append after close")
+                }
+                AnchorFailure::AnchoredHeadLag { .. } => {
+                    tr!("앵커 head 뒤처짐", "anchored head lag")
+                }
+                _ => tr!("앵커 불일치", "anchor mismatch"),
+            };
+            println!("  \x1b[1;31m{label}\x1b[0m {failure}");
             2
         }
     }

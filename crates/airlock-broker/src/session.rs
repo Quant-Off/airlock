@@ -720,6 +720,9 @@ impl Session {
     /// 않고 [`Closed::anchor`]에 담겨 올라갑니다. 이미 끝난 자식 실행을 되돌릴 수는
     /// 없으므로 사실을 보고에 남기고 호출부가 판단하게 합니다
     pub fn finish(&mut self, status: Option<&std::process::ExitStatus>) -> Result<Closed> {
+        if self.closed {
+            return Err(BrokerError::SessionClosed);
+        }
         let audit_status = match status {
             Some(s) => exit_status_of(s),
             None => audit::ExitStatus::Unknown,
